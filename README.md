@@ -2,6 +2,9 @@
 
 This project forwards SMS messages received by GSM/LTE communication modules to a Telegram bot, while also supporting sending SMS through Telegram.
 
+## README
+[English](README.md) [日本語](README_JP.md) [简体中文](README_CN.md)
+  
 ## Features
 
 - Automatically forwards received SMS to Telegram
