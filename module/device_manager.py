@@ -168,49 +168,58 @@ class DeviceManager:
             await self.send_at_command_async(command)
     
     async def start(self) -> None:
-        await self.connect()
-        self.priming_event.set()
-        await self.exit_event.wait()
-    
+        """
+        启动设备管理器，连接到设备并开始读取数据。
+        """
+        try:
+            await self.connect()
+            self.is_running = True  # 确保设置正确的运行状态
+            self.read_task = asyncio.create_task(self.read_loop())
+            self.process_task = asyncio.create_task(self.process_loop())
+            self.priming_event.set()
+            await self.exit_event.wait()
+        except Exception as e:
+            logger.error(f"设备管理器启动失败: {e}")
+            self.is_running = False
+            self.priming_event.set()  # 设置事件避免主线程永久等待
+            raise  # 向上级传递异常
+
     async def close(self) -> None:
-        """关闭连接并清理资源"""
+        """
+        关闭服务，停止所有正在运行的子任务。
+        """
         logger.info("正在关闭 Device Manager 服务...")
         
         self.is_running = False
-        try:
-            # 取消并等待异步任务完成
-            if self.read_task and not self.read_task.done():
+        
+        # 取消读取和处理任务
+        if self.read_task:
+            try:
                 self.read_task.cancel()
-                try:
-                    await self.read_task
-                except asyncio.CancelledError:
-                    logger.warning("轮调任务read_task被取消")
-
-            if self.process_task and not self.process_task.done():
-                self.process_task.cancel()
-                try:
-                    await self.process_task
-                except asyncio.CancelledError:
-                    logger.warning("轮调任务process_task被取消")
-
-            # 关闭串口连接
-            if self.writer:
-                self.writer.close()
-                try:
-                    await self.writer.wait_closed()
-                except Exception as e:
-                    logger.error(f"关闭写入器时出错: {e}")
-
-            # 清理资源
-            self.reader = None
-            self.writer = None
-        except Exception as e:
-            logger.error(f"关闭服务时出现错误: {e}")
+                logger.warning("轮调任务read_task被取消")
+            except asyncio.CancelledError:
+                pass
             
+        if self.process_task:
+            try:
+                self.process_task.cancel()
+            except asyncio.CancelledError:
+                pass
+            
+        # 关闭串口连接
+        if self.writer:
+            try:
+                self.writer.close()
+                await self.writer.wait_closed()
+            except Exception as e:
+                logger.error(f"关闭写入器时出错: {e}")
+                
         logger.info("Device Manager 服务已关闭")
     
     async def read_loop(self) -> None:
-        """持续读取串口数据的循环"""
+        """
+        持续读取串口数据的循环
+        """
         number_of_errors = 0
         while self.is_running:
             try:
@@ -219,19 +228,17 @@ class DeviceManager:
 
                 if line:
                     await self.message_queue.put(line)
-                    # logger.debug(f"接收到并加入队列: {line}")
                     number_of_errors = 0
             except Exception as e:
                 number_of_errors += 1
                 logger.warning(f"读取循环出错: {e}")
                 await asyncio.sleep(self.retry_delay)
                 
-                if 1 < number_of_errors < self.max_retries:
-                    await self.reconnect()  # 尝试重新连接
+                # 如果连续出错超过阈值，标记服务为停止状态并退出
                 if number_of_errors >= self.max_retries:
-                    logger.error(f"读取循环出错次数已达到 {number_of_errors} 次")
-                    await self.close()
-                    raise ValueError("读取循环出错")
+                    logger.error(f"读取循环连续出错 {number_of_errors} 次，停止服务")
+                    self.is_running = False
+                    raise RuntimeError(f"设备读取失败: {e}")
                     
     async def process_loop(self) -> None:
         """处理消息队列的循环"""

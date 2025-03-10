@@ -162,8 +162,18 @@ class TelegramBot:
         return False
 
     async def start(self) -> None:
-        await self.connect()
-        await self.exit_event.wait()
+        """
+        启动 Telegram Bot 服务。
+        """
+        try:
+            # 连接到 Telegram API
+            await self.connect()
+            # 等待退出事件
+            await self.exit_event.wait()
+        except Exception as e:
+            logger.error(f"Telegram Bot 服务启动失败: {e}")
+            self.is_running = False
+            raise  # 向上级传递异常
 
     async def close(self) -> None:
         """关闭 Telegram Bot 连接"""
@@ -198,6 +208,9 @@ class TelegramBot:
         if self.is_running:
             logger.warning("长轮询循环polling_loop已启动")
 
+        max_consecutive_errors = 5  # 最大连续错误次数
+        consecutive_errors = 0  # 当前连续错误次数
+
         while self.is_running:
             try:
                 # 获取更新
@@ -209,27 +222,43 @@ class TelegramBot:
                 for update in updates:
                     await self.process_update(update)
 
-                # 更新最后活动时间
+                # 更新最后活动时间，重置错误计数
                 self.last_activity = time.time()
+                consecutive_errors = 0
             except (asyncio.TimeoutError,
                     aiohttp.ClientConnectionError,
                     aiohttp.ClientResponseError) as e:
+                consecutive_errors += 1
                 logger.error(f"轮调过程中出现网络错误: {type(e).__name__}")
 
-                for _retry_delay in range(1, 30, 2):
-                    logger.debug(f"将在 {_retry_delay} 分钟后重试连接")
-                    await asyncio.sleep(_retry_delay * 60)
-
-                    if await self.reconnect():
-                        break
-                else:
-                    logger.error("重试次数达到上限，关闭连接")
-                    await self.close()
+                # 如果连续错误次数超过阈值，停止服务
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error(f"连续网络错误达到 {consecutive_errors} 次，停止服务")
+                    self.is_running = False
+                    raise RuntimeError(f"Telegram API 连接失败: {type(e).__name__}")
+                
+                # 否则尝试等待并重新连接
+                retry_delay = min(30, consecutive_errors * 5)
+                logger.debug(f"将在 {retry_delay} 分钟后重试连接")
+                await asyncio.sleep(retry_delay * 60)
+                
+                if not await self.reconnect():
+                    logger.error("重连失败，停止服务")
+                    self.is_running = False
+                    break
             except asyncio.CancelledError:
                 logger.warning("轮调任务被取消")
                 break
             except Exception as e:
+                consecutive_errors += 1
                 logger.error(f"轮调过程中出现未知错误: {e}")
+                
+                # 如果连续错误次数超过阈值，停止服务
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error(f"连续未知错误达到 {consecutive_errors} 次，停止服务")
+                    self.is_running = False
+                    raise RuntimeError(f"Telegram Bot 服务出错: {e}")
+                    
                 await asyncio.sleep(10)
 
         logger.warning("长轮询循环polling_loop已关闭")

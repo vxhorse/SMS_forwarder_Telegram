@@ -81,9 +81,9 @@ docker pull vxhorse/sms-forwarder
 ```yaml
 services:
   sms-forwarder:
-    image: vxhorse/sms-forwarder:1.0
+    image: vxhorse/sms-forwarder:latest
     container_name: sms-forwarder
-    restart: always
+    restart: unless-stopped
     network_mode: "host"
     devices:
       - /dev/ttyUSB2:/dev/ttyUSB2

@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import os
+import sys
 from config import BOT_TOKEN, CHAT_ID, PROXY_URL
 from logger import setup_logger
 from module.device_manager import DeviceManager
@@ -36,7 +37,12 @@ class Main:
         try:
             # 启动子线程
             self.dm_thread.start()
-            await asyncio.wait_for(self.dm.priming_event.wait(), timeout=40)
+            try:
+                await asyncio.wait_for(self.dm.priming_event.wait(), timeout=40)
+            except asyncio.TimeoutError:
+                logger.error("设备管理器启动超时")
+                raise RuntimeError("设备管理器启动失败")
+                
             self.tb_thread.start()
 
             # 保持服务运行状态
@@ -47,34 +53,51 @@ class Main:
                 if not self.tb.is_running or not self.dm.is_running:
                     logger.warning("检测到某个服务未运行，进行等待...")
                     await asyncio.sleep(10)  # 延迟10秒后重试
-                    if not self.tb.is_running:
-                        raise RuntimeError("TelegramBot 服务停止运行")
-                    elif not self.dm.is_running:
-                        raise RuntimeError("DeviceManager 服务停止运行")
+                    if not self.tb.is_running or not self.dm.is_running:
+                        if not self.tb.is_running:
+                            raise RuntimeError("TelegramBot 服务停止运行")
+                        elif not self.dm.is_running:
+                            raise RuntimeError("DeviceManager 服务停止运行")
                     else:
                         logger.info("所有服务已继续运行")
                     
         except Exception as e:
             logger.error(f"主线程运行出错: {e}")
+            raise  # 重新抛出异常以确保程序退出
         finally:
             await self.close()
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)  # 给关闭过程一些时间
     
     async def close(self):
         """
         关闭服务，停止所有正在运行的子线程。
         """
         self.is_running = False
-        await asyncio.gather(
-            self.dm.close(),
-            self.tb.close()
-        )
+        try:
+            # 先尝试关闭设备管理器和TelegramBot
+            tasks = []
+            if self.dm:
+                tasks.append(self.dm.close())
+            if self.tb:
+                tasks.append(self.tb.close())
+                
+            # 等待关闭任务完成，但不等待太久
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             
-        # 等待线程结束
-        self.dm.exit_event.set()
-        self.tb.exit_event.set()
-        self.dm_thread.join()
-        self.tb_thread.join()
+            # 设置线程退出事件
+            if self.dm:
+                self.dm.exit_event.set()
+            if self.tb:
+                self.tb.exit_event.set()
+                
+            # 等待线程结束，但设置超时避免无限等待
+            if self.dm_thread and self.dm_thread.is_alive():
+                self.dm_thread.join(timeout=5)
+            if self.tb_thread and self.tb_thread.is_alive():
+                self.tb_thread.join(timeout=5)
+        except Exception as e:
+            logger.error(f"关闭过程中出现错误: {e}")
     
     def run_device_manager(self):
         """
@@ -83,8 +106,13 @@ class Main:
         logger.info("设备管理器线程已启动")
         self.dm_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.dm_loop)
-        self.dm_loop.run_until_complete(self.dm.start())
-        logger.info("设备管理器线程已结束")
+        try:
+            self.dm_loop.run_until_complete(self.dm.start())
+        except Exception as e:
+            logger.error(f"设备管理器出现致命错误: {e}")
+            self.is_running = False  # 通知主线程停止
+        finally:
+            logger.info("设备管理器线程已结束")
         
     def run_telegram_bot(self):
         """
@@ -93,8 +121,13 @@ class Main:
         logger.info("TelegramBot 线程已启动")
         self.tb_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.tb_loop)
-        self.tb_loop.run_until_complete(self.tb.start())
-        logger.info("TelegramBot 线程已结束")
+        try:
+            self.tb_loop.run_until_complete(self.tb.start())
+        except Exception as e:
+            logger.error(f"TelegramBot出现致命错误: {e}")
+            self.is_running = False  # 通知主线程停止
+        finally:
+            logger.info("TelegramBot 线程已结束")
         
     async def handle_forwarding_sms(self, phone_number: str, timestamp: str, content: str) -> bool: 
         """
@@ -105,12 +138,16 @@ class Main:
         :param content: 短信内容
         :return: 返回转发结果（True 为成功，False 为失败）
         """
-        # 使用 TelegramBot 的事件循环来调用异步方法
-        future = asyncio.run_coroutine_threadsafe(
-            self.tb.handle_forwarding_sms(phone_number, timestamp, content),
-            self.tb_loop
-        )
-        return future.result()
+        try:
+            # 使用 TelegramBot 的事件循环来调用异步方法
+            future = asyncio.run_coroutine_threadsafe(
+                self.tb.handle_forwarding_sms(phone_number, timestamp, content),
+                self.tb_loop
+            )
+            return future.result()
+        except Exception as e:
+            logger.error(f"转发短信时出现错误: {e}")
+            return False
 
     async def handle_send_sms(self, phone_number: str, message: str) -> bool:
         """
@@ -120,25 +157,36 @@ class Main:
         :param message: 短信内容
         :return: 返回发送结果（True 为成功，False 为失败）
         """
-        # 使用 DeviceManager 的事件循环来调用异步方法
-        future = asyncio.run_coroutine_threadsafe(
-            self.dm.handle_send_sms(phone_number, message),
-            self.dm_loop
-        )
-        return future.result()
+        try:
+            # 使用 DeviceManager 的事件循环来调用异步方法
+            future = asyncio.run_coroutine_threadsafe(
+                self.dm.handle_send_sms(phone_number, message),
+                self.dm_loop
+            )
+            return future.result()
+        except Exception as e:
+            logger.error(f"发送短信时出现错误: {e}")
+            return False
     
 if __name__ == "__main__":
     main = Main()
+    exit_code = 0
     try:
         logger.info("程序启动中...")
         asyncio.run(main.start())  # 启动主程序
     except KeyboardInterrupt:
         logger.warning("接收到键盘中断信号，正在关闭程序...")
-        asyncio.run(main.close())
+        exit_code = 0  # 正常退出
     except Exception as e:
         logger.error(f"程序运行时出现错误: {e}")
-        asyncio.run(main.close())
+        exit_code = 1  # 异常退出
     finally:
-        # 强制退出整个程序
-        logger.info("程序清理已完成，准备强制关闭...")
-        os._exit(0)
+        try:
+            asyncio.run(main.close())
+        except Exception as e:
+            logger.error(f"程序关闭过程中出现错误: {e}")
+            exit_code = 1
+        
+        # 退出程序
+        logger.info(f"程序清理已完成，退出码: {exit_code}")
+        sys.exit(exit_code)  # 使用sys.exit替代os._exit以传递正确的退出码
