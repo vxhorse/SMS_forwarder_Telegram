@@ -1,4 +1,3 @@
-import glob
 import serial
 import serial_asyncio
 import asyncio
@@ -199,20 +198,36 @@ class DeviceManager:
                 logger.warning("轮调任务read_task被取消")
             except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                logger.error(f"取消read_task时出错: {e}")
+            self.read_task = None
             
         if self.process_task:
             try:
                 self.process_task.cancel()
             except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                logger.error(f"取消process_task时出错: {e}")
+            self.process_task = None
             
         # 关闭串口连接
         if self.writer:
             try:
+                # 安全关闭串口写入器
                 self.writer.close()
-                await self.writer.wait_closed()
+                # 添加try-except防止wait_closed()抛出异常
+                try:
+                    await asyncio.wait_for(self.writer.wait_closed(), timeout=2.0)
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning(f"等待写入器关闭超时或出错: {e}")
             except Exception as e:
                 logger.error(f"关闭写入器时出错: {e}")
+            finally:
+                self.writer = None
+                
+        # 设置退出事件
+        self.exit_event.set()
                 
         logger.info("Device Manager 服务已关闭")
     

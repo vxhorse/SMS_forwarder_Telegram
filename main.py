@@ -1,6 +1,5 @@
 import asyncio
 import threading
-import os
 import sys
 from config import BOT_TOKEN, CHAT_ID, PROXY_URL
 from logger import setup_logger
@@ -73,29 +72,45 @@ class Main:
         关闭服务，停止所有正在运行的子线程。
         """
         self.is_running = False
+        logger.info("开始关闭应用程序...")
+        
         try:
-            # 先尝试关闭设备管理器和TelegramBot
-            tasks = []
-            if self.dm:
-                tasks.append(self.dm.close())
-            if self.tb:
-                tasks.append(self.tb.close())
-                
-            # 等待关闭任务完成，但不等待太久
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # 设置线程退出事件
+            # 先设置线程退出事件，使线程有机会自行终止
             if self.dm:
                 self.dm.exit_event.set()
             if self.tb:
                 self.tb.exit_event.set()
                 
+            # 等待一小段时间，给线程处理退出事件的机会
+            await asyncio.sleep(1)
+                
+            # 然后尝试关闭设备管理器和TelegramBot
+            # 使用单独的关闭逻辑而不是gather，以避免一个失败影响另一个
+            if self.dm:
+                try:
+                    await asyncio.wait_for(self.dm.close(), timeout=5)
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.error(f"关闭设备管理器时出错: {e}")
+                    
+            if self.tb:
+                try:
+                    await asyncio.wait_for(self.tb.close(), timeout=5)
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.error(f"关闭Telegram Bot时出错: {e}")
+            
             # 等待线程结束，但设置超时避免无限等待
             if self.dm_thread and self.dm_thread.is_alive():
                 self.dm_thread.join(timeout=5)
+                if self.dm_thread.is_alive():
+                    logger.warning("设备管理器线程未能在超时时间内结束")
+                    
             if self.tb_thread and self.tb_thread.is_alive():
                 self.tb_thread.join(timeout=5)
+                if self.tb_thread.is_alive():
+                    logger.warning("TelegramBot线程未能在超时时间内结束")
+                    
+            logger.info("所有服务已关闭")
+                    
         except Exception as e:
             logger.error(f"关闭过程中出现错误: {e}")
     

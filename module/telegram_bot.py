@@ -184,16 +184,15 @@ class TelegramBot:
             # 取消轮询任务
             if self.polling_task and not self.polling_task.done():
                 self.polling_task.cancel()
-                try:
-                    await self.polling_task
-                except asyncio.CancelledError:
-                    logger.warning("轮询任务已取消")
+                # 不再等待polling_task完成，因为它可能在不同的事件循环中
+                # 通过日志确认任务已被取消
+                logger.warning("已发出轮询任务取消信号")
                 self.polling_task = None
-
+            
             # 关闭会话
             if self.session and not self.session.closed:
                 await self.session.close()
-
+            
             # 设置退出事件
             self.exit_event.set()
         except Exception as e:
