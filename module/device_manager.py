@@ -200,7 +200,8 @@ class DeviceManager:
                 pass
             except Exception as e:
                 logger.error(f"取消read_task时出错: {e}")
-            self.read_task = None
+            finally:
+                self.read_task = None
             
         if self.process_task:
             try:
@@ -209,7 +210,8 @@ class DeviceManager:
                 pass
             except Exception as e:
                 logger.error(f"取消process_task时出错: {e}")
-            self.process_task = None
+            finally:
+                self.process_task = None
             
         # 关闭串口连接
         if self.writer:
@@ -224,6 +226,7 @@ class DeviceManager:
             except Exception as e:
                 logger.error(f"关闭写入器时出错: {e}")
             finally:
+                # 无论如何都确保写入器被标记为已关闭
                 self.writer = None
                 
         # 设置退出事件
@@ -253,8 +256,12 @@ class DeviceManager:
                 if number_of_errors >= self.max_retries:
                     logger.error(f"读取循环连续出错 {number_of_errors} 次，停止服务")
                     self.is_running = False
+                    # 确保抛出异常让上层知道服务已停止
                     raise RuntimeError(f"设备读取失败: {e}")
                     
+        # 当is_running为False时，确保任务能够正常结束
+        logger.warning("读取循环已关闭")
+    
     async def process_loop(self) -> None:
         """处理消息队列的循环"""
         number_of_errors = 0

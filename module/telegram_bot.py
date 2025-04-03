@@ -183,22 +183,33 @@ class TelegramBot:
         try:
             # 取消轮询任务
             if self.polling_task and not self.polling_task.done():
-                self.polling_task.cancel()
-                # 不再等待polling_task完成，因为它可能在不同的事件循环中
-                # 通过日志确认任务已被取消
-                logger.warning("已发出轮询任务取消信号")
-                self.polling_task = None
+                try:
+                    # 使用cancel()而不是直接等待任务完成
+                    self.polling_task.cancel()
+                    # 记录日志但不等待任务
+                    logger.warning("轮调任务被取消")
+                except Exception as e:
+                    logger.error(f"取消轮调任务时出错: {e}")
+                finally:
+                    self.polling_task = None
             
             # 关闭会话
             if self.session and not self.session.closed:
-                await self.session.close()
+                try:
+                    await asyncio.wait_for(self.session.close(), timeout=5)
+                except asyncio.TimeoutError:
+                    logger.warning("关闭会话超时")
+                except Exception as e:
+                    logger.error(f"关闭会话时出错: {e}")
             
             # 设置退出事件
             self.exit_event.set()
         except Exception as e:
             logger.error(f"关闭连接时出现错误: {e}")
-
-        logger.info("Telegram Bot 连接已关闭")
+        finally:
+            # 无论如何确保标记服务为已关闭
+            self.is_running = False
+            logger.info("Telegram Bot 连接已关闭")
 
     async def polling_loop(self) -> None:
         """
@@ -234,6 +245,7 @@ class TelegramBot:
                 if consecutive_errors >= max_consecutive_errors:
                     logger.error(f"连续网络错误达到 {consecutive_errors} 次，停止服务")
                     self.is_running = False
+                    # 确保抛出异常让上层知道服务已停止
                     raise RuntimeError(f"Telegram API 连接失败: {type(e).__name__}")
                 
                 # 否则尝试等待并重新连接
@@ -244,7 +256,8 @@ class TelegramBot:
                 if not await self.reconnect():
                     logger.error("重连失败，停止服务")
                     self.is_running = False
-                    break
+                    # 确保抛出异常让上层知道服务已停止
+                    raise RuntimeError("Telegram API 重连失败")
             except asyncio.CancelledError:
                 logger.warning("轮调任务被取消")
                 break

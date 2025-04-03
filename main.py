@@ -192,16 +192,25 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.warning("接收到键盘中断信号，正在关闭程序...")
         exit_code = 0  # 正常退出
+    except RuntimeError as e:
+        # 明确处理RuntimeError，这通常是由子服务失败导致的
+        logger.error(f"程序运行时发生严重错误: {e}")
+        exit_code = 2  # 特定错误码表示服务异常
     except Exception as e:
         logger.error(f"程序运行时出现错误: {e}")
-        exit_code = 1  # 异常退出
+        exit_code = 1  # 一般异常退出
     finally:
         try:
-            asyncio.run(main.close())
+            # 设置较短的超时时间，避免无限等待关闭过程
+            shutdown_task = asyncio.wait_for(main.close(), timeout=10)
+            asyncio.run(shutdown_task)
+        except asyncio.TimeoutError:
+            logger.error("程序关闭超时，强制退出")
+            exit_code = 3  # 关闭超时错误码
         except Exception as e:
             logger.error(f"程序关闭过程中出现错误: {e}")
             exit_code = 1
         
-        # 退出程序
+        # 确保退出程序
         logger.info(f"程序清理已完成，退出码: {exit_code}")
-        sys.exit(exit_code)  # 使用sys.exit替代os._exit以传递正确的退出码
+        sys.exit(exit_code)  # 使用sys.exit传递正确的退出码
