@@ -1,0 +1,4 @@
+aiohttp==3.11.12
+pyserial==3.5
+pyserial-asyncio==0.6
+python-gsmmodem-new==0.13.0

@@ -1,0 +1,29 @@
+# Python缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 环境文件
+.env
+.env.*
+venv/
+env/
+
+# 日志文件
+*.log
+logs/
+
+# Docker相关
+Dockerfile
+docker-compose.yml
+docker-compose.yaml
+.dockerignore
+
+# 系统文件
+.DS_Store
+
+# 编辑器配置
+.idea/
+.vscode/
