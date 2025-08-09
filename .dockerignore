@@ -4,6 +4,7 @@ __pycache__/
 *.so
 .Python
 .git
+.gitattributes
 .gitignore
 .env
 .env.*
