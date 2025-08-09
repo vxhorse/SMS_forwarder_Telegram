@@ -118,8 +118,11 @@ class DeviceManager:
             raise ValueError("无法连接到设备")
         
         self.is_running = True
-        self.read_task = asyncio.create_task(self.read_loop())
-        self.process_task = asyncio.create_task(self.process_loop())
+        # 仅在任务不存在或已结束时创建，避免重复任务
+        if self.read_task is None or self.read_task.done():
+            self.read_task = asyncio.create_task(self.read_loop())
+        if self.process_task is None or self.process_task.done():
+            self.process_task = asyncio.create_task(self.process_loop())
     
     async def reconnect(self) -> None:
         """设备断开或出错时重新连接"""
@@ -173,8 +176,6 @@ class DeviceManager:
         try:
             await self.connect()
             self.is_running = True  # 确保设置正确的运行状态
-            self.read_task = asyncio.create_task(self.read_loop())
-            self.process_task = asyncio.create_task(self.process_loop())
             self.priming_event.set()
             await self.exit_event.wait()
         except Exception as e:
@@ -395,6 +396,7 @@ class DeviceManager:
 
         # 检查是否已接收到足够的PDU数据或者是否强制处理
         if len(self.pending_sms["pdu"]) >= self.pending_sms["expected_length"] * 2 or force_process:
+            decoded_pdu = None
             try:
                 # 将字节数据转换为十六进制字符串
                 pdu_hex = self.pending_sms["pdu"].decode('ascii', errors='ignore').strip()
