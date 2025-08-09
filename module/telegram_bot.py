@@ -117,7 +117,7 @@ class TelegramBot:
         try:
             async with self.session_lock:
                 # 确保旧的session已关闭
-                if self.session or not self.session.closed:
+                if self.session is not None and not self.session.closed:
                     await self.session.close()
 
                 # 创建新的session
