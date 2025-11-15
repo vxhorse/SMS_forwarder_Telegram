@@ -108,7 +108,10 @@ class TelegramBot:
                 raise ConnectionError("无法连接到 Telegram API")
         except Exception as e:
             logger.error(f"连接时发生错误: {e}")
-            await self.close()
+            # 确保is_running标志被设置为False
+            self.is_running = False
+            # 标记为未连接状态，让start()方法抛出异常
+            raise
 
     async def reconnect(self) -> bool:
         """重新连接到 Telegram API
@@ -165,15 +168,10 @@ class TelegramBot:
         """
         启动 Telegram Bot 服务。
         """
-        try:
-            # 连接到 Telegram API
-            await self.connect()
-            # 等待退出事件
-            await self.exit_event.wait()
-        except Exception as e:
-            logger.error(f"Telegram Bot 服务启动失败: {e}")
-            self.is_running = False
-            raise  # 向上级传递异常
+        # 连接到 Telegram API
+        await self.connect()
+        # 等待退出事件
+        await self.exit_event.wait()
 
     async def close(self) -> None:
         """关闭 Telegram Bot 连接"""
@@ -183,31 +181,22 @@ class TelegramBot:
         try:
             # 取消轮询任务
             if self.polling_task and not self.polling_task.done():
+                self.polling_task.cancel()
                 try:
-                    # 使用cancel()而不是直接等待任务完成
-                    self.polling_task.cancel()
-                    # 记录日志但不等待任务
-                    logger.warning("轮调任务被取消")
-                except Exception as e:
-                    logger.error(f"取消轮调任务时出错: {e}")
-                finally:
-                    self.polling_task = None
+                    await self.polling_task
+                except (asyncio.CancelledError, Exception) as e:
+                    logger.warning(f"轮调任务取消: {e}")
+                self.polling_task = None
             
             # 关闭会话
             if self.session and not self.session.closed:
-                try:
-                    await asyncio.wait_for(self.session.close(), timeout=5)
-                except asyncio.TimeoutError:
-                    logger.warning("关闭会话超时")
-                except Exception as e:
-                    logger.error(f"关闭会话时出错: {e}")
+                await self.session.close()
             
             # 设置退出事件
             self.exit_event.set()
         except Exception as e:
             logger.error(f"关闭连接时出现错误: {e}")
         finally:
-            # 无论如何确保标记服务为已关闭
             self.is_running = False
             logger.info("Telegram Bot 连接已关闭")
 

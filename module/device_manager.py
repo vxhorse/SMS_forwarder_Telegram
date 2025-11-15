@@ -193,42 +193,30 @@ class DeviceManager:
         self.is_running = False
         
         # 取消读取和处理任务
-        if self.read_task:
+        if self.read_task and not self.read_task.done():
+            self.read_task.cancel()
             try:
-                self.read_task.cancel()
-                logger.warning("轮调任务read_task被取消")
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"取消read_task时出错: {e}")
-            finally:
-                self.read_task = None
+                await self.read_task
+            except (asyncio.CancelledError, Exception) as e:
+                logger.warning(f"read_task取消: {e}")
+            self.read_task = None
             
-        if self.process_task:
+        if self.process_task and not self.process_task.done():
+            self.process_task.cancel()
             try:
-                self.process_task.cancel()
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"取消process_task时出错: {e}")
-            finally:
-                self.process_task = None
+                await self.process_task
+            except (asyncio.CancelledError, Exception) as e:
+                logger.warning(f"process_task取消: {e}")
+            self.process_task = None
             
         # 关闭串口连接
         if self.writer:
+            self.writer.close()
             try:
-                # 安全关闭串口写入器
-                self.writer.close()
-                # 添加try-except防止wait_closed()抛出异常
-                try:
-                    await asyncio.wait_for(self.writer.wait_closed(), timeout=2.0)
-                except (asyncio.TimeoutError, Exception) as e:
-                    logger.warning(f"等待写入器关闭超时或出错: {e}")
+                await self.writer.wait_closed()
             except Exception as e:
-                logger.error(f"关闭写入器时出错: {e}")
-            finally:
-                # 无论如何都确保写入器被标记为已关闭
-                self.writer = None
+                logger.warning(f"关闭写入器出错: {e}")
+            self.writer = None
                 
         # 设置退出事件
         self.exit_event.set()
@@ -248,6 +236,8 @@ class DeviceManager:
                 if line:
                     await self.message_queue.put(line)
                     number_of_errors = 0
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 number_of_errors += 1
                 logger.warning(f"读取循环出错: {e}")
@@ -257,10 +247,8 @@ class DeviceManager:
                 if number_of_errors >= self.max_retries:
                     logger.error(f"读取循环连续出错 {number_of_errors} 次，停止服务")
                     self.is_running = False
-                    # 确保抛出异常让上层知道服务已停止
                     raise RuntimeError(f"设备读取失败: {e}")
                     
-        # 当is_running为False时，确保任务能够正常结束
         logger.warning("读取循环已关闭")
     
     async def process_loop(self) -> None:
@@ -270,6 +258,7 @@ class DeviceManager:
             try:
                 message = await asyncio.wait_for(self.message_queue.get(), timeout=5)
                 await self.process_message(message)
+                number_of_errors = 0
             except asyncio.TimeoutError:
                 await self.handle_incoming_sms_pdu()
                 continue  # 队列为空，继续下一次循环
@@ -284,10 +273,10 @@ class DeviceManager:
                     await self.reconnect()  # 尝试重新连接
                 if number_of_errors >= self.max_retries:
                     logger.error(f"处理循环出错次数已达到 {number_of_errors} 次")
-                    await self.close()
-                    raise ValueError("处理循环出错")
-            else:
-                number_of_errors = 0
+                    self.is_running = False
+                    raise RuntimeError("处理循环出错")
+                    
+        logger.warning("处理循环已关闭")
     
     async def process_message(self, message: bytes) -> None:
         """处理单个消息"""
