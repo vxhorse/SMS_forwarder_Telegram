@@ -2,6 +2,9 @@
 
 该项目将GSM/LTE通信模块接收到的短信转发至Telegram机器人，同时支持通过Telegram发送短信。
 
+## 说明文档
+[English](README.md) | [日本語](README_JP.md) | [简体中文](README_CN.md) | [فارسی](README_FA.md)
+
 ## 功能特点
 
 - 自动转发接收到的短信到Telegram
@@ -11,6 +14,40 @@
 - Docker部署，易于安装和管理
 - 模块热插拔支持
 - **服务健康检查**：内置健康检查机制，确保服务稳定运行
+
+## 系统架构
+
+```mermaid
+graph TD
+    subgraph DC [Docker Container]
+        Main["SMSForwarder (Main Process)"]
+        
+        subgraph DeviceLayer [Device Layer]
+            DM[DeviceManager]
+            Serial["Serial Port (ttyUSB)"]
+            Buffer[ConcatSmsBuffer]
+        end
+        
+        subgraph NetworkLayer [Network Layer]
+            Bot[TelegramBot]
+            API[Telegram API]
+        end
+        
+        Health[HealthCheck]
+    end
+    
+    Hardware[LTE Module] <--> Serial
+    Main --> DM
+    Main --> Bot
+    DM <--> Serial
+    DM -- "SMS分片" --> Buffer
+    Buffer -- "合并后短信" --> DM
+    DM -- "转发短信" --> Main
+    Main -- "发送消息" --> Bot
+    Bot <--> API
+    
+    Main -. "监控状态" .- Health
+```
 
 ## 硬件要求
 
@@ -87,8 +124,7 @@ services:
     container_name: sms-forwarder
     restart: unless-stopped
     network_mode: "host"
-    init: true  # 使用tini作为init进程，确保信号正确传递
-    stop_grace_period: 30s  # 优雅关闭超时时间
+    stop_grace_period: 30s
     devices:
       - /dev/ttyUSB2:/dev/ttyUSB2
     volumes:
@@ -100,7 +136,7 @@ services:
       - BOT_TOKEN=your_telegram_bot_token
       - CHAT_ID=your_telegram_chat_id
       - PROXY_URL=http://127.0.0.1:7890
-    healthcheck:  # 健康检查配置
+    healthcheck:
       test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/tmp/healthy') else 1)"]
       interval: 30s
       timeout: 10s

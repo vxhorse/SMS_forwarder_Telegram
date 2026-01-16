@@ -3,7 +3,7 @@
 This project forwards SMS messages received by GSM/LTE communication modules to a Telegram bot, while also supporting sending SMS through Telegram.
 
 ## README
-[English](README.md) [日本語](README_JP.md) [简体中文](README_CN.md)
+[English](README.md) | [日本語](README_JP.md) | [简体中文](README_CN.md) | [فارسی](README_FA.md)
 
 ## Features
 
@@ -14,6 +14,40 @@ This project forwards SMS messages received by GSM/LTE communication modules to 
 - Docker deployment for easy installation and management
 - Hot-plug support for modules
 - **Service health check**: Built-in health check mechanism to ensure stable service operation
+
+## Architecture
+
+```mermaid
+graph TD
+    subgraph DC [Docker Container]
+        Main["SMSForwarder (Main Process)"]
+        
+        subgraph DeviceLayer [Device Layer]
+            DM[DeviceManager]
+            Serial["Serial Port (ttyUSB)"]
+            Buffer[ConcatSmsBuffer]
+        end
+        
+        subgraph NetworkLayer [Network Layer]
+            Bot[TelegramBot]
+            API[Telegram API]
+        end
+        
+        Health[HealthCheck]
+    end
+    
+    Hardware[LTE Module] <--> Serial
+    Main --> DM
+    Main --> Bot
+    DM <--> Serial
+    DM -- "SMS Fragments" --> Buffer
+    Buffer -- "Merged SMS" --> DM
+    DM -- "Forward SMS" --> Main
+    Main -- "Send Message" --> Bot
+    Bot <--> API
+    
+    Main -. Monitor .- Health
+```
 
 ## Hardware Requirements
 
@@ -90,8 +124,7 @@ services:
     container_name: sms-forwarder
     restart: unless-stopped
     network_mode: "host"
-    init: true  # Use tini as init process to ensure proper signal handling
-    stop_grace_period: 30s  # Graceful shutdown timeout
+    stop_grace_period: 30s
     devices:
       - /dev/ttyUSB2:/dev/ttyUSB2
     volumes:
@@ -103,7 +136,7 @@ services:
       - BOT_TOKEN=your_telegram_bot_token
       - CHAT_ID=your_telegram_chat_id
       - PROXY_URL=http://127.0.0.1:7890
-    healthcheck:  # Health check configuration
+    healthcheck:
       test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/tmp/healthy') else 1)"]
       interval: 30s
       timeout: 10s
