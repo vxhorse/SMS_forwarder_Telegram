@@ -4,17 +4,48 @@ import asyncio
 import time
 import re
 from datetime import datetime, timedelta
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict, Any
 from config import SMS_PORT, SMS_BAUDRATE
 from logger import setup_logger
 from gsmmodem.pdu import encodeSmsSubmitPdu, decodeSmsPdu
 
 logger = setup_logger(__name__)
 
+# 长短信分片缓存的数据结构
+class ConcatSmsBuffer:
+    """长短信分片缓存"""
+    def __init__(self, sender: str, ref_num: int, max_parts: int, timestamp: datetime):
+        self.sender = sender
+        self.ref_num = ref_num
+        self.max_parts = max_parts
+        self.timestamp = timestamp
+        self.parts: Dict[int, str] = {}  # seq_num -> content
+        self.first_received = datetime.now()
+    
+    def add_part(self, seq_num: int, content: str) -> None:
+        """添加分片"""
+        self.parts[seq_num] = content
+    
+    def is_complete(self) -> bool:
+        """检查是否所有分片都已收到"""
+        return len(self.parts) == self.max_parts
+    
+    def get_merged_content(self) -> str:
+        """按序号合并所有分片内容"""
+        return ''.join(self.parts[i] for i in sorted(self.parts.keys()))
+    
+    def is_expired(self, timeout_seconds: int = 60) -> bool:
+        """检查缓存是否超时"""
+        return (datetime.now() - self.first_received).total_seconds() > timeout_seconds
+
+
 class DeviceManager:
     """
     设备管理类，用于检测和管理串口设备。
     """
+    
+    # 长短信缓存超时时间（秒）
+    CONCAT_SMS_TIMEOUT = 60
 
     def __init__(self, receive_sms_callback: Callable, port: Optional[str] = None, baudrate: Optional[int] = None, timeout: int = 2):
         """
@@ -44,6 +75,9 @@ class DeviceManager:
         
         self.message_queue: asyncio.Queue = asyncio.Queue()
         self.pending_sms = {"pdu": None, "expected_length": None}
+        
+        # 长短信分片缓存: key = (sender, ref_num)
+        self.concat_sms_cache: Dict[tuple, ConcatSmsBuffer] = {}
 
         assert isinstance(self.baudrate, int), "波特率必须是整数类型"
         assert isinstance(self.port, str), "端口必须是字符串类型"
@@ -372,7 +406,7 @@ class DeviceManager:
 
     async def handle_incoming_sms_pdu(self, pdu_part: bytes = b'', force_process: bool = False) -> None:
         """
-        处理接收到的短信PDU数据。
+        处理接收到的短信PDU数据，支持长短信分片合并。
 
         :param pdu_part: 接收到的部分PDU数据
         :param force_process: 是否强制处理当前已接收的数据,即使数据不完整
@@ -395,18 +429,40 @@ class DeviceManager:
 
                 # 提取短信信息
                 sender = decoded_pdu.get('number', 'Unknown')
-                timestamp = decoded_pdu.get('date', datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+                timestamp = decoded_pdu.get('date', datetime.now())
+                timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S") if isinstance(timestamp, datetime) else str(timestamp)
                 content = decoded_pdu.get('text', '')
-
-                logger.info(
-                    f"{'成功解码短信' if not force_process else '强制解码可能不完整的短信'} - 发送者: {sender}, 时间: {timestamp}, 内容: {content}")
-
-                # 调用回调函数处理解码后的短信
-                await self.receive_sms_callback(sender, timestamp, content)
+                
+                # 检查是否是长短信分片（检查UDH中的concatenation信息）
+                udh = decoded_pdu.get('udh', [])
+                concat_info = None
+                
+                # 遍历UDH查找concatenation信息
+                for header in udh:
+                    if hasattr(header, 'concatRef'):
+                        concat_info = {
+                            'ref': header.concatRef,
+                            'max': header.concatMax,
+                            'seq': header.concatSeq
+                        }
+                        break
+                
+                if concat_info:
+                    # 这是长短信的一个分片
+                    await self._handle_concat_sms_part(
+                        sender, timestamp, content,
+                        concat_info['ref'], concat_info['max'], concat_info['seq']
+                    )
+                else:
+                    # 这是普通短信，直接转发
+                    logger.info(
+                        f"{'成功解码短信' if not force_process else '强制解码可能不完整的短信'} - "
+                        f"发送者: {sender}, 时间: {timestamp_str}, 内容: {content}"
+                    )
+                    await self.receive_sms_callback(sender, timestamp_str, content)
 
             except Exception as e:
                 logger.error(f"解析PDU时出错: {e}")
-                # 在这里添加更详细的错误信息
                 logger.error(f"PDU内容: {self.pending_sms['pdu']}")
                 logger.error(f"decoded_pdu: {decoded_pdu}")
             finally:
@@ -415,6 +471,81 @@ class DeviceManager:
         else:
             logger.debug(f"PDU数据不完整,已接收 {len(self.pending_sms['pdu'])} 字节,"
                          f"预期 {self.pending_sms['expected_length'] * 2} 字节")
+    
+    async def _handle_concat_sms_part(
+        self, sender: str, timestamp: datetime, content: str,
+        ref_num: int, max_parts: int, seq_num: int
+    ) -> None:
+        """
+        处理长短信的单个分片。
+        
+        :param sender: 发送者号码
+        :param timestamp: 时间戳
+        :param content: 分片内容
+        :param ref_num: 分片引用号（用于识别属于同一条长短信的分片）
+        :param max_parts: 总分片数
+        :param seq_num: 当前分片序号（从1开始）
+        """
+        cache_key = (sender, ref_num)
+        
+        logger.debug(
+            f"收到长短信分片 - 发送者: {sender}, 引用号: {ref_num}, "
+            f"分片: {seq_num}/{max_parts}, 内容: {content[:20]}..."
+        )
+        
+        # 清理过期的缓存
+        await self._cleanup_expired_concat_cache()
+        
+        # 如果缓存中没有此长短信，创建新的缓存
+        if cache_key not in self.concat_sms_cache:
+            self.concat_sms_cache[cache_key] = ConcatSmsBuffer(
+                sender=sender,
+                ref_num=ref_num,
+                max_parts=max_parts,
+                timestamp=timestamp
+            )
+        
+        buffer = self.concat_sms_cache[cache_key]
+        buffer.add_part(seq_num, content)
+        
+        logger.info(
+            f"长短信分片已缓存 - 发送者: {sender}, 引用号: {ref_num}, "
+            f"已收到: {len(buffer.parts)}/{max_parts}"
+        )
+        
+        # 检查是否所有分片都已收到
+        if buffer.is_complete():
+            merged_content = buffer.get_merged_content()
+            timestamp_str = buffer.timestamp.strftime("%Y-%m-%d %H:%M:%S") if isinstance(buffer.timestamp, datetime) else str(buffer.timestamp)
+            
+            logger.info(
+                f"长短信已完整合并 - 发送者: {sender}, 时间: {timestamp_str}, "
+                f"分片数: {max_parts}, 完整内容: {merged_content}"
+            )
+            
+            # 转发完整的短信
+            await self.receive_sms_callback(sender, timestamp_str, merged_content)
+            
+            # 清理缓存
+            del self.concat_sms_cache[cache_key]
+    
+    async def _cleanup_expired_concat_cache(self) -> None:
+        """清理过期的长短信分片缓存"""
+        expired_keys = [
+            key for key, buffer in self.concat_sms_cache.items()
+            if buffer.is_expired(self.CONCAT_SMS_TIMEOUT)
+        ]
+        
+        for key in expired_keys:
+            buffer = self.concat_sms_cache[key]
+            logger.warning(
+                f"长短信分片超时 - 发送者: {buffer.sender}, 引用号: {buffer.ref_num}, "
+                f"已收到: {len(buffer.parts)}/{buffer.max_parts}, "
+                f"丢弃未完成的分片"
+            )
+            # 可选：转发已收到的不完整内容
+            # 这里选择丢弃，但记录日志
+            del self.concat_sms_cache[key]
         
     async def handle_send_sms(self, phone_number: str, message: str) -> bool:
         """

@@ -9,9 +9,11 @@ This project forwards SMS messages received by GSM/LTE communication modules to 
 
 - Automatically forwards received SMS to Telegram
 - Reply to SMS through Telegram
+- **Automatic long SMS merging**: Automatically identifies and merges segmented SMS to ensure complete text reception
 - Supports mainstream LTE modules (such as EC200T/EC200S/EC200A series)
 - Docker deployment for easy installation and management
 - Hot-plug support for modules
+- **Service health check**: Built-in health check mechanism to ensure stable service operation
 
 ## Hardware Requirements
 
@@ -88,6 +90,8 @@ services:
     container_name: sms-forwarder
     restart: unless-stopped
     network_mode: "host"
+    init: true  # Use tini as init process to ensure proper signal handling
+    stop_grace_period: 30s  # Graceful shutdown timeout
     devices:
       - /dev/ttyUSB2:/dev/ttyUSB2
     volumes:
@@ -99,6 +103,12 @@ services:
       - BOT_TOKEN=your_telegram_bot_token
       - CHAT_ID=your_telegram_chat_id
       - PROXY_URL=http://127.0.0.1:7890
+    healthcheck:  # Health check configuration
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/tmp/healthy') else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 ```
 
 Please make sure to modify the following:
@@ -132,8 +142,9 @@ Send `/help` in the Telegram bot conversation to view all available commands.
 
 ## Notes
 
+- **Long SMS Support**: This service supports automatic merging of long SMS. Segmented messages will wait up to 60 seconds for all parts to arrive before merging and forwarding
 - **Compatibility**: Different module models have varying compatibility; some modules may not support sending and receiving long text messages
-- **Stability**: Some modules may need to be restarted after extended operation to maintain stability
+- **Stability**: The service has built-in health checks and automatic restart mechanisms; network disconnections will automatically recover
 - **Serial Port Selection**: If communication issues occur, try modifying the `SMS_PORT` environment variable to other ttyUSB devices
 - **SIM Card Detection**: Ensure the SIM card is properly inserted and has sufficient balance
 - **Network Dependency**: Telegram communication requires a stable network connection
