@@ -2,6 +2,9 @@
 
 このプロジェクトはGSM/LTE通信モジュールが受信したSMSをTelegramボットに転送し、Telegramを通じてSMSを送信する機能もサポートします。
 
+## ドキュメント
+[English](README.md) | [日本語](README_JP.md) | [简体中文](README_CN.md) | [فارسی](README_FA.md)
+
 ## 機能特徴
 
 - 受信したSMSを自動的にTelegramに転送
@@ -11,6 +14,40 @@
 - Dockerデプロイメントで簡単にインストールと管理が可能
 - モジュールのホットプラグサポート
 - **サービスヘルスチェック**：内蔵のヘルスチェック機構により、サービスの安定稼働を保証
+
+## システムアーキテクチャ
+
+```mermaid
+graph TD
+    subgraph DC [Docker Container]
+        Main["SMSForwarder (Main Process)"]
+        
+        subgraph DeviceLayer [Device Layer]
+            DM[DeviceManager]
+            Serial["Serial Port (ttyUSB)"]
+            Buffer[ConcatSmsBuffer]
+        end
+        
+        subgraph NetworkLayer [Network Layer]
+            Bot[TelegramBot]
+            API[Telegram API]
+        end
+        
+        Health[HealthCheck]
+    end
+    
+    Hardware[LTE Module] <--> Serial
+    Main --> DM
+    Main --> Bot
+    DM <--> Serial
+    DM -- "SMSフラグメント" --> Buffer
+    Buffer -- "結合されたSMS" --> DM
+    DM -- "SMS転送" --> Main
+    Main -- "メッセージ送信" --> Bot
+    Bot <--> API
+    
+    Main -. "状態監視" .- Health
+```
 
 ## ハードウェア要件
 
@@ -87,8 +124,7 @@ services:
     container_name: sms-forwarder
     restart: unless-stopped
     network_mode: "host"
-    init: true  # tiniをinitプロセスとして使用し、シグナルの正確な伝達を保証
-    stop_grace_period: 30s  # グレースフルシャットダウンタイムアウト
+    stop_grace_period: 30s
     devices:
       - /dev/ttyUSB2:/dev/ttyUSB2
     volumes:
@@ -100,7 +136,7 @@ services:
       - BOT_TOKEN=your_telegram_bot_token
       - CHAT_ID=your_telegram_chat_id
       - PROXY_URL=http://127.0.0.1:7890
-    healthcheck:  # ヘルスチェック設定
+    healthcheck:
       test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/tmp/healthy') else 1)"]
       interval: 30s
       timeout: 10s
