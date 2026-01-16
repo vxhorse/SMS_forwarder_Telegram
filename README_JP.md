@@ -6,9 +6,11 @@
 
 - 受信したSMSを自動的にTelegramに転送
 - Telegramを通じてSMSに返信
+- **長文SMS自動結合**：分割されたSMSを自動的に識別・結合し、完全なテキストを確実に受信
 - 主流のLTEモジュール（EC200T/EC200S/EC200Aなどのシリーズ）をサポート
 - Dockerデプロイメントで簡単にインストールと管理が可能
 - モジュールのホットプラグサポート
+- **サービスヘルスチェック**：内蔵のヘルスチェック機構により、サービスの安定稼働を保証
 
 ## ハードウェア要件
 
@@ -85,6 +87,8 @@ services:
     container_name: sms-forwarder
     restart: unless-stopped
     network_mode: "host"
+    init: true  # tiniをinitプロセスとして使用し、シグナルの正確な伝達を保証
+    stop_grace_period: 30s  # グレースフルシャットダウンタイムアウト
     devices:
       - /dev/ttyUSB2:/dev/ttyUSB2
     volumes:
@@ -96,6 +100,12 @@ services:
       - BOT_TOKEN=your_telegram_bot_token
       - CHAT_ID=your_telegram_chat_id
       - PROXY_URL=http://127.0.0.1:7890
+    healthcheck:  # ヘルスチェック設定
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/tmp/healthy') else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 ```
 
 以下の内容を必ず変更してください：
@@ -129,8 +139,9 @@ Telegramボットとの対話で`/help`を送信して、利用可能なすべ�
 
 ## 注意事項
 
+- **長文SMSサポート**：本サービスは長文SMSの自動結合に対応しており、分割されたSMSは60秒以内にすべての断片が到着するのを待って結合・転送されます
 - **互換性**：異なるモデルのモジュールの互換性は異なり、一部のモジュールは長文SMSの送受信をサポートしていない場合があります
-- **安定性**：一部のモジュールは長時間稼働後、安定性を維持するために再起動が必要な場合があります
+- **安定性**：サービスには内蔵のヘルスチェックと自動再起動機構があり、ネットワーク問題による切断は自動的に復旧します
 - **シリアルポートの選択**：通信問題が発生した場合、`SMS_PORT`環境変数を他のttyUSBデバイスに変更してみてください
 - **SIMカードの検出**：SIMカードが正しく挿入され、十分な残高があることを確認してください
 - **ネットワーク依存**：Telegram通信には安定したネットワーク接続が必要です

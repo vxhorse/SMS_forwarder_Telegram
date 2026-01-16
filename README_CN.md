@@ -6,9 +6,11 @@
 
 - 自动转发接收到的短信到Telegram
 - 通过Telegram回复短信
+- **长短信自动合并**：自动识别并合并分片短信，确保完整接收长文本
 - 支持主流LTE模块（如EC200T/EC200S/EC200A等系列）
 - Docker部署，易于安装和管理
 - 模块热插拔支持
+- **服务健康检查**：内置健康检查机制，确保服务稳定运行
 
 ## 硬件要求
 
@@ -85,6 +87,8 @@ services:
     container_name: sms-forwarder
     restart: unless-stopped
     network_mode: "host"
+    init: true  # 使用tini作为init进程，确保信号正确传递
+    stop_grace_period: 30s  # 优雅关闭超时时间
     devices:
       - /dev/ttyUSB2:/dev/ttyUSB2
     volumes:
@@ -96,6 +100,12 @@ services:
       - BOT_TOKEN=your_telegram_bot_token
       - CHAT_ID=your_telegram_chat_id
       - PROXY_URL=http://127.0.0.1:7890
+    healthcheck:  # 健康检查配置
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/tmp/healthy') else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 ```
 
 请确保修改以下内容：
@@ -129,8 +139,9 @@ docker compose up -d
 
 ## 注意事项
 
+- **长短信支持**：本服务已支持长短信自动合并，分片短信会在60秒内等待所有分片到达后合并转发
 - **兼容性**：不同型号的模块兼容性不同，某些模块可能不支持长文本短信的收发
-- **稳定性**：部分模块在长时间运行后可能需要重启以保持稳定
+- **稳定性**：服务内置健康检查和自动重启机制，网络问题导致的断连会自动恢复
 - **串口选择**：如遇通信问题，尝试修改`SMS_PORT`环境变量为其他ttyUSB设备
 - **SIM卡检测**：确保SIM卡正确插入并有足够余额
 - **网络依赖**：Telegram通信需要稳定的网络连接
