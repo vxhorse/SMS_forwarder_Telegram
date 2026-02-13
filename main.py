@@ -52,8 +52,13 @@ class SMSForwarder:
             logger.info("正在初始化Telegram Bot...")
             tb_connect_task = asyncio.create_task(self.tb.start())
             
-            # 等待一段时间确认Bot启动
-            await asyncio.sleep(2)
+            # 等待 Telegram Bot 就绪事件（带超时）
+            try:
+                await asyncio.wait_for(self.tb.priming_event.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                logger.error("Telegram Bot启动超时")
+                raise RuntimeError("Telegram Bot启动超时")
+            
             if not self.tb.is_running:
                 raise RuntimeError("Telegram Bot未能正常启动")
             
