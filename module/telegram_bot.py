@@ -85,6 +85,9 @@ class TelegramBot:
         self.exit_event = asyncio.Event()
         self.polling_task: Optional[asyncio.Task] = None
 
+        # 启动就绪事件（供 main.py 等待）
+        self.priming_event = asyncio.Event()
+
         # 会话管理
         self.session: Optional[aiohttp.ClientSession] = None
         self.session_lock = asyncio.Lock()
@@ -100,16 +103,22 @@ class TelegramBot:
 
             if await self.verify_connection():
                 await self.setup_commands()
-                await self.send_welcome_message()
                 self.is_running = True
+                self.priming_event.set()
                 self.polling_task = asyncio.create_task(self.polling_loop())
                 logger.info("成功连接到 Telegram API")
+                # 欢迎消息在就绪之后发送，失败不影响服务启动
+                try:
+                    await self.send_welcome_message()
+                except Exception as e:
+                    logger.warning(f"发送欢迎消息失败（不影响服务运行）: {e}")
             else:
                 raise ConnectionError("无法连接到 Telegram API")
         except Exception as e:
             logger.error(f"连接时发生错误: {e}")
             # 确保is_running标志被设置为False
             self.is_running = False
+            self.priming_event.set()  # 即使失败也要通知，避免 main.py 永久等待
             # 标记为未连接状态，让start()方法抛出异常
             raise
 
@@ -168,10 +177,15 @@ class TelegramBot:
         """
         启动 Telegram Bot 服务。
         """
-        # 连接到 Telegram API
-        await self.connect()
-        # 等待退出事件
-        await self.exit_event.wait()
+        try:
+            # 连接到 Telegram API
+            await self.connect()
+            # 等待退出事件
+            await self.exit_event.wait()
+        except Exception as e:
+            logger.error(f"Telegram Bot 启动失败: {e}")
+            self.priming_event.set()  # 确保 main.py 不会永久等待
+            raise
 
     async def close(self) -> None:
         """关闭 Telegram Bot 连接"""
