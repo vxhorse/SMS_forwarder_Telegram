@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Callable, Dict, Any
 from config import SMS_PORT, SMS_BAUDRATE
 from logger import setup_logger
-from gsmmodem.pdu import encodeSmsSubmitPdu, decodeSmsPdu
+from gsmmodem.pdu import encodeSmsSubmitPdu, decodeSmsPdu, Concatenation
 
 logger = setup_logger(__name__)
 
@@ -439,22 +439,27 @@ class DeviceManager:
                 
                 # 遍历UDH查找concatenation信息
                 for header in udh:
-                    if hasattr(header, 'concatRef'):
+                    if isinstance(header, Concatenation):
                         concat_info = {
-                            'ref': header.concatRef,
-                            'max': header.concatMax,
-                            'seq': header.concatSeq
+                            'ref': header.reference,
+                            'max': header.parts,
+                            'seq': header.number
                         }
                         break
                 
                 if concat_info:
                     # 这是长短信的一个分片
+                    logger.debug(
+                        f"检测到长短信UDH - ref={concat_info['ref']}, "
+                        f"seq={concat_info['seq']}/{concat_info['max']}"
+                    )
                     await self._handle_concat_sms_part(
                         sender, timestamp, content,
                         concat_info['ref'], concat_info['max'], concat_info['seq']
                     )
                 else:
                     # 这是普通短信，直接转发
+                    logger.debug(f"普通短信（无UDH拼接信息），UDH元素: {udh}")
                     logger.info(
                         f"{'成功解码短信' if not force_process else '强制解码可能不完整的短信'} - "
                         f"发送者: {sender}, 时间: {timestamp_str}, 内容: {content}"
