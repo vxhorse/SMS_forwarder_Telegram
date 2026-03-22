@@ -82,6 +82,11 @@ class SMSForwarder:
         while self.is_running and not self._shutdown_event.is_set():
             await asyncio.sleep(check_interval)
             
+            # sleep 醒来后再次检查是否已进入关闭流程
+            if self._shutdown_event.is_set() or not self.is_running:
+                logger.info("检测到关闭信号，退出监控循环")
+                break
+            
             # 检查各服务状态
             if not self.dm.is_running:
                 logger.error("设备管理器已停止运行")
@@ -106,7 +111,10 @@ class SMSForwarder:
             self._mark_healthy()
     
     async def shutdown(self) -> None:
-        """优雅关闭服务"""
+        """关闭服务"""
+        if self._shutdown_event.is_set():
+            return  # 已在关闭中，跳过重复执行
+        
         logger.info("开始关闭SMS转发服务...")
         self.is_running = False
         self._shutdown_event.set()
