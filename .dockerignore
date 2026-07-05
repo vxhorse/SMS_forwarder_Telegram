@@ -16,6 +16,7 @@ logs/
 Dockerfile
 docker-compose.yml
 docker-compose.yaml
+docker-compose.example.yml
 .DS_Store
 .idea/
 .vscode/

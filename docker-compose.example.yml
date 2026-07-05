@@ -1,0 +1,20 @@
+services:
+  sms-forwarder:
+    image: vxhorse/sms-forwarder:latest
+    container_name: sms-forwarder
+    restart: unless-stopped
+    network_mode: "host"
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    devices:
+      - ${SMS_PORT:-/dev/ttyUSB2}:${SMS_PORT:-/dev/ttyUSB2}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/tmp/healthy') else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

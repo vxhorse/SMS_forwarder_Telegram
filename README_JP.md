@@ -109,46 +109,27 @@ sudo systemctl disable ModemManager
 
 ### 5. プロジェクトの設定
 
-1. Dockerイメージを取得：
+1. Dockerイメージを取得します。`latest` イメージは `linux/amd64` と `linux/arm64` をサポートしています：
 
 ```bash
 docker pull vxhorse/sms-forwarder
 ```
 
-2. `docker-compose.yml`ファイルを作成し、環境変数とデバイスマッピングを設定：
+2. サニタイズ済みテンプレートからローカル設定ファイルを作成します：
 
-```yaml
-services:
-  sms-forwarder:
-    image: vxhorse/sms-forwarder:latest
-    container_name: sms-forwarder
-    restart: unless-stopped
-    network_mode: "host"
-    stop_grace_period: 30s
-    devices:
-      - /dev/ttyUSB2:/dev/ttyUSB2
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-    environment:
-      - LOG_LEVEL=INFO
-      - SMS_PORT=/dev/ttyUSB2
-      - SMS_BAUDRATE=115200
-      - BOT_TOKEN=your_telegram_bot_token
-      - CHAT_ID=your_telegram_chat_id
-      - PROXY_URL=http://127.0.0.1:7890
-    healthcheck:
-      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/tmp/healthy') else 1)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+```bash
+cp .env.example .env
+cp docker-compose.example.yml docker-compose.yml
 ```
+
+3. 実際の環境に合わせて `.env` と `docker-compose.yml` を編集します。
 
 以下の内容を必ず変更してください：
 - `SMS_PORT`: 実際の状況に応じて正しいSMS通信ポートに修正
 - `BOT_TOKEN`: あなたのTelegramボットTokenに置き換え
 - `CHAT_ID`: あなたのTelegramユーザーIDに置き換え
 - デバイスマッピング `/dev/ttyUSB2:/dev/ttyUSB2`: 正しいSMSポートに修正
+- `PROXY_URL`: ホストでローカルプロキシを実行している場合は `http://127.0.0.1:7890` のままにし、ネットワーク環境に合わせて変更してください
 
 ### 6. サービスの起動
 
