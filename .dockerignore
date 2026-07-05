@@ -10,6 +10,7 @@ __pycache__/
 .env.*
 venv/
 env/
+.venv/
 *.log
 logs/
 Dockerfile
@@ -21,4 +22,7 @@ docker-compose.yaml
 README.md
 README_CN.md
 README_JP.md
+README_FA.md
+doc/
 *.pdf
+**/*.pdf
