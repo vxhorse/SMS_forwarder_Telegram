@@ -8,8 +8,10 @@ __pycache__/
 # 环境文件
 .env
 .env.*
+!.env.example
 venv/
 env/
+.venv/
 
 # 日志文件
 *.log
@@ -17,6 +19,8 @@ logs/
 
 # Docker相关
 *.tar
+*.tar.gz
+*.tgz
 docker-compose.yml
 docker-compose.yaml
 

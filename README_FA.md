@@ -109,46 +109,27 @@ sudo systemctl disable ModemManager
 
 ### 5. پیکربندی پروژه
 
-1. دریافت ایمیج Docker:
+1. ایمیج Docker را دریافت کنید. ایمیج `latest` از `linux/amd64` و `linux/arm64` پشتیبانی می‌کند:
 
 ```bash
 docker pull vxhorse/sms-forwarder
 ```
 
-2. یک فایل `docker-compose.yml` ایجاد کنید و متغیرهای محیطی و نگاشت دستگاه را پیکربندی کنید:
+2. فایل‌های پیکربندی محلی را از قالب‌های بدون اطلاعات حساس ایجاد کنید:
 
-```yaml
-services:
-  sms-forwarder:
-    image: vxhorse/sms-forwarder:latest
-    container_name: sms-forwarder
-    restart: unless-stopped
-    network_mode: "host"
-    stop_grace_period: 30s
-    devices:
-      - /dev/ttyUSB2:/dev/ttyUSB2
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-    environment:
-      - LOG_LEVEL=INFO
-      - SMS_PORT=/dev/ttyUSB2
-      - SMS_BAUDRATE=115200
-      - BOT_TOKEN=your_telegram_bot_token
-      - CHAT_ID=your_telegram_chat_id
-      - PROXY_URL=http://127.0.0.1:7890
-    healthcheck:
-      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/tmp/healthy') else 1)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+```bash
+cp .env.example .env
+cp docker-compose.example.yml docker-compose.yml
 ```
+
+3. فایل‌های `.env` و `docker-compose.yml` را مطابق محیط واقعی خود ویرایش کنید.
 
 لطفاً موارد زیر را تغییر دهید:
 - `SMS_PORT`: بسته به شرایط واقعی به پورت صحیح ارتباط پیامک تغییر دهید
 - `BOT_TOKEN`: با Token ربات تلگرام خود جایگزین کنید
 - `CHAT_ID`: با شناسه کاربری تلگرام خود جایگزین کنید
 - نگاشت دستگاه `/dev/ttyUSB2:/dev/ttyUSB2`: به پورت صحیح پیامک تغییر دهید
+- `PROXY_URL`: اگر روی میزبان پروکسی محلی دارید، `http://127.0.0.1:7890` را نگه دارید؛ در غیر این صورت آن را با توجه به شبکه خود تغییر دهید
 
 ### 6. راه‌اندازی سرویس
 

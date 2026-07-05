@@ -109,46 +109,27 @@ sudo systemctl disable ModemManager
 
 ### 5. 配置项目
 
-1. 拉取Docker镜像：
+1. 拉取Docker镜像。`latest` 镜像已支持 `linux/amd64` 和 `linux/arm64`：
 
 ```bash
 docker pull vxhorse/sms-forwarder
 ```
 
-2. 创建`docker-compose.yml`文件，并配置环境变量和设备映射：
+2. 从脱敏模板创建本地配置文件：
 
-```yaml
-services:
-  sms-forwarder:
-    image: vxhorse/sms-forwarder:latest
-    container_name: sms-forwarder
-    restart: unless-stopped
-    network_mode: "host"
-    stop_grace_period: 30s
-    devices:
-      - /dev/ttyUSB2:/dev/ttyUSB2
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-    environment:
-      - LOG_LEVEL=INFO
-      - SMS_PORT=/dev/ttyUSB2
-      - SMS_BAUDRATE=115200
-      - BOT_TOKEN=your_telegram_bot_token
-      - CHAT_ID=your_telegram_chat_id
-      - PROXY_URL=http://127.0.0.1:7890
-    healthcheck:
-      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/tmp/healthy') else 1)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+```bash
+cp .env.example .env
+cp docker-compose.example.yml docker-compose.yml
 ```
+
+3. 根据实际环境编辑 `.env` 和 `docker-compose.yml`。
 
 请确保修改以下内容：
 - `SMS_PORT`: 按实际情况修改为正确的短信通信端口
 - `BOT_TOKEN`: 替换为您的Telegram机器人Token
 - `CHAT_ID`: 替换为您的Telegram用户ID
 - 设备映射 `/dev/ttyUSB2:/dev/ttyUSB2`: 修改为正确的短信端口
+- `PROXY_URL`: 如果主机运行本地代理，可保留 `http://127.0.0.1:7890`；否则按网络环境调整
 
 ### 6. 启动服务
 

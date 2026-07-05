@@ -109,46 +109,27 @@ For detailed tutorial, refer to the [Telegram Bot API documentation](https://cor
 
 ### 5. Configure the Project
 
-1. Pull the Docker image:
+1. Pull the Docker image. The `latest` image supports `linux/amd64` and `linux/arm64`:
 
 ```bash
 docker pull vxhorse/sms-forwarder
 ```
 
-2. Create a `docker-compose.yml` file and configure environment variables and device mapping:
+2. Create local configuration files from the sanitized templates:
 
-```yaml
-services:
-  sms-forwarder:
-    image: vxhorse/sms-forwarder:latest
-    container_name: sms-forwarder
-    restart: unless-stopped
-    network_mode: "host"
-    stop_grace_period: 30s
-    devices:
-      - /dev/ttyUSB2:/dev/ttyUSB2
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-    environment:
-      - LOG_LEVEL=INFO
-      - SMS_PORT=/dev/ttyUSB2
-      - SMS_BAUDRATE=115200
-      - BOT_TOKEN=your_telegram_bot_token
-      - CHAT_ID=your_telegram_chat_id
-      - PROXY_URL=http://127.0.0.1:7890
-    healthcheck:
-      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/tmp/healthy') else 1)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+```bash
+cp .env.example .env
+cp docker-compose.example.yml docker-compose.yml
 ```
+
+3. Edit `.env` and `docker-compose.yml` for your environment.
 
 Please make sure to modify the following:
 - `SMS_PORT`: Change to the correct SMS communication port as needed
 - `BOT_TOKEN`: Replace with your Telegram bot Token
 - `CHAT_ID`: Replace with your Telegram user ID
 - Device mapping `/dev/ttyUSB2:/dev/ttyUSB2`: Modify to the correct SMS port
+- `PROXY_URL`: Keep `http://127.0.0.1:7890` if you run a local proxy on the host; adjust it for your network
 
 ### 6. Start the Service
 
