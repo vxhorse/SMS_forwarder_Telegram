@@ -95,6 +95,24 @@ AT_COMMAND_TIMEOUT = float(os.getenv("AT_COMMAND_TIMEOUT", "3.0"))
 # Longer timeout for commands the modem processes slowly (AT&F, AT+CFUN, AT&W).
 AT_SLOW_COMMAND_TIMEOUT = float(os.getenv("AT_SLOW_COMMAND_TIMEOUT", "10.0"))
 
+# How long the serial transport gets to flush what it is still holding when the
+# connection is released, in seconds.
+#
+# A close completes only once that buffer has drained, and the transport leaves
+# it to the write path to say when it has. A port that has stopped accepting
+# bytes never says it, and nothing raises: the bytes are simply queued behind
+# flow control. The probe that noticed the modem had gone quiet is exactly what
+# leaves bytes in the buffer, so the close that follows such a detection is the
+# one most likely never to end - and an unbounded wait there parks the process
+# in teardown, still holding the port, until the watchdog's down tolerance runs
+# out an hour later.
+#
+# Past the deadline the transport is aborted instead, which discards the buffer
+# and forces the close through. Floored because zero would abort every ordinary
+# disconnect before the transport had a chance to flush, and an abort throws
+# away whatever was still queued.
+SERIAL_CLOSE_TIMEOUT = max(1.0, float(os.getenv("SERIAL_CLOSE_TIMEOUT", "5.0")))
+
 # Modem liveness probe (AT+CSQ): interval, response deadline, and how many
 # consecutive misses trigger a reconnect.
 #

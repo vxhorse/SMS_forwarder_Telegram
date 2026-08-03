@@ -660,11 +660,48 @@ class DeviceManager:
             # that never reached the port.
             return
         try:
+            # Deliberately outside the deadline below: this only asks the
+            # transport to close and returns at once. What can take forever is
+            # waiting for it to finish, because it finishes only once its write
+            # buffer has drained and a port under asserted flow control never
+            # drains one. Nothing raises there - the bytes are queued, not
+            # rejected - so the guard around this block cannot help, and the
+            # detection that ended the session is itself what leaves bytes in
+            # that buffer. Aborting discards them and forces the close through,
+            # which is the only way to give the port back. self.writer is
+            # already None by here, so abandoning a writer that will not close
+            # leaves nothing inconsistent behind.
             writer.close()
-            await writer.wait_closed()
+            await asyncio.wait_for(
+                writer.wait_closed(), timeout=config.SERIAL_CLOSE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Serial port did not close within {config.SERIAL_CLOSE_TIMEOUT:.0f}s; "
+                f"aborting the transport and discarding whatever it still held"
+            )
+            self._abort_transport(writer)
         except Exception as exc:
             logger.warning(f"Error closing serial writer: {exc}")
         await self._notify("⚠️ Modem disconnected, reconnecting")
+
+    @staticmethod
+    def _abort_transport(writer) -> None:
+        """Force a transport closed, discarding anything it has not written.
+
+        The escalation for a close that cannot complete, and never the ordinary
+        path: what it discards is real data that a working port would have sent.
+        """
+        abort = getattr(getattr(writer, "transport", None), "abort", None)
+        if abort is None:
+            logger.warning(
+                "Serial transport offers no way to abort; the port may stay held"
+            )
+            return
+        try:
+            abort()
+        except Exception as exc:
+            logger.warning(f"Could not abort the serial transport: {exc}")
 
     async def _notify(self, text: str) -> None:
         """Report outward. A dead channel must not affect the device path."""
