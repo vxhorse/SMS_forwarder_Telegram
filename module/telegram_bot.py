@@ -19,6 +19,46 @@ from module.supervisor import FatalConfigError
 
 logger = setup_logger(__name__)
 
+
+# What may leave this module inside an exception, and why.
+#
+# Every request built here carries the bot token in its path
+# (https://api.telegram.org/bot<TOKEN>/...), and that token grants both read and
+# write access to the chat. Several aiohttp exception types append the request
+# URL to their own str(), so any of them escaping this module puts the token
+# into whatever logs the failure - and the callers that report a failed
+# component interpolate the exception they are handed.
+#
+# So no exception built from a request is ever allowed out. Failures leave as
+# TelegramApiError, whose text this module writes itself, and any exception text
+# that is echoed has the token removed from it first.
+
+
+class TelegramApiError(Exception):
+    """An API call failed, described without any part of the request."""
+
+
+# aiohttp types that render the request URL in their own str(). These two cover
+# all eight: ContentTypeError, ClientHttpProxyError, TooManyRedirects and
+# WSServerHandshakeError derive from ClientResponseError, and the two
+# InvalidUrl* errors derive from InvalidURL.
+_URL_RENDERING_ERRORS = (aiohttp.ClientResponseError, aiohttp.InvalidURL)
+
+# What a request can fail with. aiohttp.ClientError covers every type above.
+_REQUEST_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
+
+
+def _scrub(text: str, token: str) -> str:
+    """Remove the bot token from a string.
+
+    An empty token is left alone rather than treated as absent: an empty needle
+    matches between every character, which would rewrite the whole string.
+    """
+    if not token:
+        return text
+    return text.replace(token, "<token>")
+
+
 class TelegramBot:
     """The Telegram component: one API session and everything on top of it.
 
@@ -31,20 +71,17 @@ class TelegramBot:
         'start': {
             'command': '/start',
             'description': '开始使用机器人',
-            'help_text': '显示欢迎消息并初始化机器人',
-            'keyboard_text': '🏠 主菜单'
+            'help_text': '显示欢迎消息并初始化机器人'
         },
         'help': {
             'command': '/help',
             'description': '显示帮助信息',
-            'help_text': '显示所有可用的命令和使用说明',
-            'keyboard_text': '💁 帮助'
+            'help_text': '显示所有可用的命令和使用说明'
         },
         'sendsms': {
             'command': '/sendsms',
             'description': '发送短信',
-            'help_text': '开始发送短信的流程',
-            'keyboard_text': '📲 发送短信'
+            'help_text': '开始发送短信的流程'
         }
     }
 
@@ -89,7 +126,6 @@ class TelegramBot:
         # years in the past and leaps forward once time is synchronised, which
         # would make any wall-clock interval nonsense.
         self.last_activity = time.monotonic()
-        self.polling_task: Optional[asyncio.Task] = None
 
         # Session management.
         self.session: Optional[aiohttp.ClientSession] = None
@@ -99,6 +135,27 @@ class TelegramBot:
 
         self.name = "telegram"
         self.health = health
+
+    def _describe_error(self, exc: BaseException) -> str:
+        """Describe a failure without reproducing any part of the request.
+
+        For a type that renders the URL, only the class name and the status are
+        echoed; both come from aiohttp's own vocabulary rather than from the
+        request, which is what makes them safe. Every other exception keeps its
+        message, because that is where the useful detail lives - a refused proxy
+        names the address it could not reach - with the token removed in case
+        one ever carries it. The allow-list decides what may be quoted; the
+        scrub is a second guard for types not anticipated here.
+        """
+        detail = type(exc).__name__
+        status = getattr(exc, "status", None)
+        if isinstance(status, int):
+            detail = f"{detail} (HTTP {status})"
+        if not isinstance(exc, _URL_RENDERING_ERRORS):
+            text = _scrub(str(exc), self.bot_token)
+            if text:
+                detail = f"{detail}: {text}"
+        return detail
 
     def validate_config(self) -> None:
         """Reject placeholder or missing credentials.
@@ -139,14 +196,11 @@ class TelegramBot:
     async def teardown(self) -> None:
         """Release the session. Idempotent, never raises."""
         self.is_running = False
-        if self.polling_task and not self.polling_task.done():
-            self.polling_task.cancel()
-            self.polling_task = None
         try:
             if self.session is not None and not self.session.closed:
                 await self.session.close()
         except Exception as exc:
-            logger.warning(f"Error closing the Telegram session: {exc}")
+            logger.warning(f"Error closing the Telegram session: {self._describe_error(exc)}")
         self.session = None
 
     async def notify(self, text: str) -> None:
@@ -157,7 +211,7 @@ class TelegramBot:
         try:
             await self.send_message(text)
         except Exception as exc:
-            logger.warning(f"Could not send notification: {exc}")
+            logger.warning(f"Could not send notification: {self._describe_error(exc)}")
 
     async def setup_commands(self) -> None:
         """Publish the bot's command list."""
@@ -179,21 +233,31 @@ class TelegramBot:
         except Exception as e:
             # Not fatal to the session: a bot whose command menu is stale still
             # forwards messages.
-            logger.error(f"Error publishing the command list: {e}")
+            logger.error(f"Error publishing the command list: {self._describe_error(e)}")
 
     async def verify_connection(self) -> bool:
         """Confirm the API answers for this token."""
         url = f'{self.base_url}getMe'
 
-        async with self.session.get(url, proxy=self.proxy_url) as response:
-            if response.status == 200:
-                data = await response.json()
-                if data.get('ok'):
-                    # The bot's own identity, not anyone's message.
-                    username = data.get('result', {}).get('username')
-                    logger.debug(f"Connected to Telegram bot: {username}")
-                    return True
-            logger.error(f"Connection check failed: HTTP {response.status}")
+        try:
+            async with self.session.get(url, proxy=self.proxy_url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('ok'):
+                        # The bot's own identity, not anyone's message.
+                        username = data.get('result', {}).get('username')
+                        logger.debug(f"Connected to Telegram bot: {username}")
+                        return True
+                logger.error(f"Connection check failed: HTTP {response.status}")
+        except _REQUEST_ERRORS as exc:
+            # Detached from the original with "from None" so no traceback or
+            # chained context can carry the URL onward either. The response body
+            # is decoded inside this block on purpose: a proxy answering with an
+            # HTML error page makes json() raise ContentTypeError, which renders
+            # the URL.
+            raise TelegramApiError(
+                f"getMe failed: {self._describe_error(exc)}"
+            ) from None
         return False
 
     async def polling_loop(self) -> None:
@@ -231,25 +295,32 @@ class TelegramBot:
         """Fetch pending updates from the API."""
         url = f'{self.base_url}getUpdates'
         params = {'offset': self.offset, 'timeout': 50}
-        async with self.session.get(url, params=params, proxy=self.proxy_url) as response:
-            if response.status == 200:
-                data = await response.json()
-                return data.get('result', [])
-            else:
+        try:
+            async with self.session.get(url, params=params, proxy=self.proxy_url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get('result', [])
                 # The body is not quoted: an error reply is an unbounded
                 # server-controlled string, and its size is enough to tell an
-                # empty answer from a real one.
+                # empty answer from a real one. This was a ClientResponseError,
+                # which carries the request it came from and prints the URL, so
+                # a routine 409 or 401 published the token on every attempt.
                 error_text = await response.text()
-                raise aiohttp.ClientResponseError(
-                    request_info=response.request_info,
-                    history=response.history,
-                    status=response.status,
-                    message=f"Could not fetch updates: HTTP {response.status}, "
-                            f"{len(error_text)} byte reply"
+                raise TelegramApiError(
+                    f"Could not fetch updates: HTTP {response.status}, "
+                    f"{len(error_text)} byte reply"
                 )
+        except _REQUEST_ERRORS as exc:
+            raise TelegramApiError(
+                f"Could not fetch updates: {self._describe_error(exc)}"
+            ) from None
 
     async def process_update(self, update: dict) -> None:
-        """Route one update."""
+        """Route one update, once it is known to come from the configured chat.
+
+        Authorisation lives here, at the routing point, so every branch that can
+        reach a handler is guarded by the same check in one readable place.
+        """
         self.offset = max(self.offset, update['update_id'] + 1)
 
         if 'message' in update and 'text' in update['message']:
@@ -260,7 +331,16 @@ class TelegramBot:
             else:
                 logger.warning(f"Message from an unauthorised chat: {chat_id}")
         elif 'callback_query' in update:
-            await self.process_callback_query(update['callback_query'])
+            callback_query = update['callback_query']
+            # A button press is as unauthenticated as a message: anyone who can
+            # reach the bot can send one, and the handler writes to user_state
+            # under the presser's own chat id. Navigated with get() because a
+            # callback need not carry a message at all.
+            chat_id = str(callback_query.get('message', {}).get('chat', {}).get('id'))
+            if chat_id == self.chat_id:
+                await self.process_callback_query(callback_query)
+            else:
+                logger.warning(f"Callback from an unauthorised chat: {chat_id}")
         else:
             # Field names only. Their values may hold a message body.
             logger.warning(f"Update of an unhandled kind: {sorted(update.keys())}")
@@ -401,9 +481,17 @@ class TelegramBot:
             'callback_query_id': callback_query_id,
             'text': text
         }
-        async with self.session.post(url, json=data, proxy=self.proxy_url) as response:
-            if response.status != 200:
-                logger.warning(f'Could not answer a callback query: HTTP {response.status}')
+        try:
+            async with self.session.post(url, json=data, proxy=self.proxy_url) as response:
+                if response.status != 200:
+                    logger.warning(f'Could not answer a callback query: HTTP {response.status}')
+        except _REQUEST_ERRORS as exc:
+            # Still propagates, as it always did - this runs inside the polling
+            # loop, so the supervisor should see a broken session. Only its
+            # rendering changes.
+            raise TelegramApiError(
+                f"Could not answer a callback query: {self._describe_error(exc)}"
+            ) from None
 
     async def send_welcome_message(self) -> None:
         """Send the welcome text."""
@@ -501,7 +589,8 @@ class TelegramBot:
             except Exception as e:
                 logger.error(
                     f'Error sending a message '
-                    f'(attempt {attempt + 1}/{self.max_retries}): {e}'
+                    f'(attempt {attempt + 1}/{self.max_retries}): '
+                    f'{self._describe_error(e)}'
                 )
 
             if attempt < self.max_retries - 1:
@@ -537,7 +626,7 @@ class TelegramBot:
 
             return {'inline_keyboard': formatted_keyboard}
         except Exception as e:
-            logger.error(f"Error building a keyboard layout: {e}")
+            logger.error(f"Error building a keyboard layout: {self._describe_error(e)}")
             return {}
 
     @staticmethod
