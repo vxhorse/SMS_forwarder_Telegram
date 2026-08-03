@@ -13,6 +13,7 @@ from gsmmodem.pdu import encodeSmsSubmitPdu
 import config
 from module.device_manager import DeviceManager, ForwardOutcome
 from module.health import HealthState
+from tests.ast_helpers import dotted_name
 
 # A reserved test number, not anyone's. Long enough that a masked form and the
 # full form are clearly different strings.
@@ -2373,16 +2374,6 @@ async def test_a_notify_failure_cannot_break_the_device_path():
     assert manager.writer is None
 
 
-def _dotted_name(node):
-    """Render an exception type as a dotted name, or None if it is not one."""
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        parent = _dotted_name(node.value)
-        return f"{parent}.{node.attr}" if parent else None
-    return None
-
-
 def test_the_write_cannot_start_swallowing_cancellations():
     """The property in send_at_command_async that a widening edit could undo in
     silence, guarded on the shape of the code rather than on behaviour.
@@ -2416,7 +2407,7 @@ def test_the_write_cannot_start_swallowing_cancellations():
         if isinstance(node, ast.Try)
         and any(
             isinstance(inner, ast.Call)
-            and (_dotted_name(inner.func) or "").endswith(".drain")
+            and (dotted_name(inner.func) or "").endswith(".drain")
             for statement in node.body
             for inner in ast.walk(statement)
         )
@@ -2429,7 +2420,7 @@ def test_the_write_cannot_start_swallowing_cancellations():
     handlers = guarded[0].handlers
     assert handlers, "the write around which this property exists is gone"
     first = handlers[0]
-    assert _dotted_name(first.type) in ("asyncio.CancelledError", "CancelledError"), (
+    assert dotted_name(first.type) in ("asyncio.CancelledError", "CancelledError"), (
         "a cancellation must be handled before anything broader can catch it"
     )
     assert len(first.body) == 1 and isinstance(first.body[0], ast.Raise), (
