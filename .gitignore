@@ -37,8 +37,5 @@ docker-compose.yaml.bak-*
 # Local workflow documents, not in repository
 docs/superpowers/
 
-# Vendor manuals and third-party copyrighted materials
-doc/
-
 # Local deployment records name specific hosts
 docs/deployments/
