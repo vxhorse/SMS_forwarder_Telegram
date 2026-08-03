@@ -956,12 +956,14 @@ async def test_probe_settings_come_from_config(monkeypatch):
     monkeypatch.setattr(config, "MODEM_PROBE_TIMEOUT", 13.0)
     monkeypatch.setattr(config, "MODEM_PROBE_FAILURES", 7)
     monkeypatch.setattr(config, "MODEM_REGISTRATION_FAILURES", 9)
+    monkeypatch.setattr(config, "MODEM_REGISTRATION_CHECK", False)
 
     manager = _make()
     assert manager.probe_interval == 11.0
     assert manager.probe_timeout == 13.0
     assert manager.probe_failures == 7
     assert manager.registration_failures == 9
+    assert manager.registration_check is False
 
 
 async def test_one_reading_can_never_be_enough_to_drop_the_connection(monkeypatch):
@@ -1113,8 +1115,10 @@ async def test_every_registration_shape_the_manual_gives_is_read_correctly():
         b"+CREG: 2,0": 0,
         b"+CREG: 2,2": 2,
         b"+CREG: 0,3": 3,
+        b"+CREG: 2,6": 6,
         b'+CREG: 2,1,"D509","80D413D",7': 1,
         b'+CREG: 2,5,"D509","80D413D",7': 5,
+        b'+CREG: 2,7,"D509","80D413D",7': 7,
         # The modem's own reports, which lead with <stat>.
         b"+CREG: 0": 0,
         b"+CREG: 1": 1,
@@ -1122,6 +1126,7 @@ async def test_every_registration_shape_the_manual_gives_is_read_correctly():
         b"+CREG: 4": 4,
         b'+CREG: 1,"D509","80D413D",7': 1,
         b'+CREG: 5,"2AF3","0123ABC",7': 5,
+        b'+CREG: 6,"2AF3","0123ABC",7': 6,
     }
 
     for line, expected in shapes.items():
@@ -1364,6 +1369,199 @@ async def test_an_unanswered_registration_probe_is_not_read_as_registered():
         await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
 
     assert sent.count("AT+CREG?") == 3
+
+
+async def test_the_deregistration_count_does_not_cross_a_session():
+    """This loop runs once per session, and the count belongs to the session.
+    Readings taken through a connection that has since been torn down say
+    nothing about the one that replaced it: carried over, they would give a
+    modem that has just reconnected a single probe to prove itself before the
+    new session was dropped too."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    manager.registration_misses = 1  # left behind by a session that has ended
+
+    sent, exhausted = _answering_modem(manager, [b"+CREG: 2,0", b"+CREG: 2,1"])
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(exhausted.wait(), timeout=2.0)
+        # The first reading of this session is its first miss, not its second.
+        assert task.done() is False
+        assert manager.registration_misses == 0
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_a_timed_out_probe_clears_the_published_registration_state():
+    """The snapshot is where the state is read from outside the process, and
+    it is read precisely while the count is climbing. Leaving the last reading
+    in it would show a modem on the network for the whole time the loop spends
+    giving up on one that has gone silent, which hides the failure the
+    snapshot exists to expose."""
+    health = HealthState(["device", "telegram"])
+    manager = DeviceManager(_noop_callback, health=health, port="/hostdev/ttyUSB2")
+    manager.writer = FakeWriter()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    _answering_modem(manager, [b"+CREG: 2,1", None, None])
+
+    assert health.snapshot()["registration"] is None
+    with pytest.raises(RuntimeError, match="registered"):
+        await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+
+    assert health.snapshot()["registration"] is None
+
+
+async def test_registration_for_messages_only_counts_as_being_on_the_network():
+    """6 and 7 are a network that granted the modem an association for
+    messages and nothing else, which is the most registered it can be for a
+    service that only carries messages. Counting them as failures would cycle
+    the radio for ever on a network that attaches this way, in both the shape
+    that leads with <n> and the shape that leads with the state."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    sent, exhausted = _answering_modem(manager, [
+        b"+CREG: 2,6",                     # reply: messages only, home
+        b'+CREG: 6,"2AF3","0123ABC",7',    # report: the same state
+        b"+CREG: 2,7",                     # reply: messages only, roaming
+    ])
+
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(exhausted.wait(), timeout=2.0)
+        assert task.done() is False
+        assert manager.registration_misses == 0
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_an_emergency_only_attach_does_not_count_as_being_on_the_network():
+    """The boundary on the other side of 6 and 7. 8 is a modem attached for
+    emergency bearer services alone: it is on a network and no ordinary
+    message can reach it, which is exactly the condition this probe exists to
+    report."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    sent, _ = _answering_modem(manager, [b"+CREG: 2,8"] * 5)
+
+    with pytest.raises(RuntimeError, match="registered"):
+        await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+
+    assert sent.count("AT+CREG?") == 2
+
+
+async def test_the_off_network_warning_names_one_state_and_one_count():
+    """The line an operator greps for, and the only place the reason appears.
+    A description carrying a comma of its own inside a parenthesised list
+    reads as two fields plus a count as a third, so nothing in the line may
+    use the separator that divides its parts."""
+    from module import device_manager as dm_module
+
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    _answering_modem(manager, [b"+CREG: 2,2"] * 5)
+
+    with _LogCapture(dm_module) as captured:
+        with pytest.raises(RuntimeError, match="registered"):
+            await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+
+    warnings = [
+        record.getMessage() for record in captured.records
+        if record.levelno >= logging.WARNING and "not on the network" in record.getMessage()
+    ]
+    assert len(warnings) == 2, warnings
+    # Both halves are there: why, and for how long.
+    assert "searching" in warnings[0], warnings
+    assert "1 in a row" in warnings[0], warnings
+    assert "2 in a row" in warnings[1], warnings
+    # And neither half can be mistaken for the other, or for a third field.
+    assert "," not in warnings[0], warnings
+
+
+async def test_the_registration_check_can_be_switched_off():
+    """A network that attaches the modem for data alone, with messages
+    arriving over a path this question does not describe, has no true answer
+    to give it. An operator seeing that must be able to stop asking without
+    waiting for a release, and without the radio being reinitialised every
+    few minutes in the meantime."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    manager.registration_check = False
+
+    probes = []
+    settled = asyncio.Event()
+
+    async def fake_probe(command):
+        probes.append(command)
+        manager._probe_event.set()
+        if len(probes) >= 5:
+            settled.set()
+
+    manager.send_at_command_async = fake_probe
+
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(settled.wait(), timeout=2.0)
+        # Five rounds is more than the threshold, and the modem answered
+        # nothing about registration in any of them.
+        assert task.done() is False
+        assert probes == ["AT+CSQ"] * 5
+        assert manager.registration_misses == 0
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_the_registration_check_is_switched_off_separately_from_its_threshold(
+    monkeypatch,
+):
+    """A switch and a count are deliberately two settings. Folding the switch
+    into the count would let an operator raising the threshold disable the
+    guard by accident, which is why the count keeps a floor it cannot be
+    tuned below."""
+    import importlib
+
+    original = config.MODEM_REGISTRATION_CHECK
+    try:
+        monkeypatch.delenv("MODEM_REGISTRATION_CHECK", raising=False)
+        assert importlib.reload(config).MODEM_REGISTRATION_CHECK is True
+
+        for value in ("0", "false", "no", "off"):
+            monkeypatch.setenv("MODEM_REGISTRATION_CHECK", value)
+            reloaded = importlib.reload(config)
+            assert reloaded.MODEM_REGISTRATION_CHECK is False, value
+            # Switching the check off does not lower the floor on the count.
+            assert reloaded.MODEM_REGISTRATION_FAILURES >= 2
+
+        monkeypatch.setenv("MODEM_REGISTRATION_CHECK", "1")
+        assert importlib.reload(config).MODEM_REGISTRATION_CHECK is True
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    assert config.MODEM_REGISTRATION_CHECK == original
 
 
 async def test_run_parks_while_the_modem_keeps_answering():

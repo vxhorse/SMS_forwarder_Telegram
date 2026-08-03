@@ -107,12 +107,56 @@ MODEM_PROBE_FAILURES = int(os.getenv("MODEM_PROBE_FAILURES", "3"))
 # while looking like a setting.
 MODEM_REGISTRATION_FAILURES = max(2, int(os.getenv("MODEM_REGISTRATION_FAILURES", "3")))
 
-# The longest gap the heartbeat can legitimately leave between two refreshes of
-# the health snapshot. A missed probe costs its whole interval plus the deadline
-# it waits for a reply, and MODEM_PROBE_FAILURES of them in a row have to pass
+# Whether to ask the registration question at all.
+#
+# Deliberately a separate setting from the count above rather than a zero it
+# could take. Turning the check off and tuning how patient it is are different
+# decisions, and folding them into one number means an operator adjusting the
+# patience can switch the guard off by accident - so the count keeps a floor it
+# cannot be tuned below, and switching off is spelt out here instead.
+#
+# It exists because the question can have no true answer. The registration
+# state read by this check describes the circuit-switched domain, and a network
+# that attaches a module for packet service alone, delivering messages over a
+# path that state does not describe, reports "not registered" while every
+# message arrives. On such a network the check would drop the session every few
+# minutes and reinitialise the radio each time, which is worse than not
+# checking; see the known limitation recorded beside _REGISTERED_STATES in
+# module/device_manager.py for what a complete answer would require. Anyone in
+# that position needs a way out that does not involve waiting for a release.
+MODEM_REGISTRATION_CHECK = os.getenv(
+    "MODEM_REGISTRATION_CHECK", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
+# The gap the heartbeat can legitimately leave between two refreshes of the
+# health snapshot. A missed probe costs its whole interval plus the deadline it
+# waits for a reply, and MODEM_PROBE_FAILURES of them in a row have to pass
 # before the probe gives up and raises. For all of that time the component is
 # working and has simply not refreshed the file. Anything that treats a gap this
 # short as a failure is reading a slow modem as a dead one.
+#
+# This understates the true worst case, and knowingly. The heartbeat now asks a
+# second question after each answered probe, and waits the same deadline for the
+# answer, so the last round before it gives up can cost one interval plus two
+# deadlines rather than one:
+#
+#     (F - 1) x (I + T) + (I + 2T)     rather than     F x (I + T)
+#
+# which at the defaults is 110 seconds rather than 105. Both floors below still
+# hold with room to spare: WATCHDOG_STALL_FLOOR doubles this figure, and the
+# difference 2F(I+T) - [(F-1)(I+T) + (I+2T)] comes to F(I+T) - T, which stays
+# positive for any retry count of one or more, while a count of zero is covered
+# by the floor's other term. The formula is left alone rather than changed twice;
+# the loop's own timing is being revisited.
+#
+# The margin that did move is against HEALTH_STALE_SECONDS, which the container
+# healthcheck reads and which no floor here protects: 120 seconds against a worst
+# gap of 110 rather than 105. At the default interval and retry count the gap is
+# 90 + 4T, so it passes the window once MODEM_PROBE_TIMEOUT exceeds seven and a
+# half seconds - and that setting is neither capped nor clamped against the
+# window, so a generous reply deadline can fail the healthcheck on a process that
+# is working. MODEM_PROBE_INTERVAL is clamped for exactly this reason; the
+# deadline is not.
 WATCHDOG_REFRESH_BUDGET = MODEM_PROBE_FAILURES * (
     MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT
 )
