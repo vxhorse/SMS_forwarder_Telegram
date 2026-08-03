@@ -479,6 +479,15 @@ class DeviceManager:
         try:
             self.writer.write(f"{command}\r\n".encode())
             await self.writer.drain()
+        except asyncio.CancelledError:
+            # Stated rather than left to the type hierarchy. A probe is
+            # bounded by cancelling it, so a cancellation arriving in the drain
+            # has to leave through here; swallowed, it would turn that bound
+            # back into the unbounded write it exists to prevent. It escapes
+            # the handler below only because CancelledError derives from
+            # BaseException, which is a distinction one word wide and one that
+            # a later edit could widen away without anything looking wrong.
+            raise
         except Exception as e:
             logger.warning(f"Could not write to the serial port: {e}")
         else:
