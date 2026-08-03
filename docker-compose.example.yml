@@ -7,11 +7,10 @@ services:
     stop_signal: SIGTERM
     stop_grace_period: 30s
     volumes:
-      # A bind mount rather than devices: - the latter is resolved when the
-      # container is created, so a device that has not finished enumerating
-      # yet makes creation fail outright, and a restart policy never applies
-      # to a container that never ran. Mounted at /hostdev instead of over
-      # /dev so the container keeps its own pts, shm and null.
+      # A bind mount rather than devices:, so that container creation does not
+      # depend on the modem already being there. Mounted at /hostdev instead of
+      # over /dev so the container keeps its own pts, shm and null.
+      # See "Why not devices:" in README.md.
       - /dev:/hostdev
       - /etc/localtime:/etc/localtime:ro
     device_cgroup_rules:
@@ -31,7 +30,6 @@ services:
       timeout: 10s
       retries: 3
       # Must exceed SERVICE_STABLE_SECONDS plus the time the modem needs to
-      # enumerate. A component is only reported up after its session has held
-      # for SERVICE_STABLE_SECONDS, and the health file is not written until
-      # every component is up, so the first write lands at connect + 60s.
+      # enumerate; raise it if yours is slower. See "Reading the health check"
+      # in README.md.
       start_period: 180s
