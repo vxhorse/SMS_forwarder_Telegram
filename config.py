@@ -31,6 +31,16 @@ SERVICE_STABLE_SECONDS = float(os.getenv("SERVICE_STABLE_SECONDS", "60.0"))
 # How often the watchdog inspects component health, in seconds. Floored because
 # a value of zero would turn the watchdog into a busy loop.
 WATCHDOG_CHECK_INTERVAL = max(1.0, float(os.getenv("WATCHDOG_CHECK_INTERVAL", "30.0")))
+# Deadline for one outward component-state notification, in seconds.
+#
+# Sending a notification retries several times with a delay between attempts, so
+# an unreachable messaging API can hold its caller for far longer than the send
+# itself would suggest. The device path awaits one when it connects and another
+# while it is shutting down: unbounded, the first slows every reconnect cycle
+# and the second can outlast the stop grace period the container runtime allows,
+# turning a clean stop into a kill. Floored because zero would abandon every
+# notification before it was attempted.
+NOTIFY_TIMEOUT = max(1.0, float(os.getenv("NOTIFY_TIMEOUT", "5.0")))
 
 # Root of the device tree to scan. Inside a container this points at the
 # bind-mounted host /dev; running directly on a host it is just /dev.
