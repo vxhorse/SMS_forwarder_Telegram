@@ -60,9 +60,11 @@ graph TD
 reconnected with exponential backoff when it fails; neither waits for the other.
 A component counts as recovered only once its session has held for
 `SERVICE_STABLE_SECONDS`, so a component that connects and immediately fails
-still looks broken. `HealthState` records that, the watchdog exits the process if
-anything stays down past `WATCHDOG_DOWN_SECONDS`, and `healthcheck.py` reports
-the same state to the container runtime.
+still looks broken. `HealthState` records that, the watchdog exits the process on
+either of the two ways a component can be lost — down past
+`WATCHDOG_DOWN_SECONDS`, or still reporting up while its loop has stopped
+advancing for `WATCHDOG_STALL_SECONDS` — and `healthcheck.py` reports the same
+state to the container runtime.
 
 ## Hardware Requirements
 
@@ -211,11 +213,15 @@ working `.env` only needs `BOT_TOKEN` and `CHAT_ID`. Durations are in seconds.
 | `MODEM_PROBE_INTERVAL` | `30.0` | Liveness probe interval. Clamped to half of `HEALTH_STALE_SECONDS` |
 | `MODEM_PROBE_TIMEOUT` | `5.0` | How long the modem has to answer a probe |
 | `MODEM_PROBE_FAILURES` | `3` | Consecutive missed probes that force a reconnect |
+| `MODEM_REGISTRATION_CHECK` | `0` | Also ask whether the modem is on the network. Off by default — see [The registration check](#the-registration-check) |
+| `MODEM_REGISTRATION_FAILURES` | `3` | Consecutive "not registered" readings that force a reconnect, once the check is on. Floored at 2 |
 | `AT_COMMAND_TIMEOUT` | `3.0` | Deadline for one AT command |
 | `AT_SLOW_COMMAND_TIMEOUT` | `10.0` | Deadline for slow commands (`AT&F`, `AT+CFUN`, `AT&W`) |
+| `SERIAL_CLOSE_TIMEOUT` | `5.0` | How long a serial port has to flush before the close is forced. Floored at 1 |
 | `HEALTH_FILE` | `/tmp/healthy` | Snapshot file the healthcheck reads |
 | `HEALTH_STALE_SECONDS` | `120` | How old that snapshot may be. Floored at 2 |
 | `WATCHDOG_DOWN_SECONDS` | `3600` | Exit once a component has been down this long |
+| `WATCHDOG_STALL_SECONDS` | *(derived)* | Exit once no component loop has advanced for this long. Defaults to twice `HEALTH_STALE_SECONDS`, raised by a derived floor (~310 as shipped) and capped at `WATCHDOG_DOWN_SECONDS` |
 | `WATCHDOG_CHECK_INTERVAL` | `30.0` | How often the watchdog looks. Floored at 1 |
 
 ### Serial port selection
@@ -237,6 +243,43 @@ have more than one modem, or if your device is somewhere unusual.
 If you do set it, name the path as the service sees it. Under the compose file
 in this repository the host's `/dev` is mounted at `/hostdev`, so the port is
 `/hostdev/ttyUSB2`, not `/dev/ttyUSB2`.
+
+### The registration check
+
+The heartbeat proves the modem answers. It does not prove a message can reach
+it: a SIM the network has detached answers every command exactly as before while
+nothing arrives. `MODEM_REGISTRATION_CHECK=1` adds a second question, `AT+CREG?`,
+and ends the session after `MODEM_REGISTRATION_FAILURES` consecutive readings
+that say the modem is not on the network.
+
+It ships **off**, because that question has no true answer on every network.
+`+CREG` describes the circuit-switched domain, so a network that attaches the
+module for packet service alone — messages arriving over a path that domain does
+not describe — reports "not registered" while everything works. Acting on that
+ends a working session every few minutes, reinitialises the radio each time
+(which lengthens a real outage rather than shortening it) and rewrites the
+module's stored profile on every cycle. The loop is also hard to see from
+outside: it fails later than a session takes to count as recovered, so every
+cycle resets what the watchdog measures, and the snapshot goes stale for only
+the width of one teardown, so the container healthcheck stays green throughout.
+
+Leaving it off while you find out costs no diagnostic value. Startup asks the
+module to report registration changes unasked, so the state is parsed, published
+in the snapshot and logged either way; only the decision to end a session over it
+is deferred. Read the `registration` field over a period that includes ordinary
+message traffic:
+
+```bash
+docker compose exec sms-forwarder cat /tmp/healthy
+```
+
+- Settles on `1`, `5`, `6` or `7` (registered at home, roaming, or either of
+  those limited to messages alone) — the question has a true answer on this
+  network, and `MODEM_REGISTRATION_CHECK=1` buys the detection it was built for.
+- Sits at `0` or `2` while messages keep arriving — this is the network the check
+  cannot describe. Leave it off.
+
+[`doc/README.md`](doc/README.md) records what a complete answer would require.
 
 ### Why not `devices:`
 
@@ -299,8 +342,19 @@ Three states are worth recognising:
 - **`unhealthy`** — nothing is being forwarded. Note that this does not restart
   anything by itself; the container runtime only records it. Recovery comes from
   the service reconnecting on its own, and failing that from the watchdog, which
-  exits the process after `WATCHDOG_DOWN_SECONDS` so the restart policy takes
-  over.
+  exits the process so the restart policy takes over. The watchdog has two exit
+  paths, and they are an order of magnitude apart:
+  - A component that **failed loudly** is marked down, and the process exits once
+    it has been down for `WATCHDOG_DOWN_SECONDS` — an hour by default. The log
+    line reads `Watchdog tripped: a component has been down for ...`.
+  - A component that **blocked without failing** is still marked up, so the
+    clock above never starts. What catches it instead is
+    `WATCHDOG_STALL_SECONDS`: no component loop has reported progress, and the
+    snapshot has not been written, for that long. As shipped this is around
+    **310 seconds**, not an hour, so an unexplained restart roughly five minutes
+    after things went quiet is this one and not the other. The log line reads
+    `Watchdog tripped: nothing has made progress for ...`, and an unwritable
+    `HEALTH_FILE` trips it too.
 - **`healthy`** — the snapshot is fresh and every component is up.
 
 ## Usage Instructions
@@ -324,7 +378,7 @@ Send `/help` in the Telegram bot conversation to view all available commands.
 
 - **Long SMS Support**: This service supports automatic merging of long SMS. Segmented messages will wait up to 60 seconds for all parts to arrive before merging and forwarding
 - **Compatibility**: Different module models have varying compatibility; some modules may not support sending and receiving long text messages
-- **Stability**: Each component reconnects on its own with exponential backoff, and a watchdog restarts the process if one stays down past `WATCHDOG_DOWN_SECONDS`
+- **Stability**: Each component reconnects on its own with exponential backoff, and a watchdog restarts the process if one stays down past `WATCHDOG_DOWN_SECONDS`, or stops making progress for `WATCHDOG_STALL_SECONDS` while still reporting up
 - **Serial Port Selection**: Leave `SMS_PORT` empty and let discovery choose. Set it only when discovery picks the wrong device, and give the path under `SMS_DEV_ROOT`
 - **Missing hardware is not an error**: with no modem attached, the service waits and retries indefinitely; the container reports unhealthy while it does
 - **SIM Card Detection**: Ensure the SIM card is properly inserted and has sufficient balance
@@ -375,5 +429,7 @@ Send `/help` in the Telegram bot conversation to view all available commands.
    - Staying `unhealthy` means a component is down, and the log names which:
      `Component <name> failed ...`
    - An unhealthy container is not restarted by the container runtime. The
-     watchdog exits the process after `WATCHDOG_DOWN_SECONDS`, and the restart
-     policy takes it from there
+     watchdog exits the process — after `WATCHDOG_DOWN_SECONDS` for a component
+     that failed, or after the much shorter `WATCHDOG_STALL_SECONDS` for one that
+     stopped advancing without failing — and the restart policy takes it from
+     there. `docker compose logs | grep 'Watchdog tripped'` says which
