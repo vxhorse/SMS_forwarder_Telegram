@@ -1,13 +1,14 @@
 import asyncio
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from gsmmodem.pdu import encodeSmsSubmitPdu
 
 import config
 from module.device_manager import DeviceManager
+from module.health import HealthState
 
 # Self-generated PDU with meaningless body text. Never use real message content.
 STORED_PDU = encodeSmsSubmitPdu("+8613800138000", "TESTMSG")[0].data.hex().upper()
@@ -528,3 +529,443 @@ async def test_setup_continues_past_an_unsupported_optional_command():
 
     commands = [command for command, _ in sent]
     assert commands[-1] == "AT&W"
+
+
+async def _no_delay(_delay):
+    """Stand in for asyncio.sleep: yields to the loop without spending time."""
+    await asyncio.sleep(0)
+
+
+class _LogCapture:
+    """Collect this module's log records without printing them."""
+
+    def __init__(self, dm_module):
+        self._logger = dm_module.logger
+        self._handler = logging.Handler()
+        self.records = []
+        self._handler.emit = self.records.append
+        self._level = self._logger.level
+
+    def __enter__(self):
+        self._logger.setLevel(logging.DEBUG)
+        self._logger.addHandler(self._handler)
+        return self
+
+    def __exit__(self, *exc_info):
+        self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._level)
+        return False
+
+    @property
+    def text(self):
+        return " ".join(record.getMessage() for record in self.records)
+
+
+async def test_device_manager_is_a_managed_service():
+    manager = _make()
+    assert manager.name == "device"
+    for method in ("connect_once", "run", "teardown"):
+        assert callable(getattr(manager, method))
+
+
+async def test_probe_settings_come_from_config():
+    manager = _make()
+    assert manager.probe_interval == config.MODEM_PROBE_INTERVAL
+    assert manager.probe_timeout == config.MODEM_PROBE_TIMEOUT
+    assert manager.probe_failures == config.MODEM_PROBE_FAILURES
+
+
+async def test_csq_updates_health_and_signal_strength():
+    health = HealthState(["device", "telegram"])
+    manager = DeviceManager(_noop_callback, health=health, port="/hostdev/ttyUSB2")
+    await manager.process_message(b"+CSQ: 21,99\r\n")
+    assert health.snapshot()["rssi"] == 21
+    assert manager._probe_event.is_set() is True
+
+
+async def test_malformed_csq_does_not_raise():
+    health = HealthState(["device", "telegram"])
+    manager = DeviceManager(_noop_callback, health=health, port="/hostdev/ttyUSB2")
+    await manager.process_message(b"+CSQ: garbage\r\n")
+    assert health.snapshot()["rssi"] is None
+
+
+async def test_a_csq_reply_still_counts_as_an_answer_when_it_is_malformed():
+    """The probe asks whether the modem answers, not what it answered."""
+    manager = _make()
+    await manager.process_message(b"+CSQ: garbage\r\n")
+    assert manager._probe_event.is_set() is True
+
+
+async def test_a_csq_reply_is_not_mistaken_for_pdu_data():
+    """A heartbeat reply can land between a +CMT header and its PDU. Appending
+    it to the pending PDU would corrupt the message and lose the heartbeat."""
+    manager = _make()
+    await manager.process_message(b"+CMT: ,26\r\n")
+    await manager.process_message(b"+CSQ: 21,99\r\n")
+    assert manager._probe_event.is_set() is True
+    assert manager.pending_sms["pdu"] == b""
+
+
+async def test_heartbeat_raises_after_consecutive_failures():
+    manager = _make([])
+    manager.probe_interval = 0.01
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 2
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+
+
+async def test_an_answered_heartbeat_resets_the_failure_count():
+    """Three misses spread over an hour must not look like three in a row."""
+    manager = _make()
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 2
+    manager._sleep = _no_delay
+    answers = iter([False, True, False, False])
+    probes = []
+
+    async def fake_probe(command):
+        probes.append(command)
+        if next(answers):
+            manager._probe_event.set()
+
+    manager.send_at_command_async = fake_probe
+
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+
+    # Without the reset the second miss would be the second in a row and the
+    # loop would give up one probe earlier.
+    assert probes == ["AT+CSQ"] * 4
+
+
+async def test_a_single_missed_heartbeat_keeps_the_session():
+    """One unanswered probe is normal on a busy modem. Tearing the connection
+    down for it would reconnect the service every few minutes for no reason."""
+    manager = _make()
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 3
+    manager._sleep = _no_delay
+    probes = []
+    settled = asyncio.Event()
+
+    async def fake_probe(command):
+        probes.append(command)
+        if len(probes) == 1:
+            return  # the first probe goes unanswered
+        manager._probe_event.set()
+        if len(probes) >= 6:
+            settled.set()
+
+    manager.send_at_command_async = fake_probe
+
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(settled.wait(), timeout=2.0)
+        assert task.done() is False
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_run_parks_while_the_modem_keeps_answering():
+    """The supervisor treats a run body that returns as a failed session, and a
+    session shorter than SERVICE_STABLE_SECONDS as flapping. A healthy run must
+    therefore never end, while its heartbeat keeps going underneath it."""
+    manager = _make([])
+    manager._sleep = _no_delay
+    probes = []
+    settled = asyncio.Event()
+
+    async def fake_probe(command):
+        probes.append(command)
+        manager._probe_event.set()
+        if len(probes) >= 3:
+            settled.set()
+
+    manager.send_at_command_async = fake_probe
+
+    task = asyncio.create_task(manager.run())
+    try:
+        await asyncio.wait_for(settled.wait(), timeout=2.0)
+        assert task.done() is False
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_the_send_path_holds_the_port_across_the_prompt_window():
+    """Everything written between AT+CMGS and the terminating Ctrl+Z is taken
+    by the modem as message data, so nothing else may write during it."""
+    manager = _make()
+    manager._sleep = _no_delay
+    in_window = asyncio.Event()
+
+    async def record(command):
+        if command.startswith("AT+CMGS="):
+            in_window.set()
+
+    manager.send_at_command_async = record
+
+    send = asyncio.create_task(manager.handle_send_sms("+8613800138000", "x"))
+    try:
+        await asyncio.wait_for(in_window.wait(), timeout=2.0)
+        assert manager._at_lock.locked() is True
+    finally:
+        manager.sms_sent_event.set()
+        await asyncio.wait_for(send, timeout=2.0)
+    assert manager._at_lock.locked() is False
+
+
+async def test_the_heartbeat_waits_for_the_port_to_be_free():
+    """The probe is the second writer this component gained. It must queue
+    behind a message being sent rather than writing into the middle of it."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+
+    await manager._at_lock.acquire()
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert manager.writer.written == []
+        assert task.done() is False
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        manager._at_lock.release()
+
+
+async def test_concat_buffer_uses_a_monotonic_clock():
+    """Storing a wall-clock datetime would let a large NTP correction expire
+    every in-flight part at once."""
+    from module.device_manager import ConcatSmsBuffer
+
+    before = time.monotonic()
+    buffer = ConcatSmsBuffer(sender="+8613800138000", ref_num=1, max_parts=2,
+                             timestamp=None)
+    after = time.monotonic()
+
+    assert isinstance(buffer.first_received, float)
+    assert before <= buffer.first_received <= after
+    assert buffer.is_expired(timeout_seconds=60) is False
+
+
+async def test_concat_buffer_expires_on_elapsed_time():
+    from module.device_manager import ConcatSmsBuffer
+
+    buffer = ConcatSmsBuffer(sender="+8613800138000", ref_num=1, max_parts=2,
+                             timestamp=None)
+    assert buffer.is_expired(timeout_seconds=60) is False
+    buffer.first_received -= 61
+    assert buffer.is_expired(timeout_seconds=60) is True
+
+
+async def test_concat_buffer_ignores_a_wall_clock_jump(monkeypatch):
+    """The board has no battery-backed RTC, so it boots years in the past and
+    leaps forward the moment the clock is synchronised. A wall-clock expiry
+    would discard every half-assembled message at that instant."""
+    from module import device_manager as dm_module
+
+    buffer = dm_module.ConcatSmsBuffer(sender="+8613800138000", ref_num=1,
+                                       max_parts=2, timestamp=None)
+
+    jump = timedelta(days=5 * 365)
+    real_time = time
+
+    class JumpedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) + jump
+
+    class JumpedTime:
+        """Wall clock leaps forward; the monotonic clock cannot."""
+        time = staticmethod(lambda: real_time.time() + jump.total_seconds())
+        monotonic = staticmethod(real_time.monotonic)
+
+    monkeypatch.setattr(dm_module, "datetime", JumpedDateTime)
+    monkeypatch.setattr(dm_module, "time", JumpedTime)
+
+    assert buffer.is_expired(timeout_seconds=60) is False
+
+
+async def test_teardown_closes_the_serial_transport():
+    """_probe_modem can raise with the port already open. Leaving it held means
+    the next attempt cannot open it."""
+    manager = _make([b"OK\r\n"])
+    writer = manager.writer
+    await manager.teardown()
+    assert writer.closed is True
+    assert manager.writer is None
+    assert manager.reader is None
+
+
+async def test_teardown_is_idempotent():
+    manager = _make([b"OK\r\n"])
+    await manager.teardown()
+    await manager.teardown()
+    assert manager.writer is None
+
+
+async def test_teardown_without_a_connection_does_nothing():
+    """teardown() runs after every failed attempt, including ones where
+    connect_once() never got as far as opening the port."""
+    manager = DeviceManager(_noop_callback, port="/hostdev/ttyUSB2")
+    await manager.teardown()
+    assert manager.writer is None
+
+
+async def test_teardown_does_not_raise_when_closing_fails():
+    manager = _make()
+
+    def boom():
+        raise OSError("device went away")
+
+    manager.writer.close = boom
+    await manager.teardown()
+    assert manager.writer is None
+
+
+async def test_a_failed_handshake_still_releases_the_port(monkeypatch):
+    """The specific leak this task inherited: _probe_modem raises after the
+    transport is open, so only teardown can give the port back."""
+    from module import device_manager as dm_module
+
+    writer = FakeWriter()
+
+    async def fake_open(url, baudrate):
+        return FakeReader([]), writer
+
+    monkeypatch.setattr(
+        dm_module.serial_asyncio, "open_serial_connection", fake_open
+    )
+    manager = DeviceManager(_noop_callback, port="/hostdev/ttyUSB2")
+    manager._port_exists = lambda path: True
+    manager.probe_timeout = 0.05
+
+    with pytest.raises(RuntimeError):
+        await manager.connect_once()
+    assert writer.closed is False
+
+    await manager.teardown()
+    assert writer.closed is True
+
+
+async def test_a_notify_failure_cannot_break_the_device_path():
+    manager = _make()
+
+    async def failing_notify(text):
+        raise RuntimeError("channel is down")
+
+    manager.notify = failing_notify
+    await manager.teardown()
+    assert manager.writer is None
+
+
+async def test_obsolete_methods_are_gone():
+    """Reconnection must have exactly one owner, the supervisor."""
+    for name in ("send_at_command", "reconnect", "close"):
+        assert not hasattr(DeviceManager, name)
+
+
+async def test_a_serial_line_is_described_without_its_payload():
+    from module.device_manager import _describe_line
+
+    assert _describe_line(DELIVER_PDU.encode()) == f"[{len(DELIVER_PDU)} bytes]"
+    assert _describe_line(b"+CMT: ,26").startswith("+CMT ")
+    assert _describe_line(b"RING") == "RING"
+
+
+async def test_an_unhandled_serial_line_is_logged_without_its_payload():
+    """Unrecognised lines are worth logging on unfamiliar hardware, but one of
+    them may itself be a message."""
+    from module import device_manager as dm_module
+
+    with _LogCapture(dm_module) as captured:
+        manager = _make()
+        await manager.process_message(DELIVER_PDU.encode() + b"\r\n")
+
+    assert DELIVER_PDU not in captured.text
+    assert DELIVER_PDU[:16] not in captured.text
+    assert any(
+        record.levelno >= logging.WARNING and "nhandled" in record.getMessage()
+        for record in captured.records
+    )
+
+
+async def test_an_unparsable_message_header_is_logged_without_its_payload():
+    from module import device_manager as dm_module
+
+    with _LogCapture(dm_module) as captured:
+        manager = _make()
+        await manager.handle_incoming_sms_header(b'+CMT: "unexpected shape"')
+
+    assert "unexpected shape" not in captured.text
+    assert "+CMT" in captured.text
+
+
+async def test_an_outgoing_pdu_is_not_logged_when_it_is_written():
+    """The write path carries commands and, once per message, the encoded PDU.
+    A PDU in the log is the message in the log."""
+    from module import device_manager as dm_module
+
+    pdu_hex = encodeSmsSubmitPdu("+8613800138000", "TESTMSG")[0].data.hex().upper()
+
+    with _LogCapture(dm_module) as captured:
+        manager = _make()
+        await manager.send_at_command_async("AT+CMGS=23")
+        await manager.send_at_command_async(pdu_hex + chr(26))
+
+    assert "AT+CMGS=23" in captured.text
+    assert pdu_hex not in captured.text
+    assert pdu_hex[:16] not in captured.text
+
+
+async def test_no_log_line_carries_a_message_body():
+    """The service forwards one-time codes and bank notifications. A body in
+    the log is a disclosure, and this file used to log the whole merged text
+    of every long message at INFO."""
+    from module import device_manager as dm_module
+
+    # Not message content: a marker chosen so the assertion can look for it.
+    marker = "QQZZWWXX"
+    when = datetime(2024, 11, 2, 13, 15, 51)
+
+    with _LogCapture(dm_module) as captured:
+        manager = _make()
+        await manager._handle_concat_sms_part(
+            "+8613800138000", when, marker[:4], 7, 2, 1
+        )
+        await manager._handle_concat_sms_part(
+            "+8613800138000", when, marker[4:], 7, 2, 2
+        )
+
+    assert marker not in captured.text
+    assert marker[:4] not in captured.text
+    assert marker[4:] not in captured.text
+    # The diagnostics that replaced it must still be there.
+    assert "7" in captured.text
+
+
+async def test_an_expired_concat_buffer_is_logged_without_its_payload():
+    from module import device_manager as dm_module
+
+    marker = "QQZZWWXX"
+    manager = _make()
+    await manager._handle_concat_sms_part(
+        "+8613800138000", datetime(2024, 11, 2, 13, 15, 51), marker, 7, 2, 1
+    )
+    buffer = manager.concat_sms_cache[("+8613800138000", 7)]
+    buffer.first_received -= DeviceManager.CONCAT_SMS_TIMEOUT + 1
+
+    with _LogCapture(dm_module) as captured:
+        await manager._cleanup_expired_concat_cache()
+
+    assert manager.concat_sms_cache == {}
+    assert marker not in captured.text
