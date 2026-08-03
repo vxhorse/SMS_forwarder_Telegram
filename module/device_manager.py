@@ -1,4 +1,3 @@
-import serial
 import serial_asyncio
 import asyncio
 import os
@@ -15,40 +14,75 @@ from gsmmodem.pdu import encodeSmsSubmitPdu, decodeSmsPdu, Concatenation
 
 logger = setup_logger(__name__)
 
-# 长短信分片缓存的数据结构
+# What may appear in a log line, and why.
+#
+# This service carries one-time codes and bank notifications, so no log line
+# may reproduce a message. The only part of a serial line that is ever echoed
+# is the URC keyword, the "+NAME" ahead of the colon: it is a protocol token
+# defined by the AT command set and cannot contain message text. Everything
+# else is reduced to a byte count, including whatever follows the colon,
+# because a line this code did not recognise may itself be a message.
+_URC_KEYWORD = re.compile(rb'^\+[A-Z0-9]{1,12}')
+
+# Bare responses defined by the AT command set. They have no payload at all, so
+# quoting them in full costs nothing and says what the modem actually sent,
+# which is what makes an unfamiliar module's chatter debuggable.
+_SAFE_BARE_RESPONSES = frozenset({
+    b'RING', b'BUSY', b'ERROR', b'CONNECT', b'RDY',
+    b'NO CARRIER', b'NO ANSWER', b'NO DIALTONE',
+})
+
+
+def _describe_line(message: bytes) -> str:
+    """Describe a serial line for the log without reproducing its payload."""
+    if message in _SAFE_BARE_RESPONSES:
+        return message.decode('ascii')
+    match = _URC_KEYWORD.match(message)
+    prefix = f"{match.group().decode('ascii')} " if match else ""
+    return f"{prefix}[{len(message)} bytes]"
+
+
 class ConcatSmsBuffer:
-    """长短信分片缓存"""
+    """The parts of one concatenated message, held until they are all here."""
+
     def __init__(self, sender: str, ref_num: int, max_parts: int, timestamp: datetime):
         self.sender = sender
         self.ref_num = ref_num
         self.max_parts = max_parts
+        # The carrier's own timestamp for the message. Message data, not a
+        # duration, which is why it stays a wall-clock value.
         self.timestamp = timestamp
         self.parts: Dict[int, str] = {}  # seq_num -> content
-        self.first_received = datetime.now()
-    
+        # Monotonic, not wall clock: a machine without a battery-backed RTC can
+        # jump years forward once NTP synchronises, which would expire every
+        # in-flight part at once.
+        self.first_received = time.monotonic()
+
     def add_part(self, seq_num: int, content: str) -> None:
-        """添加分片"""
+        """Store one part."""
         self.parts[seq_num] = content
-    
+
     def is_complete(self) -> bool:
-        """检查是否所有分片都已收到"""
+        """Whether every part has arrived."""
         return len(self.parts) == self.max_parts
-    
+
     def get_merged_content(self) -> str:
-        """按序号合并所有分片内容"""
+        """Join the parts in sequence order."""
         return ''.join(self.parts[i] for i in sorted(self.parts.keys()))
-    
+
     def is_expired(self, timeout_seconds: int = 60) -> bool:
-        """检查缓存是否超时"""
-        return (datetime.now() - self.first_received).total_seconds() > timeout_seconds
+        """Whether this buffer has been waiting for missing parts too long."""
+        return (time.monotonic() - self.first_received) > timeout_seconds
 
 
 class DeviceManager:
+    """The modem component: one serial connection and everything on top of it.
+
+    Supervised through the ManagedService contract (connect_once / run /
+    teardown), so reconnection has exactly one owner and lives elsewhere.
     """
-    设备管理类，用于检测和管理串口设备。
-    """
-    
-    # 长短信缓存超时时间（秒）
+
+    # How long an incomplete concatenated message is held, in seconds.
     CONCAT_SMS_TIMEOUT = 60
 
     # Placeholder in the setup sequence. It is not an AT command: reaching it
@@ -117,94 +151,97 @@ class DeviceManager:
         r'AT+CNMI=2,2,0,0,0',
     }
 
-    def __init__(self, receive_sms_callback: Callable, port: Optional[str] = None, baudrate: Optional[int] = None, timeout: int = 2):
+    def __init__(self, receive_sms_callback: Callable, health=None,
+                 notify: Optional[Callable] = None, port: Optional[str] = None,
+                 baudrate: Optional[int] = None, timeout: int = 2):
         """
-        初始化设备管理器。
+        Set up the modem component.
 
-        :param receive_sms_callback: 接收短信时的回调函数
-        :param port: 端口名称
-        :param baudrate: 波特率
-        :param timeout: 超时时间（秒）
+        :param receive_sms_callback: called with each received message
+        :param health: HealthState to report signal strength and freshness to
+        :param notify: coroutine used to report device state changes outward
+        :param port: serial device path; empty means discover it
+        :param baudrate: serial speed
+        :param timeout: serial read timeout, in seconds
         """
-        
+
         self.receive_sms_callback = receive_sms_callback
         self.port = port or SMS_PORT
         self.baudrate = baudrate or SMS_BAUDRATE
         self.timeout = timeout
-        
-        self.max_retries = 3  # 最大重试次数
-        self.retry_delay = 5  # 重试间隔时间（秒）
-        
+
+        self.max_retries = 3  # consecutive errors a loop tolerates
+        self.retry_delay = 5  # seconds between retries
+
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
-        
+
         self.is_running = False
-        self.exit_event = asyncio.Event()
-        self.read_task: Optional[asyncio.Task] = None
-        self.process_task: Optional[asyncio.Task] = None
-        
+
         self.message_queue: asyncio.Queue = asyncio.Queue()
         self.pending_sms = {"pdu": None, "expected_length": None}
-        
-        # 长短信分片缓存: key = (sender, ref_num)
+
+        # Parts of concatenated messages, keyed by (sender, ref_num).
         self.concat_sms_cache: Dict[tuple, ConcatSmsBuffer] = {}
 
-        assert isinstance(self.baudrate, int), "波特率必须是整数类型"
-        assert isinstance(self.port, str), "端口必须是字符串类型"
-        
-        # 验证短信是否成功发送的事件
-        self.sms_sent_event = asyncio.Event()
-        # 启动后的事件
-        self.priming_event = asyncio.Event()
+        assert isinstance(self.baudrate, int), "baudrate must be an integer"
+        assert isinstance(self.port, str), "port must be a string"
 
-        # Injection points so tests do not have to touch the real filesystem.
+        # Set once the modem confirms a message was sent.
+        self.sms_sent_event = asyncio.Event()
+
+        self.name = "device"
+        self.health = health
+        # Reports device state changes outward. Failures here must never
+        # affect the device connection itself.
+        self.notify = notify
+        # The path actually in use, which may have been discovered rather
+        # than configured.
+        self.active_port: Optional[str] = None
+
+        self.probe_interval = config.MODEM_PROBE_INTERVAL
+        # One deadline covers both probes, because they ask the same question:
+        # how long the modem gets to answer. _probe_modem asks it once at
+        # connect time, heartbeat_loop asks it repeatedly afterwards.
+        self.probe_timeout = config.MODEM_PROBE_TIMEOUT
+        self.probe_failures = config.MODEM_PROBE_FAILURES
+        # Set whenever a +CSQ reply arrives, which is what proves the modem is
+        # still answering rather than merely still connected.
+        self._probe_event = asyncio.Event()
+        # One AT transaction on the port at a time. The heartbeat and the
+        # sending path are independent writers, and AT+CMGS puts the modem into
+        # a prompt where every byte written becomes part of the outgoing
+        # message: a probe landing in that window would be sent as message
+        # data and the message itself would be rejected.
+        self._at_lock = asyncio.Lock()
+
+        # Injection points so tests do not have to touch the real filesystem
+        # or spend real time.
         self._sleep = asyncio.sleep
         self._port_exists = os.path.exists
-        self.probe_timeout = config.AT_COMMAND_TIMEOUT
 
-    def send_at_command(self, port: str, command: str) -> Optional[list]:
-        """
-        通过已连接的串口发送AT指令并检查响应。
-
-        :param port: 串口端口名称
-        :param command: 要发送的AT指令
-        :param retries: 重试次数，默认3次
-        :return: 返回响应内容的列表，如果响应中包含期望内容，返回响应内容，否则返回None
-        """
-        try:
-            with serial.Serial(port, baudrate=self.baudrate, timeout=self.timeout) as ser:
-                for _ in range(self.max_retries):
-                    # 清空缓冲区
-                    ser.reset_input_buffer()
-                    ser.reset_output_buffer()
-
-                    # 发送AT指令
-                    ser.write(f'{command}\r'.encode())
-                    time.sleep(0.5)
-                    response = ser.read(ser.in_waiting).decode('utf-8')
-                    response_parts = [part.strip() for part in response.split('\r\n') if part.strip()]
-                    logger.debug(f"端口 {port} 命令 '{command}' 的响应: {response_parts}")
-                    return response_parts
-        except Exception as e:
-            logger.warning(f"端口 {port} 命令 '{command}' 出现错误: {e}")
-        return None
-    
     async def send_at_command_async(self, command: str) -> None:
         """
-        通过已连接的串口异步发送AT命令。
-        
-        :param command: 要发送的AT命令
+        Send one AT command without waiting for its response.
+
+        :param command: the AT command to send
         """
         if self.writer is None:
-            raise ValueError("串口写入器未初始化")
-        
+            raise ValueError("Serial writer is not initialised")
+
         try:
             self.writer.write(f"{command}\r\n".encode())
             await self.writer.drain()
         except Exception as e:
-            logger.warning(f"串口写入器发送 {command} 出现错误: {e}")
+            logger.warning(f"Could not write to the serial port: {e}")
         else:
-            logger.debug(f"串口写入器发送命令: {command}")
+            # The sending path writes a PDU through here too, and that PDU is
+            # the encoded message. Only a command is ever named; anything else
+            # is reported by size.
+            if command.startswith("AT"):
+                logger.debug(f"Sent command: {command}")
+            else:
+                logger.debug(f"Wrote {len(command)} character(s) of payload")
 
     async def resolve_port(self) -> str:
         """Return the port to use: the configured one, or a discovered one.
@@ -310,42 +347,119 @@ class DeviceManager:
             raise RuntimeError(f"Modem did not answer AT within {self.probe_timeout}s")
         logger.info("Modem handshake succeeded")
 
-    async def connect(self) -> None:
-        """
-        连接到串口设备并初始化。
-        """
-        retries = 0
-        while retries < self.max_retries:
-            try:
-                self.reader, self.writer = await serial_asyncio.open_serial_connection(url=self.port, baudrate=self.baudrate)
-                await self.setup_sms()
-                logger.warning(f"已连接到 {self.port}")
-                break
-                
-            except Exception as e:
-                retries += 1
-                logger.warning(f"连接 {self.port} 失败（第 {retries} 次）: {e}")
-                await asyncio.sleep(self.retry_delay)          
-        else:
-            logger.error(f"重试 {retries} 次失败，无法连接到设备 {self.port}")
-            raise ValueError("无法连接到设备")
-        
-        self.is_running = True
-        # 仅在任务不存在或已结束时创建，避免重复任务
-        if self.read_task is None or self.read_task.done():
-            self.read_task = asyncio.create_task(self.read_loop())
-        if self.process_task is None or self.process_task.done():
-            self.process_task = asyncio.create_task(self.process_loop())
-    
-    async def reconnect(self) -> None:
-        """设备断开或出错时重新连接"""
-        logger.info(f"尝试重新连接设备 {self.port}")
-        await self.close()
+    async def connect_once(self) -> None:
+        """Establish one connection. Any failure raises so the supervisor
+        backs off and starts over from port resolution, which is what makes
+        both "device vanished" and "open failed" recover without extra logic.
 
-        await asyncio.sleep(self.retry_delay)
-        await self.connect()
-        logger.info(f"设备 {self.port} 重新连接成功")
-    
+        Everything after the port is open is reported by raising, not by
+        cleaning up here: teardown() runs after every failed attempt and is the
+        single place the transport is released.
+        """
+        path = await self.resolve_port()
+        await self._wait_for_port(path)
+        self.reader, self.writer = await serial_asyncio.open_serial_connection(
+            url=path, baudrate=self.baudrate
+        )
+        self.active_port = path
+        await self._probe_modem()
+        await self.setup_sms()
+        self.is_running = True
+        logger.warning(f"Connected to {path}")
+        await self._notify(f"📶 Modem connected: {path}")
+
+    async def run(self) -> None:
+        """Long-running body. Any subtask failure propagates to reconnect.
+
+        All three subtasks loop forever, so this parks here for the life of the
+        session rather than returning; the supervisor treats a body that
+        returns as a failed session.
+        """
+        tasks = [
+            asyncio.create_task(self.read_loop()),
+            asyncio.create_task(self.process_loop()),
+            asyncio.create_task(self.heartbeat_loop()),
+        ]
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
+            raise RuntimeError("device subtasks ended unexpectedly")
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def teardown(self) -> None:
+        """Release the serial connection. Idempotent, never raises."""
+        self.is_running = False
+        writer, self.writer = self.writer, None
+        self.reader = None
+        if writer is None:
+            # Nothing was ever opened, or this is the second call. Both are
+            # normal: teardown runs after every failed attempt, including ones
+            # that never reached the port.
+            return
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception as exc:
+            logger.warning(f"Error closing serial writer: {exc}")
+        await self._notify("⚠️ Modem disconnected, reconnecting")
+
+    async def _notify(self, text: str) -> None:
+        """Report outward. A dead channel must not affect the device path."""
+        if self.notify is None:
+            return
+        try:
+            await self.notify(text)
+        except Exception as exc:
+            logger.warning(f"Could not send device state notification: {exc}")
+
+    async def heartbeat_loop(self) -> None:
+        """Prove periodically that the modem still answers.
+
+        A USB serial port stays open and readable when the modem behind it has
+        stopped responding: reads simply never arrive, and nothing else in this
+        process can tell that apart from a quiet night. Asking a question the
+        modem has to answer is the only way to distinguish them.
+
+        AT+CSQ is used rather than a bare AT because its reply prefix is
+        distinctive and cannot be confused with the OK produced by the message
+        sending path; the signal strength it returns is useful diagnostically.
+        """
+        failures = 0
+        while True:
+            await self._sleep(self.probe_interval)
+            self._probe_event.clear()
+            async with self._at_lock:
+                await self.send_at_command_async("AT+CSQ")
+            try:
+                await asyncio.wait_for(self._probe_event.wait(), timeout=self.probe_timeout)
+            except asyncio.TimeoutError:
+                failures += 1
+                logger.warning(f"Modem heartbeat missed ({failures} in a row)")
+                if failures >= self.probe_failures:
+                    raise RuntimeError(f"Modem missed {failures} consecutive heartbeats")
+                continue
+
+            # A single answer clears the count: an occasional miss on a busy
+            # modem is normal, only a run of them means it has gone quiet.
+            failures = 0
+            if self.health is not None:
+                # Keep the snapshot file fresh so the container healthcheck can
+                # tell a live process from a wedged one. Marking the component
+                # up is deliberately not done here: that belongs to the
+                # supervisor, which waits until a session has proved stable.
+                # Doing it from the heartbeat would re-stamp the health
+                # timestamp on every flap cycle, and a component that keeps
+                # failing just slower than this interval would never let the
+                # watchdog reach its threshold.
+                self.health.refresh_file()
+
     async def setup_sms(self) -> None:
         """Run the initialisation sequence, waiting for each response.
 
@@ -386,160 +500,100 @@ class DeviceManager:
 
             logger.warning(f"{command} was not acknowledged; continuing setup")
 
-    async def start(self) -> None:
-        """
-        启动设备管理器，连接到设备并开始读取数据。
-        """
-        try:
-            await self.connect()
-            self.is_running = True  # 确保设置正确的运行状态
-            self.priming_event.set()
-            await self.exit_event.wait()
-        except Exception as e:
-            logger.error(f"设备管理器启动失败: {e}")
-            self.is_running = False
-            self.priming_event.set()  # 设置事件避免主线程永久等待
-            raise  # 向上级传递异常
-
-    async def close(self) -> None:
-        """
-        关闭服务，停止所有正在运行的子任务。
-        """
-        logger.info("正在关闭 Device Manager 服务...")
-        
-        self.is_running = False
-        
-        # 取消读取和处理任务
-        if self.read_task and not self.read_task.done():
-            self.read_task.cancel()
-            try:
-                await self.read_task
-            except (asyncio.CancelledError, Exception) as e:
-                logger.warning(f"read_task取消: {e}")
-            self.read_task = None
-            
-        if self.process_task and not self.process_task.done():
-            self.process_task.cancel()
-            try:
-                await self.process_task
-            except (asyncio.CancelledError, Exception) as e:
-                logger.warning(f"process_task取消: {e}")
-            self.process_task = None
-            
-        # 关闭串口连接
-        if self.writer:
-            self.writer.close()
-            try:
-                await self.writer.wait_closed()
-            except Exception as e:
-                logger.warning(f"关闭写入器出错: {e}")
-            self.writer = None
-                
-        # 设置退出事件
-        self.exit_event.set()
-                
-        logger.info("Device Manager 服务已关闭")
-    
     async def read_loop(self) -> None:
-        """
-        持续读取串口数据的循环
-        """
-        number_of_errors = 0
-        while self.is_running:
+        """Read from the serial port. Repeated failures propagate to reconnect."""
+        errors = 0
+        while True:
             try:
                 assert self.reader is not None
                 line = await self.reader.readline()
-
                 if line:
                     await self.message_queue.put(line)
-                    number_of_errors = 0
+                    errors = 0
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                number_of_errors += 1
-                logger.warning(f"读取循环出错: {e}")
-                await asyncio.sleep(self.retry_delay)
-                
-                # 如果连续出错超过阈值，标记服务为停止状态并退出
-                if number_of_errors >= self.max_retries:
-                    logger.error(f"读取循环连续出错 {number_of_errors} 次，停止服务")
-                    self.is_running = False
-                    raise RuntimeError(f"设备读取失败: {e}")
-                    
-        logger.warning("读取循环已关闭")
-    
+            except Exception as exc:
+                errors += 1
+                logger.warning(f"Serial read error: {exc}")
+                if errors >= self.max_retries:
+                    raise RuntimeError(f"Serial read failed {errors} times: {exc}")
+                await self._sleep(self.retry_delay)
+
+        logger.warning("Read loop stopped")
+
     async def process_loop(self) -> None:
-        """处理消息队列的循环"""
-        number_of_errors = 0
-        while self.is_running:
+        """Drain the message queue. Reconnection belongs to the supervisor."""
+        errors = 0
+        while True:
             try:
                 message = await asyncio.wait_for(self.message_queue.get(), timeout=5)
                 await self.process_message(message)
-                number_of_errors = 0
+                errors = 0
             except asyncio.TimeoutError:
+                # Idle tick: nudge any partially received PDU along.
                 await self.handle_incoming_sms_pdu()
-                continue  # 队列为空，继续下一次循环
+                continue
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                number_of_errors += 1
-                logger.error(f"处理循环出错: {e}")
-                await asyncio.sleep(self.retry_delay)
+            except Exception as exc:
+                errors += 1
+                logger.error(f"Message processing error: {exc}")
+                if errors >= self.max_retries:
+                    raise RuntimeError(f"Message processing failed {errors} times: {exc}")
+                await self._sleep(self.retry_delay)
 
-                if 1 < number_of_errors < self.max_retries:
-                    await self.reconnect()  # 尝试重新连接
-                if number_of_errors >= self.max_retries:
-                    logger.error(f"处理循环出错次数已达到 {number_of_errors} 次")
-                    self.is_running = False
-                    raise RuntimeError("处理循环出错")
-                    
-        logger.warning("处理循环已关闭")
-    
+        logger.warning("Process loop stopped")
+
     async def process_message(self, message: bytes) -> None:
-        """处理单个消息"""
+        """Route one line read from the serial port."""
 
         if message.endswith(b'\r\n'):
             message = message[:-2].strip()
 
         if message.startswith(b'"') and message.endswith(b'"'):
             message = message[1:-1]
-        
+
         if message in [b'', b' ', b'OK', b'>']:
-            # 忽略没必要的内容
+            # Nothing to route.
             return
         else:
-            logger.debug(f"收到待处理的信息(处理后): {message}")
+            logger.debug(f"Processing serial line: {_describe_line(message)}")
 
         if message.startswith(b'+CMT:'):
             await self.handle_incoming_sms_header(message)
+        elif message.startswith(b'+CSQ:'):
+            # Checked ahead of the pending-PDU branch on purpose: a heartbeat
+            # reply can land between a +CMT header and its PDU, and appending
+            # it to the PDU would corrupt the message and lose the heartbeat.
+            # A PDU line is hexadecimal, so it can never be mistaken for this.
+            self._handle_csq(message)
         elif self.pending_sms["pdu"] is not None:
             await self.handle_incoming_sms_pdu(message)
         elif message.startswith(b'+CMGS:'):
-            logger.info(f"短信发送成功，响应: {message.decode('utf-8')}")
+            # +CMGS carries only the message reference number.
+            logger.info(f"Message accepted by the modem: {message.decode('utf-8')}")
             self.sms_sent_event.set()
         elif message.startswith(b'+CREG:'):
+            # Decoded outside the try so the failure path below can always
+            # name the line it could not parse.
+            creg_msg = message.decode('utf-8', errors='replace')
             try:
-                # 解析CREG消息
-                creg_msg = message.decode('utf-8')
                 parts = creg_msg.replace('+CREG:', '').strip().split(',')
 
-                # 解析各个部分
                 status = parts[0].strip()
                 lac = parts[1].strip(' "') if len(parts) > 1 else "Unknown"
                 ci = parts[2].strip(' "') if len(parts) > 2 else "Unknown"
                 act = parts[3].strip() if len(parts) > 3 else "Unknown"
 
-                # 获取状态描述
                 status_desc = {
-                    "0": "未注册",
-                    "1": "已注册，归属地网络",
-                    "2": "未注册，正在搜索",
-                    "3": "注册被拒绝",
-                    "4": "未知",
-                    "5": "已注册，漫游"
-                }.get(status, "未知状态")
+                    "0": "not registered",
+                    "1": "registered, home network",
+                    "2": "not registered, searching",
+                    "3": "registration denied",
+                    "4": "unknown",
+                    "5": "registered, roaming",
+                }.get(status, "unknown state")
 
-                # 获取网络类型描述
                 act_desc = {
                     "0": "GSM",
                     "2": "UTRAN",
@@ -551,41 +605,59 @@ class DeviceManager:
                 }.get(act, "Unknown")
 
                 logger.debug(
-                    f"网络注册状态更新 - 状态: {status_desc}, "
-                    f"位置区: {lac}, 小区ID: {ci}, "
-                    f"网络类型: {act_desc}"
+                    f"Network registration: {status_desc}, "
+                    f"area {lac}, cell {ci}, access technology {act_desc}"
                 )
             except Exception as e:
-                logger.debug(f"解析CREG消息失败: {e}, 原始消息: {message}")
+                # A +CREG line reports registration state only; it has no
+                # message payload, so quoting it back is safe and useful.
+                logger.debug(f"Could not parse a CREG line: {e}, line: {creg_msg!r}")
         else:
-            logger.warning(f"未处理的消息: {message}")
-    
+            logger.warning(f"Unhandled serial line: {_describe_line(message)}")
+
+    def _handle_csq(self, message: bytes) -> None:
+        """Parse +CSQ: <rssi>,<ber>. A malformed reply is logged, not raised."""
+        try:
+            payload = message.decode('utf-8').replace('+CSQ:', '').strip()
+            rssi = int(payload.split(',')[0].strip())
+        except (ValueError, IndexError, UnicodeDecodeError) as exc:
+            logger.debug(f"Could not parse CSQ: {exc}")
+            rssi = None
+        if self.health is not None and rssi is not None:
+            self.health.record_rssi(rssi)
+        # Set regardless of whether the value parsed: the probe asks whether
+        # the modem answers, not what it answered.
+        self._probe_event.set()
+
     async def handle_incoming_sms_header(self, bytes_message: bytes) -> None:
         """
-        处理接收到的短信头部信息。
-        
-        :param bytes_message: 接收到的字节形式的消息头
+        Handle a +CMT header announcing an incoming message.
+
+        :param bytes_message: the header line, as read from the port
         """
-        # 将字节消息解码为字符串
         message = bytes_message.decode('utf-8', errors='ignore')
-        
-        # 使用正则表达式匹配 PDU 长度
-        # 格式可能是 "+CMT: <length>" 或 "+CMT: ,<length>"
+
+        # The length may appear as "+CMT: <length>" or "+CMT: ,<length>".
         match = re.search(r'\+CMT:\s*(?:,\s*)?(\d+)', message)
-        
+
         if match:
-            # 提取 PDU 长度
             pdu_length = int(match.group(1))
-            
-            # 初始化 pending_sms 字典，准备接收 PDU 数据
+
+            # Start accumulating the PDU that follows this header.
             self.pending_sms = {
                 "pdu": b"",
                 "expected_length": pdu_length
             }
-            
-            logger.debug(f"准备接收 {pdu_length} 字节的 PDU 数据")
+
+            logger.debug(f"Expecting a {pdu_length} byte PDU")
         else:
-            logger.warning(f"无法从消息头中解析 PDU 长度: {message}")
+            # Worth reporting, because an unparsable header means a message is
+            # about to be dropped. Described rather than quoted: this code did
+            # not recognise the line, so it cannot promise it holds no message.
+            logger.warning(
+                f"Could not read a PDU length from the message header: "
+                f"{_describe_line(bytes_message)}"
+            )
 
     async def _forward_pdu(self, pdu_hex: str, force_process: bool = False) -> bool:
         """Decode one PDU and forward it, merging concatenated parts.
@@ -718,26 +790,24 @@ class DeviceManager:
         ref_num: int, max_parts: int, seq_num: int
     ) -> None:
         """
-        处理长短信的单个分片。
-        
-        :param sender: 发送者号码
-        :param timestamp: 时间戳
-        :param content: 分片内容
-        :param ref_num: 分片引用号（用于识别属于同一条长短信的分片）
-        :param max_parts: 总分片数
-        :param seq_num: 当前分片序号（从1开始）
+        Handle one part of a concatenated message.
+
+        :param sender: sender number
+        :param timestamp: the carrier's timestamp for the message
+        :param content: this part's text
+        :param ref_num: reference number shared by every part of one message
+        :param max_parts: how many parts the message has
+        :param seq_num: this part's position, counting from 1
         """
         cache_key = (sender, ref_num)
-        
+
         logger.debug(
-            f"收到长短信分片 - 发送者: {sender}, 引用号: {ref_num}, "
-            f"分片: {seq_num}/{max_parts}, 内容: {content[:20]}..."
+            f"Concatenated part from {sender}: ref={ref_num}, "
+            f"part {seq_num}/{max_parts}, {len(content)} character(s)"
         )
-        
-        # 清理过期的缓存
+
         await self._cleanup_expired_concat_cache()
-        
-        # 如果缓存中没有此长短信，创建新的缓存
+
         if cache_key not in self.concat_sms_cache:
             self.concat_sms_cache[cache_key] = ConcatSmsBuffer(
                 sender=sender,
@@ -745,103 +815,97 @@ class DeviceManager:
                 max_parts=max_parts,
                 timestamp=timestamp
             )
-        
+
         buffer = self.concat_sms_cache[cache_key]
         buffer.add_part(seq_num, content)
-        
+
         logger.info(
-            f"长短信分片已缓存 - 发送者: {sender}, 引用号: {ref_num}, "
-            f"已收到: {len(buffer.parts)}/{max_parts}"
+            f"Concatenated part held from {sender}: ref={ref_num}, "
+            f"{len(buffer.parts)}/{max_parts} received"
         )
-        
-        # 检查是否所有分片都已收到
+
         if buffer.is_complete():
             merged_content = buffer.get_merged_content()
             timestamp_str = buffer.timestamp.strftime("%Y-%m-%d %H:%M:%S") if isinstance(buffer.timestamp, datetime) else str(buffer.timestamp)
-            
+
             logger.info(
-                f"长短信已完整合并 - 发送者: {sender}, 时间: {timestamp_str}, "
-                f"分片数: {max_parts}, 完整内容: {merged_content}"
+                f"Concatenated message complete from {sender} at {timestamp_str}: "
+                f"{max_parts} part(s), {len(merged_content)} character(s)"
             )
-            
-            # 转发完整的短信
+
             await self.receive_sms_callback(sender, timestamp_str, merged_content)
-            
-            # 清理缓存
+
             del self.concat_sms_cache[cache_key]
-    
+
     async def _cleanup_expired_concat_cache(self) -> None:
-        """清理过期的长短信分片缓存"""
+        """Drop concatenated messages whose missing parts never arrived."""
         expired_keys = [
             key for key, buffer in self.concat_sms_cache.items()
             if buffer.is_expired(self.CONCAT_SMS_TIMEOUT)
         ]
-        
+
         for key in expired_keys:
             buffer = self.concat_sms_cache[key]
+            # The parts received so far are deliberately not forwarded: half a
+            # message is worse than none, because it reads as a whole one.
             logger.warning(
-                f"长短信分片超时 - 发送者: {buffer.sender}, 引用号: {buffer.ref_num}, "
-                f"已收到: {len(buffer.parts)}/{buffer.max_parts}, "
-                f"丢弃未完成的分片"
+                f"Concatenated message timed out from {buffer.sender}: "
+                f"ref={buffer.ref_num}, only {len(buffer.parts)}/"
+                f"{buffer.max_parts} part(s) arrived; discarding them"
             )
-            # 可选：转发已收到的不完整内容
-            # 这里选择丢弃，但记录日志
             del self.concat_sms_cache[key]
-        
+
     async def handle_send_sms(self, phone_number: str, message: str) -> bool:
         """
-        发送短信。
+        Send one message.
 
-        :param phone_number: 目标电话号码
-        :param message: 要发送的短信内容
-        :return: 发送是否成功
+        :param phone_number: destination number
+        :param message: text to send
+        :return: whether the modem confirmed the send
         """
-        logger.debug(f"准备发送短信到 {phone_number}，内容长度: {len(message)}")
+        logger.debug(f"Sending to {phone_number}, {len(message)} character(s)")
 
         try:
             self.sms_sent_event.clear()
-            
-            # 1. 对用户输入进行简单检查，比如空字符串检查、号码格式检查（根据需求可更严格）
+
             if not phone_number.strip():
-                logger.warning("目标电话号码为空，发送取消")
+                logger.warning("Destination number is empty; send cancelled")
                 return False
 
-            # 2. 构建 PDU
             pdus = encodeSmsSubmitPdu(phone_number, message, requestStatusReport=True)
-            logger.debug(f"共有 {len(pdus)} 个 PDU 需要发送")
+            logger.debug(f"{len(pdus)} PDU(s) to send")
 
-            # 3. 逐条 PDU 发送
             for i, pdu in enumerate(pdus, 1):
                 pdu_hex = pdu.data.hex().upper()
-                
+
                 smsc_length = int(pdu_hex[:2], 16)
                 pdu_length = (len(pdu_hex) - (smsc_length + 1) * 2) // 2
 
-                logger.debug(f"发送第 {i} 个 PDU，长度: {pdu_length}")
+                logger.debug(f"Sending PDU {i}, length {pdu_length}")
 
-                # 4. 发送 AT+CMGS 命令
-                await self.send_at_command_async(f'AT+CMGS={pdu_length}')
-                await asyncio.sleep(1)  # 等待模块准备就绪
+                # Held across both writes: everything between the AT+CMGS and
+                # the terminating Ctrl+Z is taken by the modem as message data.
+                async with self._at_lock:
+                    await self.send_at_command_async(f'AT+CMGS={pdu_length}')
+                    await self._sleep(1)  # give the modem time to prompt
 
-                # 发送 PDU 数据，Ctrl+Z 结尾
-                logger.debug(f"发送 PDU 数据（截断显示前 20 个字符）: {pdu_hex[:20]}...")
-                await self.send_at_command_async(pdu_hex + chr(26))
+                    # The PDU is the encoded message, so only its size is
+                    # logged. Ctrl+Z is what submits it.
+                    logger.debug(f"Writing {len(pdu_hex)} hex character(s) of PDU data")
+                    await self.send_at_command_async(pdu_hex + chr(26))
 
-            # 5. 等待短信发送完成事件
-            logger.info(f"已发送短信到 {phone_number}，正在等待模块发送结果...")
-            await asyncio.wait_for(self.sms_sent_event.wait(), timeout=10.0)  # 等待 10 秒
+            logger.info(f"Sent to {phone_number}; awaiting the modem's result")
+            await asyncio.wait_for(self.sms_sent_event.wait(), timeout=10.0)
 
-            # 6. 如果执行到这里说明短信模块返回了 +CMGS: OK
-            logger.info(f"短信发送成功: {phone_number}")
+            # Reached only once the modem answered +CMGS.
+            logger.info(f"Send confirmed: {phone_number}")
             return True
 
         except asyncio.TimeoutError:
-            logger.error(f"等待短信发送结果超时: {phone_number}")
+            logger.error(f"Timed out awaiting the send result for {phone_number}")
             return False
         except Exception as e:
-            logger.error(f"发送短信过程出现异常: {e}", exc_info=True)
+            logger.error(f"Send failed for {phone_number}: {e}", exc_info=True)
             return False
         finally:
-            # 确保事件状态清理
             self.sms_sent_event.clear()
-            

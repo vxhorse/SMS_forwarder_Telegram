@@ -1,14 +1,14 @@
 import os
 
-# 从环境变量获取日志级别，默认INFO
+# Log level, taken from the environment. INFO unless overridden.
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# SMS模块配置
+# Modem settings.
 # Leave empty to auto-discover the modem's AT port.
 SMS_PORT = os.getenv("SMS_PORT", "").strip()
 SMS_BAUDRATE = int(os.getenv("SMS_BAUDRATE", "115200"))
 
-# Telegram 机器人配置
+# Telegram bot settings.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "your_telegram_bot_token")
 CHAT_ID = os.getenv("CHAT_ID", "your_telegram_chat_id")
 PROXY_URL = os.getenv("PROXY_URL", "http://127.0.0.1:7890")
@@ -42,3 +42,9 @@ PORT_PROBE_TIMEOUT = float(os.getenv("PORT_PROBE_TIMEOUT", "3.0"))
 AT_COMMAND_TIMEOUT = float(os.getenv("AT_COMMAND_TIMEOUT", "3.0"))
 # Longer timeout for commands the modem processes slowly (AT&F, AT+CFUN, AT&W).
 AT_SLOW_COMMAND_TIMEOUT = float(os.getenv("AT_SLOW_COMMAND_TIMEOUT", "10.0"))
+
+# Modem liveness probe (AT+CSQ): interval, response deadline, and how many
+# consecutive misses trigger a reconnect.
+MODEM_PROBE_INTERVAL = float(os.getenv("MODEM_PROBE_INTERVAL", "30.0"))
+MODEM_PROBE_TIMEOUT = float(os.getenv("MODEM_PROBE_TIMEOUT", "5.0"))
+MODEM_PROBE_FAILURES = int(os.getenv("MODEM_PROBE_FAILURES", "3"))
