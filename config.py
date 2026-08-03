@@ -94,3 +94,18 @@ MODEM_PROBE_INTERVAL = max(1.0, min(
 # the same question, which is how long the modem gets to answer a probe.
 MODEM_PROBE_TIMEOUT = float(os.getenv("MODEM_PROBE_TIMEOUT", "5.0"))
 MODEM_PROBE_FAILURES = int(os.getenv("MODEM_PROBE_FAILURES", "3"))
+
+# How long the health snapshot may go unrefreshed before the watchdog treats
+# the process as stalled. A component that blocks without raising never reaches
+# mark_down, so this is the only signal that catches it. Floored at four refresh
+# cycles so a single slow cycle can never trip it; at zero it would fire the
+# moment the first snapshot was written, which would kill a working process.
+#
+# This belongs with the watchdog settings above, and sits here instead because
+# it is derived from MODEM_PROBE_INTERVAL, which is itself derived from
+# HEALTH_STALE_SECONDS. Naming either one earlier in the file would be a
+# forward reference, and the module would fail to import.
+WATCHDOG_STALL_SECONDS = max(
+    4 * MODEM_PROBE_INTERVAL,
+    float(os.getenv("WATCHDOG_STALL_SECONDS", str(2 * HEALTH_STALE_SECONDS))),
+)

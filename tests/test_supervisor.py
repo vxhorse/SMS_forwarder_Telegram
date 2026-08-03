@@ -497,3 +497,126 @@ async def test_watchdog_stays_quiet_while_components_are_up():
     assert shutdown.is_set() is False
     assert supervisor.exit_reason is None
     await _cancel(task)
+
+
+class _StallHealth:
+    """Minimal health double: answers only what the watchdog asks."""
+
+    def __init__(self, down=0.0, stall=None):
+        self.down = down
+        self.stall = stall
+        # Counts the inspections so a test can tell "the watchdog looked and
+        # held its fire" apart from "the watchdog never got as far as looking",
+        # which would otherwise satisfy the same assertions.
+        self.down_reads = 0
+        self.stall_reads = 0
+
+    def down_duration(self):
+        self.down_reads += 1
+        return self.down
+
+    def stall_duration(self):
+        self.stall_reads += 1
+        return self.stall
+
+
+# The watchdog is driven with interval=0, so every scheduling step below is one
+# or more full inspections. Fifty of them is far more cycles than the threshold
+# under test needs, and none of them costs wall time.
+_INERT_STEPS = 50
+_MIN_INSPECTIONS = 5
+
+
+async def test_watchdog_exits_when_the_snapshot_stops_being_refreshed():
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=300.0)
+    sup = Supervisor(health, shutdown)
+    await asyncio.wait_for(
+        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0),
+        timeout=_FAILSAFE,
+    )
+    assert sup.exit_reason == "stalled"
+    assert shutdown.is_set()
+
+
+async def test_watchdog_ignores_a_system_that_has_never_been_healthy():
+    # stall_duration() is None: hardware has not appeared yet. Exiting here
+    # would be the startup deadline this project removed.
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=None)
+    sup = Supervisor(health, shutdown)
+    task = asyncio.create_task(
+        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    assert not task.done()
+    assert sup.exit_reason is None
+    # It kept inspecting and kept deciding not to act, rather than never
+    # reaching the check at all.
+    assert health.stall_reads >= _MIN_INSPECTIONS
+    shutdown.set()
+    await task
+
+
+async def test_watchdog_holds_fire_below_the_stall_threshold():
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=239.0)
+    sup = Supervisor(health, shutdown)
+    task = asyncio.create_task(
+        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    assert not task.done()
+    assert sup.exit_reason is None
+    assert health.stall_reads >= _MIN_INSPECTIONS
+    shutdown.set()
+    await task
+
+
+async def test_the_down_threshold_still_wins_when_both_apply():
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=4000.0, stall=300.0)
+    sup = Supervisor(health, shutdown)
+    await asyncio.wait_for(
+        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0),
+        timeout=_FAILSAFE,
+    )
+    assert sup.exit_reason == "watchdog"
+
+
+async def test_a_component_that_is_down_is_not_also_reported_as_stalled():
+    """The snapshot is only written while every component is up, so anything
+    that is down stops it being refreshed as a matter of course. Treating that
+    age as a stall would put a second ceiling on a reconnecting component, one
+    fifteen times shorter than the tolerance chosen for it, and would blame a
+    block for a failure that is nothing of the kind.
+    """
+    shutdown = asyncio.Event()
+    # Well past the stall threshold, well inside the down threshold: exactly
+    # the window a long reconnection sits in.
+    health = _StallHealth(down=600.0, stall=600.0)
+    sup = Supervisor(health, shutdown)
+    task = asyncio.create_task(
+        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    assert not task.done()
+    assert sup.exit_reason is None
+    assert health.down_reads >= _MIN_INSPECTIONS
+    shutdown.set()
+    await task
+
+
+def test_watchdog_stall_threshold_has_a_floor(monkeypatch):
+    """The threshold is operator-settable, and zero would make it fire the
+    moment the first snapshot is written, killing a working process."""
+    monkeypatch.setenv("WATCHDOG_STALL_SECONDS", "0")
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.WATCHDOG_STALL_SECONDS >= 4 * reloaded.MODEM_PROBE_INTERVAL
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
