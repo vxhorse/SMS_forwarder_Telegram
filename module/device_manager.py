@@ -1180,8 +1180,19 @@ class DeviceManager:
         except asyncio.TimeoutError:
             logger.error(f"Timed out awaiting the send result for {masked}")
             return False
-        except Exception as e:
-            logger.error(f"Send failed for {masked}: {e}", exc_info=True)
+        except Exception as exc:
+            # Only the kind of failure is named, and exc_info is deliberately
+            # absent. This block spans the whole send - the PDU encoder, which
+            # is handed the message text, and the writes that carry the encoded
+            # message - so an exception raised anywhere under it may quote what
+            # it was working on. exc_info would not be a safer way to keep the
+            # detail either: a formatted traceback ends with the exception's own
+            # str(), so it reprints exactly what interpolating it would have.
+            # _forward_pdu is guarded the same way, for the same reason.
+            logger.error(
+                f"Send failed for {masked}, {len(message)} character(s): "
+                f"{type(exc).__name__}"
+            )
             return False
         finally:
             self.sms_sent_event.clear()
