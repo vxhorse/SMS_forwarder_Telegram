@@ -1,5 +1,46 @@
 import os
 
+# Settings whose value the operator asked for was overridden by a floor or a
+# ceiling, because a value outside that range would either disable the guard
+# the setting exists for or reinstate the exact failure the guard exists to
+# prevent. Recorded here rather than logged immediately: this module cannot
+# import the logger, since logger.py reads its level from here and importing
+# it back would be circular. main.py logs each of these once the logger
+# exists.
+CLAMP_NOTICES: list = []
+
+
+def _clamped(name: str, requested, low=None, high=None):
+    """Apply a floor and/or a ceiling to an operator-supplied setting.
+
+    Returns the value actually in force. When a bound moves the value away
+    from what was requested, appends a notice to CLAMP_NOTICES naming the
+    setting, what was asked for, and what is running instead - an operator
+    who tunes a setting outside its allowed range gets told, rather than
+    left believing it took effect.
+
+    Only ever called below with a numeric setting and a literal name typed
+    at the call site, never with an arbitrary key - so it has no way to be
+    pointed at BOT_TOKEN or CHAT_ID, which are credentials and have no floor
+    or ceiling of their own regardless.
+    """
+    applied = requested
+    if low is not None:
+        applied = max(low, applied)
+    if high is not None:
+        applied = min(high, applied)
+    if applied != requested:
+        if low is not None and applied == low:
+            reason = f"floor is {low:g}"
+        else:
+            reason = f"ceiling is {high:g}"
+        CLAMP_NOTICES.append(
+            f"{name} was requested as {requested:g} but is running as "
+            f"{applied:g} ({reason})"
+        )
+    return applied
+
+
 # Log level, taken from the environment. INFO unless overridden.
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
@@ -46,7 +87,9 @@ HEALTH_FILE = os.getenv("HEALTH_FILE", "/tmp/healthy")
 # shorter than the interval at which the file can possibly be rewritten, and
 # the healthcheck would fail a process that is working perfectly. Two seconds
 # is that bound.
-HEALTH_STALE_SECONDS = max(2, int(os.getenv("HEALTH_STALE_SECONDS", "120")))
+HEALTH_STALE_SECONDS = _clamped(
+    "HEALTH_STALE_SECONDS", int(os.getenv("HEALTH_STALE_SECONDS", "120")), low=2
+)
 # Exit the process once any component has been down this long, letting the
 # container runtime restart everything as a last resort.
 WATCHDOG_DOWN_SECONDS = int(os.getenv("WATCHDOG_DOWN_SECONDS", "3600"))
@@ -59,10 +102,18 @@ RECONNECT_BACKOFF_MAX = float(os.getenv("RECONNECT_BACKOFF_MAX", "30.0"))
 #
 # Floored because at zero every connection counts as a recovery the instant it
 # is made, which is precisely the behaviour this setting exists to prevent.
-SERVICE_STABLE_SECONDS = max(5.0, float(os.getenv("SERVICE_STABLE_SECONDS", "60.0")))
+SERVICE_STABLE_SECONDS = _clamped(
+    "SERVICE_STABLE_SECONDS",
+    float(os.getenv("SERVICE_STABLE_SECONDS", "60.0")),
+    low=5.0,
+)
 # How often the watchdog inspects component health, in seconds. Floored because
 # a value of zero would turn the watchdog into a busy loop.
-WATCHDOG_CHECK_INTERVAL = max(1.0, float(os.getenv("WATCHDOG_CHECK_INTERVAL", "30.0")))
+WATCHDOG_CHECK_INTERVAL = _clamped(
+    "WATCHDOG_CHECK_INTERVAL",
+    float(os.getenv("WATCHDOG_CHECK_INTERVAL", "30.0")),
+    low=1.0,
+)
 # Deadline for one outward component-state notification, in seconds.
 #
 # Sending a notification retries several times with a delay between attempts, so
@@ -79,10 +130,12 @@ WATCHDOG_CHECK_INTERVAL = max(1.0, float(os.getenv("WATCHDOG_CHECK_INTERVAL", "3
 # here. Ten seconds is the shortest one in common use, so a notification that
 # could outlast that is one that could outlast the whole stop.
 NOTIFY_TIMEOUT_CEILING = 10.0
-NOTIFY_TIMEOUT = max(1.0, min(
+NOTIFY_TIMEOUT = _clamped(
+    "NOTIFY_TIMEOUT",
     float(os.getenv("NOTIFY_TIMEOUT", "5.0")),
-    NOTIFY_TIMEOUT_CEILING,
-))
+    low=1.0,
+    high=NOTIFY_TIMEOUT_CEILING,
+)
 
 # Root of the device tree to scan. Inside a container this points at the
 # bind-mounted host /dev; running directly on a host it is just /dev.
@@ -111,7 +164,9 @@ AT_SLOW_COMMAND_TIMEOUT = float(os.getenv("AT_SLOW_COMMAND_TIMEOUT", "10.0"))
 # and forces the close through. Floored because zero would abort every ordinary
 # disconnect before the transport had a chance to flush, and an abort throws
 # away whatever was still queued.
-SERIAL_CLOSE_TIMEOUT = max(1.0, float(os.getenv("SERIAL_CLOSE_TIMEOUT", "5.0")))
+SERIAL_CLOSE_TIMEOUT = _clamped(
+    "SERIAL_CLOSE_TIMEOUT", float(os.getenv("SERIAL_CLOSE_TIMEOUT", "5.0")), low=1.0
+)
 
 # Modem liveness probe (AT+CSQ): interval, response deadline, and how many
 # consecutive misses trigger a reconnect.
@@ -124,10 +179,12 @@ SERIAL_CLOSE_TIMEOUT = max(1.0, float(os.getenv("SERIAL_CLOSE_TIMEOUT", "5.0")))
 # period that loop happens to have. Half the window means a single missed probe
 # is not enough to trip it, and the floor keeps a value of zero from turning
 # the probe into a busy loop.
-MODEM_PROBE_INTERVAL = max(1.0, min(
+MODEM_PROBE_INTERVAL = _clamped(
+    "MODEM_PROBE_INTERVAL",
     float(os.getenv("MODEM_PROBE_INTERVAL", "30.0")),
-    HEALTH_STALE_SECONDS / 2,
-))
+    low=1.0,
+    high=HEALTH_STALE_SECONDS / 2,
+)
 # Also governs the AT handshake performed right after the port opens: both ask
 # the same question, which is how long the modem gets to answer a probe.
 MODEM_PROBE_TIMEOUT = float(os.getenv("MODEM_PROBE_TIMEOUT", "5.0"))
@@ -143,7 +200,11 @@ MODEM_PROBE_FAILURES = int(os.getenv("MODEM_PROBE_FAILURES", "3"))
 # evidence of anything and only a run of them means the radio is not attached.
 # Floored at two for that reason, and because zero would switch the check off
 # while looking like a setting.
-MODEM_REGISTRATION_FAILURES = max(2, int(os.getenv("MODEM_REGISTRATION_FAILURES", "3")))
+MODEM_REGISTRATION_FAILURES = _clamped(
+    "MODEM_REGISTRATION_FAILURES",
+    int(os.getenv("MODEM_REGISTRATION_FAILURES", "3")),
+    low=2,
+)
 
 # Whether to ask the registration question at all.
 #
@@ -262,10 +323,48 @@ WATCHDOG_STALL_FLOOR = max(
 # it is derived from the modem probe settings, which are themselves derived from
 # HEALTH_STALE_SECONDS. Naming any of them earlier in the file would be a
 # forward reference, and the module would fail to import.
+#
+# Handled separately from _clamped above, rather than reused, because both
+# bounds here are derived rather than fixed, and the fallback used when the
+# operator sets nothing - twice HEALTH_STALE_SECONDS - already sits under
+# WATCHDOG_STALL_FLOOR at the defaults this file ships (240 against 310).
+# Reporting that plain arithmetic fact on every unmodified start would be
+# exactly the noise an operator learns to stop reading, so a notice is only
+# recorded for what the operator actually touched: an explicit
+# WATCHDOG_STALL_SECONDS that the bounds move away from, or a
+# WATCHDOG_DOWN_SECONDS low enough that the floor now exceeds it - which is
+# the documented invariant above failing, quietly, because the floor is
+# applied last on purpose.
+_watchdog_stall_env = os.environ.get("WATCHDOG_STALL_SECONDS")
+_watchdog_stall_requested = (
+    float(_watchdog_stall_env)
+    if _watchdog_stall_env is not None
+    else 2 * HEALTH_STALE_SECONDS
+)
 WATCHDOG_STALL_SECONDS = max(
     WATCHDOG_STALL_FLOOR,
-    min(
-        float(WATCHDOG_DOWN_SECONDS),
-        float(os.getenv("WATCHDOG_STALL_SECONDS", str(2 * HEALTH_STALE_SECONDS))),
-    ),
+    min(float(WATCHDOG_DOWN_SECONDS), _watchdog_stall_requested),
 )
+
+if (
+    _watchdog_stall_env is not None
+    and WATCHDOG_STALL_SECONDS != _watchdog_stall_requested
+):
+    _reason = (
+        f"floor is {WATCHDOG_STALL_FLOOR:g}"
+        if WATCHDOG_STALL_SECONDS == WATCHDOG_STALL_FLOOR
+        else f"ceiling is WATCHDOG_DOWN_SECONDS={WATCHDOG_DOWN_SECONDS:g}"
+    )
+    CLAMP_NOTICES.append(
+        f"WATCHDOG_STALL_SECONDS was requested as {_watchdog_stall_requested:g} "
+        f"but is running as {WATCHDOG_STALL_SECONDS:g} ({_reason})"
+    )
+if WATCHDOG_STALL_FLOOR > WATCHDOG_DOWN_SECONDS:
+    CLAMP_NOTICES.append(
+        f"WATCHDOG_STALL_SECONDS floor ({WATCHDOG_STALL_FLOOR:g}) exceeds "
+        f"WATCHDOG_DOWN_SECONDS ({WATCHDOG_DOWN_SECONDS:g}): a stall can now be "
+        "tolerated longer than the down timeout it is documented to stay under. "
+        "This is intentional - delaying a restart beats restarting a component "
+        "that is still working - but the documented invariant no longer holds "
+        "for this configuration."
+    )
