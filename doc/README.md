@@ -62,7 +62,7 @@ Three are slow enough to get a longer deadline
 | `AT` | Port discovery, and the handshake right after the port opens | Bare command. A port that answers `OK` is the module's AT port, and a module that answers has finished starting |
 | `AT+CMGL=4` | The stored-message drain, at step 13 above | List every message already in the store, so messages that arrived while the process was down are forwarded before step 14 erases them |
 | `AT+CSQ` | The liveness heartbeat, every `MODEM_PROBE_INTERVAL` | Signal quality. Asking a question the module must answer is the only way to tell a live module from an open port behind a wedged one |
-| `AT+CREG?` | The same heartbeat, after each answered `AT+CSQ` | Network registration state. Answering proves the module is alive, not that it is attached to a network: a SIM the carrier has detached answers every command exactly as before while no message can arrive |
+| `AT+CREG?` | The same heartbeat, after each answered `AT+CSQ`, and only with `MODEM_REGISTRATION_CHECK=1` (off by default) | Network registration state. Answering proves the module is alive, not that it is attached to a network: a SIM the carrier has detached answers every command exactly as before while no message can arrive |
 | `AT+CMGS=<length>` | The send path | Announce an outgoing PDU of that length. The module answers with a prompt, the hex PDU is written, and Ctrl+Z (0x1A) submits it |
 
 ## Responses and URCs this project reads
