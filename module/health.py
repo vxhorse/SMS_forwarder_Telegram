@@ -30,11 +30,27 @@ class HealthState:
         self._clock = clock
         self._health_file = health_file
         self._rssi: Optional[int] = None
+        self._registration: Optional[int] = None
         now = clock()
         # Every component starts down, so the watchdog clock effectively runs
         # from process start. A device that never appears is therefore visible
         # as a restart count rather than a silently idle container.
-        self._services = {name: {"up": False, "since": now} for name in service_names}
+        # "progress" is the last time this component's own loop reported that
+        # it advanced, and is None until it has. It is deliberately not seeded
+        # with the current reading: a component that has never run has not made
+        # progress, and pretending it has would start the stall clock on a
+        # process that is still waiting for its hardware.
+        self._services = {
+            name: {"up": False, "since": now, "progress": None}
+            for name in service_names
+        }
+        # When the snapshot was last written, and None until it has been.
+        self._last_refresh: Optional[float] = None
+        # When every component was last up at the same moment, and None until
+        # they have been. A system that has never been fully up is waiting, not
+        # stalled, and must never be treated as the latter - that would
+        # reinstate the startup deadline this project exists to remove.
+        self._all_up_since: Optional[float] = None
 
     def mark_up(self, name: str) -> None:
         """Mark a component ready. Idempotent: does not reset the timestamp."""
@@ -43,8 +59,24 @@ class HealthState:
             logger.warning(f"Ignoring health report for unregistered component: {name}")
             return
         if not service["up"]:
+            now = self._clock()
             service["up"] = True
-            service["since"] = self._clock()
+            service["since"] = now
+            # Re-initialised here rather than left where the previous session
+            # put it. A component that has just come back has made no progress
+            # under this session yet, and the age its last one left behind
+            # measures the outage, not this session; carried across the
+            # recovery it would be read as a stall the moment the component
+            # reconnected. This is also what lets stall_duration() assume that
+            # anything reported up has a progress stamp.
+            service["progress"] = now
+            # The moment the system became whole. The snapshot is not written
+            # while anything is down, so the age it carries here measures the
+            # outage; stall_duration() reads from this instead when it is the
+            # later of the two. Recorded at the transition, where the moment is
+            # exact, rather than left to be sampled by whoever reads the age.
+            if self.all_up():
+                self._all_up_since = now
             logger.info(f"Component is up: {name}")
 
     def mark_down(self, name: str, error: Optional[BaseException] = None) -> None:
@@ -58,9 +90,37 @@ class HealthState:
             service["since"] = self._clock()
             logger.error(f"Component is down: {name}" + (f" ({error})" if error else ""))
 
+    def record_progress(self, name: str) -> None:
+        """Record that one component's own loop advanced.
+
+        Called from that loop, and never from refresh_file(), because only a
+        stamp the loop writes itself says anything about the loop. refresh_file()
+        cannot: it is gated on every component being up, so it falls silent for
+        reasons that have nothing to do with the component being measured, and
+        every component loop calls it, so one loop that is still running keeps
+        the shared stamp fresh on behalf of one that has stopped. A component
+        blocked on a write raises nothing and stays marked up, so that shared
+        stamp is precisely what makes such a component look healthy.
+        """
+        service = self._services.get(name)
+        if service is None:
+            logger.warning(f"Ignoring progress report for unregistered component: {name}")
+            return
+        service["progress"] = self._clock()
+
     def record_rssi(self, value: Optional[int]) -> None:
         """Record the most recent signal strength. Diagnostic only."""
         self._rssi = value
+
+    def record_registration(self, state: Optional[int]) -> None:
+        """Record the most recent network registration state. Diagnostic only.
+
+        Deliberately not part of the up/down decision: whether being off the
+        network ends a session is the modem component's judgement, taken over
+        several readings, and duplicating it here would let one dip in a
+        handover take the whole snapshot down.
+        """
+        self._registration = state
 
     def all_up(self) -> bool:
         return all(service["up"] for service in self._services.values())
@@ -79,6 +139,7 @@ class HealthState:
         return {
             "services": {name: service["up"] for name, service in self._services.items()},
             "rssi": self._rssi,
+            "registration": self._registration,
         }
 
     def refresh_file(self) -> None:
@@ -95,6 +156,62 @@ class HealthState:
             os.replace(tmp_path, self._health_file)
         except OSError as exc:
             logger.warning(f"Could not write health file: {exc}")
+            return
+        self._last_refresh = self._clock()
+
+    def stall_duration(self) -> Optional[float]:
+        """Seconds since the least recently advanced thing last advanced.
+
+        Two kinds of thing are measured and the longest of them is returned:
+
+        - every component that is up, from the last time its own loop reported
+          progress. This is the reading that attributes a stall to a component.
+          A loop blocked on something that never returns raises nothing, so the
+          component stays marked up and no other reading in this process
+          changes at all.
+        - the snapshot file, from the last time it was written or the moment
+          the system last became whole, whichever is later. It says nothing
+          about any single component, because either component loop writes it
+          for both, and is kept only because it is also the reading that fails
+          when HEALTH_FILE itself can no longer be written.
+
+        The snapshot is not written at all while a component is down, so the
+        age it carries at the moment of a recovery measures the outage rather
+        than anything that is wrong now, and reading that as a stall would
+        restart the process for having reconnected. Measuring from the recovery
+        instead is what discounts it, and doing so here rather than downstream
+        is what makes it exact: this is where the moment is known. It expires
+        by itself, because the time since the recovery grows while the outage
+        it discounts does not, so an old outage cannot shorten a later stall.
+
+        A component that is down is not measured here. Its loop is not running,
+        so of course it is not advancing; that state belongs to down_duration()
+        and the far longer tolerance chosen for it.
+
+        None means the system has not yet been fully up even once, which is a
+        legitimate waiting state - hardware can appear long after the process
+        does. Only a system that was healthy and then stopped advancing is
+        stalled.
+        """
+        if self._all_up_since is None:
+            return None
+        now = self._clock()
+        # A snapshot that has never been written has no age of its own, and the
+        # absence of one is not a reason to stop measuring: a process that
+        # cannot write HEALTH_FILE at all is one whose healthcheck will never
+        # pass again.
+        written = self._all_up_since
+        if self._last_refresh is not None and self._last_refresh > written:
+            written = self._last_refresh
+        ages = [now - written]
+        # Anything reported up has a progress stamp: mark_up is the only way to
+        # become up, and it writes one.
+        ages.extend(
+            now - service["progress"]
+            for service in self._services.values()
+            if service["up"]
+        )
+        return max(ages)
 
     def clear_file(self) -> None:
         """Remove the snapshot file. Safe to call repeatedly."""

@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import logging
 import time
 
 import pytest
@@ -149,6 +150,19 @@ class _SlowBackoff:
 
     def reset(self) -> None:
         pass
+
+
+class _ManualClock:
+    """Monotonic stand-in that only ever moves when the test moves it."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 class _StepClock:
@@ -497,3 +511,486 @@ async def test_watchdog_stays_quiet_while_components_are_up():
     assert shutdown.is_set() is False
     assert supervisor.exit_reason is None
     await _cancel(task)
+
+
+class _StallHealth:
+    """Minimal health double: answers only what the watchdog asks."""
+
+    def __init__(self, down=0.0, stall=None):
+        self.down = down
+        self.stall = stall
+        # Counts the inspections so a test can tell "the watchdog looked and
+        # held its fire" apart from "the watchdog never got as far as looking",
+        # which would otherwise satisfy the same assertions.
+        self.down_reads = 0
+        self.stall_reads = 0
+
+    def down_duration(self):
+        self.down_reads += 1
+        return self.down
+
+    def stall_duration(self):
+        self.stall_reads += 1
+        return self.stall
+
+
+# The watchdog is driven with interval=0, so every scheduling step below is one
+# or more full inspections. Fifty of them is far more cycles than the threshold
+# under test needs, and none of them costs wall time.
+_INERT_STEPS = 50
+_MIN_INSPECTIONS = 5
+
+
+async def test_watchdog_exits_when_the_snapshot_stops_being_refreshed():
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=300.0)
+    sup = Supervisor(health, shutdown)
+    await asyncio.wait_for(
+        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0),
+        timeout=_FAILSAFE,
+    )
+    assert sup.exit_reason == "stalled"
+    assert shutdown.is_set()
+
+
+async def test_watchdog_ignores_a_system_that_has_never_been_healthy():
+    # stall_duration() is None: hardware has not appeared yet. Exiting here
+    # would be the startup deadline this project removed.
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=None)
+    sup = Supervisor(health, shutdown)
+    task = asyncio.create_task(
+        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    assert not task.done()
+    assert sup.exit_reason is None
+    # It kept inspecting and kept deciding not to act, rather than never
+    # reaching the check at all.
+    assert health.stall_reads >= _MIN_INSPECTIONS
+    shutdown.set()
+    await task
+
+
+async def test_watchdog_holds_fire_below_the_stall_threshold():
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=239.0)
+    sup = Supervisor(health, shutdown)
+    task = asyncio.create_task(
+        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    assert not task.done()
+    assert sup.exit_reason is None
+    assert health.stall_reads >= _MIN_INSPECTIONS
+    shutdown.set()
+    await task
+
+
+async def test_a_component_down_past_its_threshold_is_reported_as_down():
+    """A component that is down stops the snapshot being refreshed too, so both
+    ages are large at once. The reason recorded has to be the one that names
+    what actually happened, or the logs send an operator looking for a block
+    that is not there.
+
+    This does not pin the order of the two checks: the stall check is gated on
+    nothing being reported down, so with a component down it cannot fire
+    whichever order they are in. The test below pins the order.
+    """
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=4000.0, stall=300.0)
+    sup = Supervisor(health, shutdown)
+    await asyncio.wait_for(
+        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0),
+        timeout=_FAILSAFE,
+    )
+    assert sup.exit_reason == "watchdog"
+
+
+async def test_the_down_reason_wins_when_both_criteria_are_met_at_once():
+    """The two criteria are mutually exclusive at any sane configuration, so a
+    down threshold of zero is the only way to satisfy both at the same moment
+    and make the order observable. The down reason is the more specific of the
+    two and must be the one recorded.
+    """
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=300.0)
+    sup = Supervisor(health, shutdown)
+    await asyncio.wait_for(
+        sup.watchdog_loop(threshold=0.0, interval=0.0, stall_threshold=240.0),
+        timeout=_FAILSAFE,
+    )
+    assert sup.exit_reason == "watchdog"
+
+
+async def test_a_component_that_is_down_is_not_also_reported_as_stalled():
+    """The snapshot is only written while every component is up, so anything
+    that is down stops it being refreshed as a matter of course. Treating that
+    age as a stall would put a second ceiling on a reconnecting component, one
+    fifteen times shorter than the tolerance chosen for it, and would blame a
+    block for a failure that is nothing of the kind.
+    """
+    shutdown = asyncio.Event()
+    # Well past the stall threshold, well inside the down threshold: exactly
+    # the window a long reconnection sits in.
+    health = _StallHealth(down=600.0, stall=600.0)
+    sup = Supervisor(health, shutdown)
+    task = asyncio.create_task(
+        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    assert not task.done()
+    assert sup.exit_reason is None
+    assert health.down_reads >= _MIN_INSPECTIONS
+    shutdown.set()
+    await task
+
+
+async def test_the_watchdog_exits_when_one_component_stops_advancing(tmp_path):
+    """The failure the shared snapshot cannot see, driven through the real
+    HealthState rather than a double.
+
+    The device loop stops advancing without raising, so it stays marked up and
+    nothing is reported down. The Telegram loop carries on and keeps rewriting
+    the snapshot, which is what makes the shared reading useless here: it never
+    ages, so a criterion built on it alone reports a perfectly healthy process
+    that is forwarding nothing.
+    """
+    clock = _ManualClock()
+    health = HealthState(
+        ["device", "telegram"],
+        health_file=str(tmp_path / "healthy"),
+        clock=clock,
+    )
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+
+    health.mark_up("device")
+    health.mark_up("telegram")
+    health.record_progress("device")
+    health.record_progress("telegram")
+    health.refresh_file()
+
+    async def telegram_keeps_going():
+        """One Telegram cycle per scheduling step, for as long as it takes."""
+        while not shutdown.is_set():
+            clock.advance(10.0)
+            health.record_progress("telegram")
+            health.refresh_file()
+            await asyncio.sleep(0)
+
+    driver = asyncio.create_task(telegram_keeps_going())
+    watched = asyncio.create_task(
+        supervisor.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    try:
+        await asyncio.wait_for(watched, timeout=_FAILSAFE)
+    finally:
+        shutdown.set()
+        await asyncio.gather(driver, return_exceptions=True)
+
+    assert supervisor.exit_reason == "stalled"
+    # Nothing was ever reported down, so this cannot have been the other
+    # criterion wearing the wrong name.
+    assert health.down_duration() == 0.0
+
+
+class _CountingHealth(HealthState):
+    """The real HealthState, counting the inspections the watchdog makes."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stall_reads = 0
+
+    def stall_duration(self):
+        self.stall_reads += 1
+        return super().stall_duration()
+
+
+class _LogCapture:
+    """Collect the supervisor's log records without printing them."""
+
+    def __init__(self):
+        from module import supervisor as supervisor_module
+
+        self._logger = supervisor_module.logger
+        self._handler = logging.Handler()
+        self.records = []
+        self._handler.emit = self.records.append
+        self._level = self._logger.level
+
+    def __enter__(self):
+        self._logger.setLevel(logging.DEBUG)
+        self._logger.addHandler(self._handler)
+        return self
+
+    def __exit__(self, *exc_info):
+        self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._level)
+        return False
+
+    @property
+    def text(self):
+        return " ".join(record.getMessage() for record in self.records)
+
+
+_OUTAGE = 600.0
+
+
+def _recovered_health(tmp_path):
+    """A real HealthState that has just come back from a ten-minute outage.
+
+    Nothing refreshed the snapshot while the device was down, because it is not
+    written at all in that state, so the file's age at this moment is the whole
+    outage. The Telegram loop ran throughout.
+    """
+    clock = _ManualClock()
+    health = _CountingHealth(
+        ["device", "telegram"],
+        health_file=str(tmp_path / "healthy"),
+        clock=clock,
+    )
+    for name in ("device", "telegram"):
+        health.mark_up(name)
+        health.record_progress(name)
+    health.refresh_file()
+
+    health.mark_down("device")
+    clock.advance(_OUTAGE)
+    health.record_progress("telegram")
+    health.mark_up("device")
+    return health, clock
+
+
+async def test_a_recovery_does_not_read_as_a_stall(tmp_path):
+    """The age an outage leaves on the snapshot must not be read as a stall the
+    moment the component comes back, or the process is restarted for having
+    reconnected. Driven through the real HealthState, which is where the moment
+    of the recovery is known: an inspection here can only sample it.
+    """
+    health, clock = _recovered_health(tmp_path)
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+
+    task = asyncio.create_task(
+        supervisor.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    for _ in range(_INERT_STEPS):
+        clock.advance(1.0)  # Well inside the threshold, and genuinely elapsing.
+        await asyncio.sleep(0)
+
+    assert not task.done()
+    assert supervisor.exit_reason is None
+    # It kept inspecting the recovered state rather than never looking at it.
+    assert health.stall_reads >= _MIN_INSPECTIONS
+    shutdown.set()
+    await task
+
+
+async def test_a_stall_beginning_after_a_recovery_is_still_caught(tmp_path):
+    """Discounting the outage delays detection to one threshold past the
+    recovery. It must not disable it: a component that comes back and then
+    stops advancing is exactly the failure this criterion is for."""
+    health, clock = _recovered_health(tmp_path)
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+
+    async def time_passes():
+        """Nothing advances and nothing is written; only the clock moves."""
+        while not shutdown.is_set():
+            clock.advance(10.0)
+            await asyncio.sleep(0)
+
+    driver = asyncio.create_task(time_passes())
+    watched = asyncio.create_task(
+        supervisor.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    try:
+        await asyncio.wait_for(watched, timeout=_FAILSAFE)
+    finally:
+        shutdown.set()
+        await asyncio.gather(driver, return_exceptions=True)
+
+    assert supervisor.exit_reason == "stalled"
+
+
+async def test_the_stall_line_names_the_figure_it_tripped_on(tmp_path):
+    """The number printed beside the threshold has to be the number the
+    threshold was compared against. An age carrying an outage that was
+    discounted cannot be reconciled with the threshold beside it: it reads as a
+    240s threshold that somehow took 900s to fire, and sends whoever is
+    debugging it looking for a block that lasted that long.
+    """
+    health, clock = _recovered_health(tmp_path)
+    clock.advance(300.0)
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+
+    with _LogCapture() as log:
+        await asyncio.wait_for(
+            supervisor.watchdog_loop(
+                threshold=3600.0, interval=0.0, stall_threshold=240.0
+            ),
+            timeout=_FAILSAFE,
+        )
+
+    assert supervisor.exit_reason == "stalled"
+    assert "300s" in log.text
+    assert "240s" in log.text
+    assert f"{_OUTAGE + 300.0:.0f}s" not in log.text
+
+
+def _legitimate_refresh_gap(cfg) -> float:
+    """The longest gap the heartbeat can leave between two refreshes.
+
+    Counted as the rounds it is made of, rather than as the closed form the
+    configuration uses, so that the two have to agree about the loop rather
+    than merely about each other.
+
+    Only a round whose liveness probe went unanswered skips the refresh, and
+    it costs the interval before it plus the single deadline it spent waiting.
+    MODEM_PROBE_FAILURES - 1 of them can pass before the next gives up and
+    raises. The round that does refresh costs an interval and two deadlines,
+    because an answered liveness probe is followed by the registration probe,
+    which waits the same deadline for its own answer. That holds whether or not
+    MODEM_REGISTRATION_CHECK is on: the round that asks one question is the
+    shorter of the two, and a threshold has to clear the longer one. Until the
+    count runs out the component is working and simply has not refreshed the
+    snapshot.
+    """
+    missed = max(0, cfg.MODEM_PROBE_FAILURES - 1) * (
+        cfg.MODEM_PROBE_INTERVAL + cfg.MODEM_PROBE_TIMEOUT
+    )
+    refreshing = cfg.MODEM_PROBE_INTERVAL + 2 * cfg.MODEM_PROBE_TIMEOUT
+    return missed + refreshing
+
+
+def test_the_refresh_budget_is_the_worst_gap_the_heartbeat_can_leave():
+    """Every floor below is measured against this figure, so it has to be the
+    gap the loop can actually produce. Understating it - by counting one
+    deadline for the round that asks two questions, or by leaving the probe's
+    own write and lock outside any deadline at all, which is what made the gap
+    unbounded before - puts the watchdog's threshold under the time a working
+    component legitimately spends not refreshing the snapshot.
+    """
+    assert config.WATCHDOG_REFRESH_BUDGET == _legitimate_refresh_gap(config)
+
+
+def test_watchdog_stall_threshold_clears_the_probes_own_retry_budget(monkeypatch):
+    """The threshold is operator-settable, and any value inside that budget
+    restarts a process that is only riding out a slow modem."""
+    monkeypatch.setenv("WATCHDOG_STALL_SECONDS", "0")
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.WATCHDOG_STALL_SECONDS >= 2 * _legitimate_refresh_gap(reloaded)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+
+def test_the_stall_floor_still_clears_the_budget_at_the_shortest_window(monkeypatch):
+    """The floor has to be derived from the same settings the budget is, not
+    from the refresh interval alone. At the shortest configurable staleness
+    window the probe interval is clamped down but the reply deadline is not,
+    so a floor scaled off the interval alone lands under the budget and the
+    watchdog restarts a working process.
+    """
+    monkeypatch.setenv("HEALTH_STALE_SECONDS", "2")
+    monkeypatch.setenv("WATCHDOG_STALL_SECONDS", "0")
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.WATCHDOG_STALL_SECONDS >= 2 * _legitimate_refresh_gap(reloaded)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+
+def _legitimate_telegram_gap(cfg) -> float:
+    """The longest gap the polling loop can leave between two progress reports.
+
+    Counted as the calls it is made of rather than as the closed form the
+    configuration uses, so the two have to agree about the loop rather than
+    merely about each other.
+
+    The loop reports when a poll returns and after each update it handles, so
+    one gap holds at most one poll or the handling of one update. A poll costs
+    a request deadline. Handling an update costs whatever its slowest handler
+    does, and the slowest sends a message: one attempt per allowed try, each
+    behind the same deadline, with a wait between them. The two are added
+    because answering a button press and then replying to it does both.
+    """
+    poll = cfg.TELEGRAM_REQUEST_TIMEOUT
+    send = cfg.TELEGRAM_SEND_ATTEMPTS * cfg.TELEGRAM_REQUEST_TIMEOUT + max(
+        0, cfg.TELEGRAM_SEND_ATTEMPTS - 1
+    ) * cfg.TELEGRAM_SEND_RETRY_DELAY
+    return poll + send
+
+
+def test_the_telegram_budget_is_the_worst_gap_the_polling_loop_can_leave():
+    """The floor below is measured against this figure, so it has to be the gap
+    the loop can actually produce. Understating it - by counting the poll alone
+    and forgetting that one update can be retried behind three deadlines - puts
+    the stall threshold under the time a working component legitimately spends
+    between two reports."""
+    assert config.TELEGRAM_PROGRESS_BUDGET == _legitimate_telegram_gap(config)
+
+
+def test_the_stall_floor_clears_one_telegram_polling_iteration():
+    """Now that each loop is measured on its own, the Telegram loop's own pace
+    is load-bearing. It was not before: the device heartbeat rewrote the shared
+    snapshot every half-minute whatever Telegram was doing, so a long poll never
+    showed up in the reading. A threshold under one working iteration would
+    restart the process for polling.
+
+    Strictly greater, not merely at least. Two real handlers reach the budget
+    exactly - answering a button press and then replying to it - and the
+    watchdog compares with >=, so a threshold equal to the budget makes the
+    worst legitimate gap a tripping gap.
+    """
+    assert config.WATCHDOG_STALL_SECONDS > config.TELEGRAM_PROGRESS_BUDGET
+
+
+def test_the_stall_floor_clears_telegram_at_the_shortest_window(monkeypatch):
+    """The floor's other terms are derived from the modem probe settings, which
+    are clamped down by the staleness window. The Telegram loop is not clamped
+    by anything, so at the shortest window a floor built from the probe alone
+    lands under a single long poll."""
+    monkeypatch.setenv("HEALTH_STALE_SECONDS", "2")
+    monkeypatch.setenv("WATCHDOG_STALL_SECONDS", "0")
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.WATCHDOG_STALL_SECONDS > reloaded.TELEGRAM_PROGRESS_BUDGET
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+
+def test_watchdog_stall_threshold_has_a_ceiling(monkeypatch):
+    """A stall is a component lost without saying so. It must not go unnoticed
+    for longer than the operator's stated tolerance for one that says so,
+    which is what WATCHDOG_DOWN_SECONDS is.
+    """
+    monkeypatch.setenv("HEALTH_STALE_SECONDS", "10000")
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.WATCHDOG_STALL_SECONDS <= reloaded.WATCHDOG_DOWN_SECONDS
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+
+def test_the_stall_floor_outranks_the_ceiling(monkeypatch):
+    """The two bounds can conflict, and which one gives has to be the safe one.
+    Holding the threshold above the probe budget costs a slower restart;
+    cutting it below restarts a process that is working.
+    """
+    monkeypatch.setenv("WATCHDOG_DOWN_SECONDS", "1")
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.WATCHDOG_STALL_SECONDS >= 2 * _legitimate_refresh_gap(reloaded)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)

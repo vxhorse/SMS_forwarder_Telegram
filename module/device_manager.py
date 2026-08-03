@@ -104,6 +104,129 @@ def _mask_number(number: Any) -> str:
     return f"…{text[-_NUMBER_SUFFIX_LENGTH:]}"
 
 
+# What the modem reports about its network registration, and which of those
+# reports mean a message can arrive.
+#
+# 1 and 5 are registered outright, at home and while roaming. 6 and 7 are the
+# same two cases limited to messages alone - a network that granted the module
+# an association for messaging without the rest - which for a service that
+# carries nothing but messages is as attached as it needs to be, so counting
+# them as failures would cycle the radio for ever on a network that attaches
+# this way. They are not in every module's table, since 3GPP TS 27.007 added
+# them later than the rest, and accepting a value a module never emits costs
+# nothing.
+#
+# Everything else means nothing can arrive: 0 not registered, 2 still
+# searching, 3 refused by the network, 4 a state the module cannot describe,
+# and 8 attached for emergency bearer services alone - on a network, and
+# reachable by no ordinary message, which is exactly the condition this check
+# exists to report.
+#
+# Known limitation, for whoever needs the check to be right on a network it is
+# currently wrong about. +CREG describes the circuit-switched domain only. A
+# module attached for packet service alone, delivering messages over a path
+# that domain does not describe, reports one of the unregistered states here
+# while every message arrives - and on firmware predating the addition of 6
+# and 7 there is no state that expresses it either, so those two do not cover
+# the case. The complete answer is to ask +CGREG and +CEREG as well, on the
+# failing path only, and to count a miss only when every domain agrees. Two
+# things make that more than a copy of this code: process_message routes
+# +CREG: alone, so those replies currently fall through to the unhandled
+# branch and never reach a parser; and 27.007 allows their <n> to range up to
+# 5, which destroys the rule _registration_state_index relies on - that a
+# leading value above 2 cannot be an <n> - so they need a shape rule of their
+# own rather than this one. Until then this is a question that can be wrong on
+# a whole class of network, which is why MODEM_REGISTRATION_CHECK ships off and
+# is enabled once the state read on a given SIM is known to be a true one.
+_REGISTERED_STATES = frozenset({1, 5, 6, 7})
+
+# No description carries a comma. They are interpolated into lines that
+# separate their own fields with one, and a state that arrived with a comma
+# inside it would read as two fields and turn the count beside it into a third.
+_REGISTRATION_DESCRIPTIONS = {
+    0: "not registered",
+    1: "registered on the home network",
+    2: "not registered - searching",
+    3: "registration denied",
+    4: "unknown",
+    5: "registered while roaming",
+    6: "registered for messages only on the home network",
+    7: "registered for messages only while roaming",
+    8: "attached for emergency bearer services only",
+}
+
+# The values <n> can take: whether the modem reports registration changes by
+# itself, and whether those reports carry location information.
+_REGISTRATION_URC_MODES = frozenset({0, 1, 2})
+
+# The radio technology a registration line may name, for the log only.
+_ACCESS_TECHNOLOGIES = {
+    0: "GSM",
+    2: "UTRAN",
+    3: "GSM w/EGPRS",
+    4: "UTRAN w/HSDPA",
+    5: "UTRAN w/HSUPA",
+    6: "UTRAN w/HSDPA and HSUPA",
+    7: "E-UTRAN",
+    8: "UTRAN HSPA+",
+}
+
+
+def _as_int(field: str) -> Optional[int]:
+    """Read one comma-separated field as an integer, or None if it is not one."""
+    try:
+        return int(field)
+    except (TypeError, ValueError):
+        return None
+
+
+def _registration_state_index(fields: list) -> int:
+    """Which field of a +CREG line holds the registration state.
+
+    Two shapes arrive here and they differ by exactly one leading field. The
+    AT command set gives the answer to AT+CREG? as
+
+        +CREG: <n>,<stat>[,<lac>,<ci>[,<AcT>]]
+
+    and the report a modem sends by itself as
+
+        +CREG: <stat>[,<lac>,<ci>[,<AcT>]]
+
+    Both reach this code, because setup asks for the reports and the heartbeat
+    asks the question, and nothing in the line says which one it is. Reading
+    the second field whenever there is one therefore takes a registered
+    modem's location area for its registration state, and every cell whose
+    area does not happen to number 1 or 5 would read as a modem that is not on
+    the network - restarting a session that was working, over and over.
+
+    Two further rules from the same specification settle it without guessing:
+
+    - <n> is one of 0, 1 and 2, so a line leading with anything else is a
+      report;
+    - location information accompanies the state only when the modem is
+      registered and <n> is 2, so a report that is not registered is a single
+      field, and a report that leads with 1 and carries location cannot be a
+      reply - a reply whose <n> is 1 has no location to carry.
+
+    A second field that is not a number is location data as well, since a
+    location area is a string. That leaves the two-field form as the only one
+    a reply can take.
+    """
+    first = _as_int(fields[0]) if fields else None
+    if first is None or first not in _REGISTRATION_URC_MODES or len(fields) < 2:
+        return 0
+    if first == 1 and len(fields) > 2:
+        return 0
+    return 1 if _as_int(fields[1]) is not None else 0
+
+
+def _describe_registration(state: Optional[int]) -> str:
+    """Name a registration state for the log, including the absence of one."""
+    if state is None:
+        return "no reading"
+    return _REGISTRATION_DESCRIPTIONS.get(state, f"unrecognised state {state}")
+
+
 class ForwardOutcome(Enum):
     """What became of one PDU handed to _forward_pdu.
 
@@ -322,6 +445,18 @@ class DeviceManager:
         # Set whenever a +CSQ reply arrives, which is what proves the modem is
         # still answering rather than merely still connected.
         self._probe_event = asyncio.Event()
+        self.registration_check = config.MODEM_REGISTRATION_CHECK
+        self.registration_failures = config.MODEM_REGISTRATION_FAILURES
+        # Consecutive probes that found the modem off the network.
+        self.registration_misses = 0
+        # What the modem last said about being on the network, or None if the
+        # current probe has not been answered readably. Cleared before each
+        # probe so a reading can never outlive the round it was taken in.
+        self._registration_state: Optional[int] = None
+        # Set whenever a readable registration state arrives, from the reply
+        # to the heartbeat's question or from a report the modem sent by
+        # itself. Both answer the same question, so both end the wait.
+        self._registration_event = asyncio.Event()
         # One AT transaction on the port at a time. The heartbeat and the
         # sending path are independent writers, and AT+CMGS puts the modem into
         # a prompt where every byte written becomes part of the outgoing
@@ -346,6 +481,15 @@ class DeviceManager:
         try:
             self.writer.write(f"{command}\r\n".encode())
             await self.writer.drain()
+        except asyncio.CancelledError:
+            # Stated rather than left to the type hierarchy. A probe is
+            # bounded by cancelling it, so a cancellation arriving in the drain
+            # has to leave through here; swallowed, it would turn that bound
+            # back into the unbounded write it exists to prevent. It escapes
+            # the handler below only because CancelledError derives from
+            # BaseException, which is a distinction one word wide and one that
+            # a later edit could widen away without anything looking wrong.
+            raise
         except Exception as e:
             logger.warning(f"Could not write to the serial port: {e}")
         else:
@@ -527,11 +671,80 @@ class DeviceManager:
             # that never reached the port.
             return
         try:
+            # Deliberately outside the deadline below: this only asks the
+            # transport to close and returns at once. What can take forever is
+            # waiting for it to finish, because it finishes only once its write
+            # buffer has drained and a port under asserted flow control never
+            # drains one. Nothing raises there - the bytes are queued, not
+            # rejected - so the guard around this block cannot help, and the
+            # detection that ended the session is itself what leaves bytes in
+            # that buffer. Aborting discards them and forces the close through,
+            # which is the only way to give the port back. self.writer is
+            # already None by here, so abandoning a writer that will not close
+            # leaves nothing inconsistent behind.
             writer.close()
-            await writer.wait_closed()
+            await asyncio.wait_for(
+                writer.wait_closed(), timeout=config.SERIAL_CLOSE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Serial port did not close within {config.SERIAL_CLOSE_TIMEOUT:.0f}s; "
+                f"discarding what is still queued for it and forcing the close"
+            )
+            self._abort_transport(writer)
         except Exception as exc:
             logger.warning(f"Error closing serial writer: {exc}")
         await self._notify("⚠️ Modem disconnected, reconnecting")
+
+    @staticmethod
+    def _abort_transport(writer) -> None:
+        """Force a transport closed, discarding anything it has not written.
+
+        The escalation for a close that cannot complete, and never the ordinary
+        path: what it discards is real data that a working port would have sent.
+
+        Two buffers have to go, and only one of them is the transport's.
+        Aborting drops that one and schedules the remainder of the close, but
+        the remainder begins by flushing the port - and a flush waits for the
+        kernel's own output queue to empty, which is the queue that stopped
+        moving and the reason the close had to be forced at all. That wait
+        belongs to no task: it blocks whichever thread reaches it, and the
+        thread that reaches it is the event loop, which would take the
+        watchdog, the reconnect and the signal handler down with it. A process
+        that can no longer decide to exit is one no restart policy outside it
+        will act on either.
+
+        So the kernel queue is discarded first, which returns at once and
+        leaves the flush nothing to wait for.
+        """
+        transport = getattr(writer, "transport", None)
+        abort = getattr(transport, "abort", None)
+        if abort is None:
+            logger.warning(
+                "Serial transport offers no way to abort; the port may stay held"
+            )
+            return
+
+        discard = getattr(
+            getattr(transport, "serial", None), "reset_output_buffer", None
+        )
+        if discard is None:
+            # Still worth aborting: what is left is a close that may wait,
+            # against a port that is certainly never given back otherwise.
+            logger.warning(
+                "Serial port offers no way to discard its output queue; the "
+                "close may still have to wait for it"
+            )
+        else:
+            try:
+                discard()
+            except Exception as exc:
+                logger.warning(f"Could not discard the serial output queue: {exc}")
+
+        try:
+            abort()
+        except Exception as exc:
+            logger.warning(f"Could not abort the serial transport: {exc}")
 
     async def _notify(self, text: str) -> None:
         """Report outward. A dead channel must not affect the device path."""
@@ -553,16 +766,30 @@ class DeviceManager:
         AT+CSQ is used rather than a bare AT because its reply prefix is
         distinctive and cannot be confused with the OK produced by the message
         sending path; the signal strength it returns is useful diagnostically.
+
+        Answering is only half of what has to be true, so where the
+        registration check is enabled each answered probe is followed by
+        _probe_registration. A modem that has been detached from the network
+        answers every command exactly as it did before while not one message
+        can reach it - the same silent failure as a wedged modem, arrived at by
+        a different route, and invisible to a probe that asks only whether the
+        modem is still talking. That second question is off by default because
+        it cannot be answered truthfully on every network; see
+        MODEM_REGISTRATION_CHECK in config.py for when to switch it on.
+
+        Both questions are asked through _probe_once, which bounds the whole
+        transaction rather than the reply alone. Nothing this loop does can
+        block without eventually raising, which is what makes a missed
+        heartbeat something the supervisor hears about.
         """
         failures = 0
+        # Reset with the loop, not with the object: this runs once per
+        # session, and readings taken through a connection that has since been
+        # torn down say nothing about the one that replaced it.
+        self.registration_misses = 0
         while True:
             await self._sleep(self.probe_interval)
-            self._probe_event.clear()
-            async with self._at_lock:
-                await self.send_at_command_async("AT+CSQ")
-            try:
-                await asyncio.wait_for(self._probe_event.wait(), timeout=self.probe_timeout)
-            except asyncio.TimeoutError:
+            if not await self._probe_once("AT+CSQ", self._probe_event):
                 failures += 1
                 logger.warning(f"Modem heartbeat missed ({failures} in a row)")
                 if failures >= self.probe_failures:
@@ -572,12 +799,151 @@ class DeviceManager:
             # A single answer clears the count: an occasional miss on a busy
             # modem is normal, only a run of them means it has gone quiet.
             failures = 0
+
+            if self.registration_check:
+                await self._probe_registration()
+
             if self.health is not None:
+                # Two reports, and they are not interchangeable. The first says
+                # this loop reached the end of a round, which is the only
+                # statement about this component that can be attributed to it -
+                # the second is written by whichever loop gets there first and
+                # so vouches for both. Neither is mark_up(): see
+                # Supervisor._serve_session for why that decision cannot be
+                # made from inside a component's own loop.
+                self.health.record_progress(self.name)
                 # Keep the snapshot file fresh so the container healthcheck can
-                # tell a live process from a wedged one. Refreshing only, never
-                # mark_up(): see Supervisor._serve_session for why that decision
-                # cannot be made from inside a component's own loop.
+                # tell a live process from a wedged one.
                 self.health.refresh_file()
+
+    async def _probe_once(self, command: str, answered: asyncio.Event) -> bool:
+        """Ask the modem one question and say whether it answered in time.
+
+        The deadline covers taking the port and writing as well as waiting for
+        the reply, and that is the whole point of the method existing. Timing
+        the reply alone leaves the two steps most likely to be stuck outside
+        any bound at all:
+
+        - the write. Serial flow control is implemented by blocking the drain,
+          so a modem that has stopped accepting bytes - asserted flow control,
+          firmware wedged but still powered - suspends the write for ever. It
+          raises nothing, because there is nothing to raise: the port is open
+          and the bytes are merely queued.
+        - taking the port. The sending path holds the AT lock across both of
+          its writes, since everything between AT+CMGS and the terminating
+          Ctrl+Z is taken by the modem as message data. A send whose write is
+          stuck therefore holds the lock indefinitely, and a probe waiting for
+          that lock is waiting on the same block one step removed.
+
+        Either one hangs the probe built to notice a silent modem, and a probe
+        that hangs raises nothing, refreshes nothing, and reports nothing: the
+        component stays "up" while forwarding nothing at all. Bounding the
+        whole transaction turns both into an ordinary missed heartbeat, which
+        the caller already knows how to count.
+
+        :param command: the AT command to ask
+        :param answered: the event set when the matching reply is routed
+        :return: whether the reply arrived within probe_timeout
+        """
+        # Cleared before the question is asked, so what the wait observes is a
+        # reply to this round rather than one left set by the last.
+        answered.clear()
+        try:
+            await asyncio.wait_for(
+                self._ask_modem(command, answered), timeout=self.probe_timeout
+            )
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def _ask_modem(self, command: str, answered: asyncio.Event) -> None:
+        """Take the port, write one command, and wait for the answer.
+
+        Split from _probe_once only so the deadline can be wrapped around the
+        whole of it. Nothing here is left behind when that deadline cancels it:
+
+        - the lock is released by the `async with` on the way out, because
+          cancellation arrives as CancelledError, which derives from
+          BaseException and so is not swallowed by the `except Exception` in
+          send_at_command_async;
+        - a probe cancelled while still queueing for the lock never held it,
+          and asyncio.Lock unwinds its own waiter, including the case where
+          the lock was handed over in the same tick as the cancellation;
+        - the command cannot be cut in half. The write hands the whole line to
+          the transport before the only await in it, so what a cancelled probe
+          leaves behind is a complete command that has not been flushed yet,
+          never a truncated one. It reaches the modem late, in the order it
+          was queued, so it cannot land inside a later send's transaction
+          either. Its reply is discarded by the next probe's clear if it
+          arrives before the next question, and credited to that round if it
+          arrives after - late, but still this modem answering this question,
+          so neither round is credited with a reading nothing produced.
+
+        The reply is deliberately awaited outside the lock. Holding the port
+        for the whole deadline would put every send behind every probe, and
+        the reply is routed by the read loop, which needs no lock of its own.
+        """
+        async with self._at_lock:
+            await self.send_at_command_async(command)
+        await answered.wait()
+
+    async def _probe_registration(self) -> None:
+        """Ask whether the modem is on a network, and act on a run of noes.
+
+        Raises once registration_failures consecutive probes have failed to
+        find it there, which ends the session and hands the decision to the
+        supervisor - the same shape, and the same reasoning, as the liveness
+        count in the caller.
+
+        Every state that is not registered is counted alike, including the one
+        the network refused. There is exactly one remedy available from here,
+        and reaching for it sooner because a refusal looks permanent would only
+        reinitialise the radio more often without making it likelier to be
+        accepted; a refusal during an attach that the next attempt completes is
+        ordinary. What distinguishes a passing condition from a lasting one is
+        that it passes, which is what the count measures. Which state it was is
+        named in the warning, so a refusal can still be told from a search by
+        whoever reads it.
+        """
+        # The state is discarded before the question is asked, so what the wait
+        # leaves behind is a reading taken in this round or nothing at all.
+        # Carrying the previous round's reading forward would let one report of
+        # being registered stand in for every probe after it, which is exactly
+        # the silence this is looking for.
+        self._registration_state = None
+        # Bounded exactly as the liveness probe is, and for the same reasons:
+        # this question is written to the same port under the same lock, so a
+        # bound on the first probe alone would leave the loop hanging one step
+        # further along. See _probe_once.
+        if not await self._probe_once("AT+CREG?", self._registration_event):
+            # No reading, which is not the same as a reading that says the
+            # modem is registered, and must not be counted as one. What was
+            # published goes with it: the snapshot is read from outside this
+            # process precisely while the count is climbing, and a stale
+            # reading left in it would describe a modem as on the network for
+            # the whole time this loop spends giving up on one that went quiet.
+            if self.health is not None:
+                self.health.record_registration(None)
+
+        if self._registration_state in _REGISTERED_STATES:
+            # Registration dips while a modem hands over between cells and
+            # comes back by itself, so one reading clears the count for the
+            # same reason a single answered probe clears the other.
+            self.registration_misses = 0
+            return
+
+        self.registration_misses += 1
+        # The count and the state are divided by something neither of them can
+        # contain, so the line cannot be read as three things.
+        logger.warning(
+            f"Modem is not on the network ({self.registration_misses} in a row): "
+            f"{_describe_registration(self._registration_state)}"
+        )
+        if self.registration_misses >= self.registration_failures:
+            raise RuntimeError(
+                f"Modem was not registered on the network for "
+                f"{self.registration_misses} consecutive checks"
+            )
 
     async def setup_sms(self) -> None:
         """Run the initialisation sequence, waiting for each response.
@@ -758,44 +1124,9 @@ class DeviceManager:
             # destroys one received message.
             await self.handle_incoming_sms_pdu(message)
         elif message.startswith(b'+CREG:'):
-            # Decoded outside the try so the failure path below can always
-            # name the line it could not parse.
-            creg_msg = message.decode('utf-8', errors='replace')
-            try:
-                parts = creg_msg.replace('+CREG:', '').strip().split(',')
-
-                status = parts[0].strip()
-                lac = parts[1].strip(' "') if len(parts) > 1 else "Unknown"
-                ci = parts[2].strip(' "') if len(parts) > 2 else "Unknown"
-                act = parts[3].strip() if len(parts) > 3 else "Unknown"
-
-                status_desc = {
-                    "0": "not registered",
-                    "1": "registered, home network",
-                    "2": "not registered, searching",
-                    "3": "registration denied",
-                    "4": "unknown",
-                    "5": "registered, roaming",
-                }.get(status, "unknown state")
-
-                act_desc = {
-                    "0": "GSM",
-                    "2": "UTRAN",
-                    "3": "GSM w/EGPRS",
-                    "4": "UTRAN w/HSDPA",
-                    "5": "UTRAN w/HSUPA",
-                    "6": "UTRAN w/HSDPA and HSUPA",
-                    "7": "E-UTRAN",
-                }.get(act, "Unknown")
-
-                logger.debug(
-                    f"Network registration: {status_desc}, "
-                    f"area {lac}, cell {ci}, access technology {act_desc}"
-                )
-            except Exception as e:
-                # A +CREG line reports registration state only; it has no
-                # message payload, so quoting it back is safe and useful.
-                logger.debug(f"Could not parse a CREG line: {e}, line: {creg_msg!r}")
+            # Registration reports arrive unasked as well as in answer to the
+            # heartbeat's question, and both say the same thing.
+            self._handle_creg(message)
         else:
             logger.warning(f"Unhandled serial line: {_describe_line(message)}")
 
@@ -812,6 +1143,44 @@ class DeviceManager:
         # Set regardless of whether the value parsed: the probe asks whether
         # the modem answers, not what it answered.
         self._probe_event.set()
+
+    def _handle_creg(self, message: bytes) -> None:
+        """Record what one +CREG line says about being on the network.
+
+        A line that cannot be read is logged and otherwise ignored, and in
+        particular it does not end the heartbeat's wait. That is the opposite
+        of what a malformed +CSQ does, deliberately: the liveness probe asks
+        only whether the modem answered, while this one asks what it answered,
+        and an answer nothing can read is not one. Waiting on instead gives
+        the reply that can be read the rest of the deadline to arrive.
+        """
+        # A +CREG line carries registration state and location only - never
+        # any part of a message - so it can be quoted in full, which is what
+        # makes an unfamiliar shape diagnosable.
+        text = message.decode('utf-8', errors='replace')
+        fields = [field.strip() for field in text.split(':', 1)[-1].split(',')]
+
+        index = _registration_state_index(fields)
+        state = _as_int(fields[index])
+        if state is None:
+            logger.debug(f"Could not read a registration state from {text!r}")
+            return
+
+        location = fields[index + 1:]
+        area = location[0].strip('"') if location else "unknown"
+        cell = location[1].strip('"') if len(location) > 1 else "unknown"
+        technology = _ACCESS_TECHNOLOGIES.get(
+            _as_int(location[2]) if len(location) > 2 else None, "unknown"
+        )
+        logger.debug(
+            f"Network registration: {_describe_registration(state)}, "
+            f"area {area}, cell {cell}, access technology {technology}"
+        )
+
+        self._registration_state = state
+        if self.health is not None:
+            self.health.record_registration(state)
+        self._registration_event.set()
 
     async def handle_incoming_sms_header(self, bytes_message: bytes) -> None:
         """
