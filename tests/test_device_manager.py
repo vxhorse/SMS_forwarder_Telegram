@@ -2404,13 +2404,29 @@ def test_the_write_cannot_start_swallowing_cancellations():
         if isinstance(node, ast.AsyncFunctionDef)
         and node.name == "send_at_command_async"
     )
-    handlers = [
-        handler
+    # Anchored to the try that guards the drain, not to whichever try comes
+    # first in the method. Taking the first would let a second, unrelated try
+    # satisfy this while the drain's own handler went on swallowing the
+    # cancellation - the guard would pass on exactly the code it exists to
+    # reject. Only the body is searched, so a handler mentioning drain cannot
+    # nominate its own try.
+    guarded = [
+        node
         for node in ast.walk(method)
         if isinstance(node, ast.Try)
-        for handler in node.handlers
+        and any(
+            isinstance(inner, ast.Call)
+            and (_dotted_name(inner.func) or "").endswith(".drain")
+            for statement in node.body
+            for inner in ast.walk(statement)
+        )
     ]
 
+    assert len(guarded) == 1, (
+        "the drain is not guarded by exactly one try, so which handlers "
+        "protect it can no longer be read off"
+    )
+    handlers = guarded[0].handlers
     assert handlers, "the write around which this property exists is gone"
     first = handlers[0]
     assert _dotted_name(first.type) in ("asyncio.CancelledError", "CancelledError"), (
