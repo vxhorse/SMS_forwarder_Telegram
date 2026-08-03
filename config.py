@@ -4,7 +4,8 @@ import os
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # SMS模块配置
-SMS_PORT = os.getenv("SMS_PORT", "/dev/ttyUSB2")
+# Leave empty to auto-discover the modem's AT port.
+SMS_PORT = os.getenv("SMS_PORT", "").strip()
 SMS_BAUDRATE = int(os.getenv("SMS_BAUDRATE", "115200"))
 
 # Telegram 机器人配置
@@ -30,3 +31,9 @@ SERVICE_STABLE_SECONDS = float(os.getenv("SERVICE_STABLE_SECONDS", "60.0"))
 # How often the watchdog inspects component health, in seconds. Floored because
 # a value of zero would turn the watchdog into a busy loop.
 WATCHDOG_CHECK_INTERVAL = max(1.0, float(os.getenv("WATCHDOG_CHECK_INTERVAL", "30.0")))
+
+# Root of the device tree to scan. Inside a container this points at the
+# bind-mounted host /dev; running directly on a host it is just /dev.
+SMS_DEV_ROOT = os.getenv("SMS_DEV_ROOT", "/dev")
+# How long a candidate port has to answer AT during discovery, in seconds.
+PORT_PROBE_TIMEOUT = float(os.getenv("PORT_PROBE_TIMEOUT", "3.0"))
