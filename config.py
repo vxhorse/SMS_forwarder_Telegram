@@ -45,6 +45,18 @@ AT_SLOW_COMMAND_TIMEOUT = float(os.getenv("AT_SLOW_COMMAND_TIMEOUT", "10.0"))
 
 # Modem liveness probe (AT+CSQ): interval, response deadline, and how many
 # consecutive misses trigger a reconnect.
-MODEM_PROBE_INTERVAL = float(os.getenv("MODEM_PROBE_INTERVAL", "30.0"))
+#
+# The probe is also the only thing that refreshes the health snapshot file, so
+# its interval has to stay well inside HEALTH_STALE_SECONDS: a longer one would
+# leave the container healthcheck reading a stale file and failing a process
+# that is working perfectly. Clamped to half that window so a single missed
+# probe is not enough to trip it, and floored so a value of zero cannot turn
+# the probe into a busy loop.
+MODEM_PROBE_INTERVAL = max(1.0, min(
+    float(os.getenv("MODEM_PROBE_INTERVAL", "30.0")),
+    HEALTH_STALE_SECONDS / 2,
+))
+# Also governs the AT handshake performed right after the port opens: both ask
+# the same question, which is how long the modem gets to answer a probe.
 MODEM_PROBE_TIMEOUT = float(os.getenv("MODEM_PROBE_TIMEOUT", "5.0"))
 MODEM_PROBE_FAILURES = int(os.getenv("MODEM_PROBE_FAILURES", "3"))

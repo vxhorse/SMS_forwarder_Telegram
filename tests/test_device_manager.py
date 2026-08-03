@@ -575,6 +575,28 @@ async def test_probe_settings_come_from_config():
     assert manager.probe_failures == config.MODEM_PROBE_FAILURES
 
 
+async def test_the_probe_interval_cannot_outrun_the_health_staleness_window(monkeypatch):
+    """The probe is the only thing that refreshes the health snapshot, so an
+    interval longer than the staleness window would fail the container
+    healthcheck on a process that is working perfectly."""
+    import importlib
+
+    original = config.MODEM_PROBE_INTERVAL
+    monkeypatch.setenv("MODEM_PROBE_INTERVAL", "600")
+    try:
+        importlib.reload(config)
+        assert config.MODEM_PROBE_INTERVAL <= config.HEALTH_STALE_SECONDS / 2
+
+        monkeypatch.setenv("MODEM_PROBE_INTERVAL", "0")
+        importlib.reload(config)
+        assert config.MODEM_PROBE_INTERVAL >= 1.0
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    assert config.MODEM_PROBE_INTERVAL == original
+
+
 async def test_csq_updates_health_and_signal_strength():
     health = HealthState(["device", "telegram"])
     manager = DeviceManager(_noop_callback, health=health, port="/hostdev/ttyUSB2")
@@ -695,6 +717,91 @@ async def test_run_parks_while_the_modem_keeps_answering():
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+async def test_read_loop_reports_a_closed_stream_instead_of_spinning():
+    """A stream at end of file returns empty immediately and, crucially,
+    without awaiting anything. Treating that as "nothing arrived" leaves the
+    loop with no suspension point, so it never gives the event loop back: the
+    heartbeat stops, the supervisor never sees this body finish, and the
+    shutdown signal is never observed. It must be reported as a lost device.
+
+    Note for anyone changing the guard: without it this test does not fail, it
+    hangs, and no timeout written inside the test can rescue it -- a timeout
+    callback needs the event loop, which is precisely what is being starved.
+    """
+    class CountingClosedReader(ClosedReader):
+        def __init__(self):
+            self.calls = 0
+
+        async def readline(self):
+            self.calls += 1
+            return await super().readline()
+
+    manager = _make()
+    manager.reader = CountingClosedReader()
+    manager._sleep = _no_delay
+
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(manager.read_loop(), timeout=2.0)
+
+    # Reported on the first empty read, not retried: every retry would return
+    # instantly, and that is what produces the spin.
+    assert manager.reader.calls == 1
+
+
+async def test_read_loop_still_retries_a_transient_read_error():
+    """End of file is fatal, but an ordinary read error is not: the retry path
+    that handles an unplug raising through pyserial has to survive the fix."""
+    class FlakyReader:
+        def __init__(self):
+            self.calls = 0
+            self.lines = [b"OK\r\n"]
+
+        async def readline(self):
+            self.calls += 1
+            if self.calls <= 2:
+                raise OSError("transient")
+            if self.lines:
+                return self.lines.pop(0)
+            # Park rather than repeat: a fixture that returns instantly on
+            # every call would starve the loop exactly as the defect does.
+            await asyncio.sleep(3600)
+
+    manager = _make()
+    manager.reader = FlakyReader()
+    manager._sleep = _no_delay
+
+    task = asyncio.create_task(manager.read_loop())
+    try:
+        line = await asyncio.wait_for(manager.message_queue.get(), timeout=2.0)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert line == b"OK\r\n"
+    # Two failures survived rather than ending the session.
+    assert manager.reader.calls >= 3
+
+
+async def test_teardown_clears_per_session_parse_state():
+    """A disconnect can land between a +CMT header and the PDU it announced.
+    Carrying that into the next session makes the first line after reconnect
+    get swallowed as PDU data, and that line's message is lost."""
+    manager = _make()
+    await manager.process_message(b"+CMT: ,26\r\n")
+    await manager.message_queue.put(b"+CREG: 1\r\n")
+    assert manager.pending_sms["pdu"] is not None
+
+    await manager.teardown()
+
+    assert manager.pending_sms["pdu"] is None
+    assert manager.pending_sms["expected_length"] is None
+    assert manager.message_queue.empty() is True
+
+    # The next session routes normally rather than absorbing its first line.
+    await manager.process_message(b'+CREG: 1,"2AF3","01A2B3C4",7\r\n')
+    assert manager.pending_sms["pdu"] is None
 
 
 async def test_the_send_path_holds_the_port_across_the_prompt_window():
@@ -882,6 +989,25 @@ async def test_a_serial_line_is_described_without_its_payload():
     assert _describe_line(b"RING") == "RING"
 
 
+async def test_only_a_known_urc_name_is_ever_echoed():
+    """These describers run on lines the router did not recognise, and a line
+    it did not recognise may be a message. Matching the shape of a URC is not
+    enough: a body beginning with a number has that shape too."""
+    from module.device_manager import _describe_line
+
+    # Reads as a URC keyword to any shape-based test, but is not one.
+    numeric = b"+8613800138000 trailing"
+    assert _describe_line(numeric) == f"[{len(numeric)} bytes]"
+
+    unlisted = b"+NOTAURC: 12345"
+    assert _describe_line(unlisted) == f"[{len(unlisted)} bytes]"
+
+    # A name with no colon after it is not a URC either.
+    assert _describe_line(b"+CMT and more") == f"[{len(b'+CMT and more')} bytes]"
+
+    assert _describe_line(b"+CSQ: 21,99").startswith("+CSQ ")
+
+
 async def test_an_unhandled_serial_line_is_logged_without_its_payload():
     """Unrecognised lines are worth logging on unfamiliar hardware, but one of
     them may itself be a message."""
@@ -950,7 +1076,9 @@ async def test_no_log_line_carries_a_message_body():
     assert marker[:4] not in captured.text
     assert marker[4:] not in captured.text
     # The diagnostics that replaced it must still be there.
-    assert "7" in captured.text
+    assert "ref=7" in captured.text
+    assert "2/2 received" in captured.text
+    assert f"{len(marker)} character(s)" in captured.text
 
 
 async def test_an_expired_concat_buffer_is_logged_without_its_payload():
