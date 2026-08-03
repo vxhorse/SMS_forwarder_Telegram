@@ -2,26 +2,26 @@ import logging
 import sys
 import config
 
-# 全局标志，避免重复配置根logger
+# Guards against configuring the root logger more than once.
 _logging_configured = False
 
 
 def setup_logger(name: str) -> logging.Logger:
     """
-    设置并返回一个日志记录器。
-    
-    :param name: logger名称
-    :return: 配置好的logger实例
+    Build and return a logger.
+
+    :param name: logger name
+    :return: the configured logger
     """
     global _logging_configured
-    
+
     logger = logging.getLogger(name)
-    
-    # 将字符串日志级别转换为 logging 模块可识别的数字级别
+
+    # Translate the configured level name into the numeric level.
     level = getattr(logging, config.LOG_LEVEL.upper(), logging.INFO)
     logger.setLevel(level)
-    
-    # 只在logger没有handler时添加（避免重复添加）
+
+    # Only add a handler when there is none, so repeat calls do not duplicate output.
     if not logger.handlers:
         formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(funcName)s - %(levelname)s - %(message)s'
@@ -31,7 +31,7 @@ def setup_logger(name: str) -> logging.Logger:
         console_handler.setLevel(level)
         logger.addHandler(console_handler)
     
-    # 防止日志传播到父logger造成重复输出
+    # Do not propagate to the parent logger, which would duplicate every line.
     logger.propagate = False
     
     return logger
