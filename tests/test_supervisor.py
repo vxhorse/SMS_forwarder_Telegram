@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import logging
 import time
 
 import pytest
@@ -648,103 +649,6 @@ async def test_a_component_that_is_down_is_not_also_reported_as_stalled():
     await task
 
 
-async def test_a_recovery_does_not_inherit_the_outage_as_a_stall():
-    """The age left behind by an outage must not be read as a stall the moment
-    the component comes back.
-
-    Nothing re-stamps the last-refresh time on recovery: the snapshot is not
-    written while anything is down, and the component loops only refresh it on
-    their own next cycle, which is a cycle away. So the first inspection after
-    a component comes back sees nothing down beside an age as old as the whole
-    outage. Acting on that would restart the process for having reconnected,
-    and would put the same short ceiling on an outage that the gate above
-    exists to keep off it.
-    """
-    shutdown = asyncio.Event()
-    # Ten minutes down, well inside the down threshold. The age tracks it,
-    # because a down component is exactly when the snapshot is not written.
-    health = _StallHealth(down=600.0, stall=600.0)
-    sup = Supervisor(health, shutdown)
-    task = asyncio.create_task(
-        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
-    )
-    for _ in range(_INERT_STEPS):
-        await asyncio.sleep(0)
-    assert not task.done()
-
-    # The component reconnects. The age it accrued while down is still there,
-    # and no loop has reached its next refresh yet.
-    health.down = 0.0
-    for _ in range(_INERT_STEPS):
-        await asyncio.sleep(0)
-    assert not task.done()
-    assert sup.exit_reason is None
-    # The watchdog did inspect the recovered state rather than never looking.
-    assert health.stall_reads >= _MIN_INSPECTIONS
-    shutdown.set()
-    await task
-
-
-async def test_a_stall_beginning_after_a_recovery_is_still_caught():
-    """Discounting the outage's age delays detection by one threshold measured
-    from the recovery. It must not disable it: a component that comes back and
-    then stops making progress is exactly the failure this check is for.
-    """
-    shutdown = asyncio.Event()
-    health = _StallHealth(down=600.0, stall=600.0)
-    sup = Supervisor(health, shutdown)
-    task = asyncio.create_task(
-        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
-    )
-    for _ in range(_INERT_STEPS):
-        await asyncio.sleep(0)
-    health.down = 0.0  # Recovered, carrying the outage's age with it.
-    for _ in range(_INERT_STEPS):
-        await asyncio.sleep(0)
-    assert not task.done()
-
-    # No refresh ever lands, so the age keeps growing from where it was. A full
-    # threshold of it has now accrued since the recovery rather than before it.
-    health.stall = 600.0 + 240.0
-    await asyncio.wait_for(task, timeout=_FAILSAFE)
-    assert sup.exit_reason == "stalled"
-    assert shutdown.is_set()
-
-
-async def test_a_refresh_after_a_recovery_stops_the_outage_being_discounted():
-    """The discount lasts until a refresh lands, and no longer.
-
-    Once the loops are refreshing again the reading no longer contains the
-    outage's age, so keeping the old figure to subtract would hold detection
-    off by the length of an outage that is long over - and the older the
-    outage, the longer the blind spot.
-    """
-    shutdown = asyncio.Event()
-    health = _StallHealth(down=600.0, stall=600.0)
-    sup = Supervisor(health, shutdown)
-    task = asyncio.create_task(
-        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
-    )
-    for _ in range(_INERT_STEPS):
-        await asyncio.sleep(0)
-    health.down = 0.0
-    for _ in range(_INERT_STEPS):
-        await asyncio.sleep(0)
-    assert not task.done()
-
-    # The loops reach their next cycle and the snapshot is written again.
-    health.stall = 1.0
-    for _ in range(_INERT_STEPS):
-        await asyncio.sleep(0)
-    assert not task.done()
-
-    # Much later, progress stops for a full threshold. This is an ordinary
-    # stall now: nothing about the old outage should still be subtracted.
-    health.stall = 240.0
-    await asyncio.wait_for(task, timeout=_FAILSAFE)
-    assert sup.exit_reason == "stalled"
-
-
 async def test_the_watchdog_exits_when_one_component_stops_advancing(tmp_path):
     """The failure the shared snapshot cannot see, driven through the real
     HealthState rather than a double.
@@ -792,6 +696,151 @@ async def test_the_watchdog_exits_when_one_component_stops_advancing(tmp_path):
     # Nothing was ever reported down, so this cannot have been the other
     # criterion wearing the wrong name.
     assert health.down_duration() == 0.0
+
+
+class _CountingHealth(HealthState):
+    """The real HealthState, counting the inspections the watchdog makes."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stall_reads = 0
+
+    def stall_duration(self):
+        self.stall_reads += 1
+        return super().stall_duration()
+
+
+class _LogCapture:
+    """Collect the supervisor's log records without printing them."""
+
+    def __init__(self):
+        from module import supervisor as supervisor_module
+
+        self._logger = supervisor_module.logger
+        self._handler = logging.Handler()
+        self.records = []
+        self._handler.emit = self.records.append
+        self._level = self._logger.level
+
+    def __enter__(self):
+        self._logger.setLevel(logging.DEBUG)
+        self._logger.addHandler(self._handler)
+        return self
+
+    def __exit__(self, *exc_info):
+        self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._level)
+        return False
+
+    @property
+    def text(self):
+        return " ".join(record.getMessage() for record in self.records)
+
+
+_OUTAGE = 600.0
+
+
+def _recovered_health(tmp_path):
+    """A real HealthState that has just come back from a ten-minute outage.
+
+    Nothing refreshed the snapshot while the device was down, because it is not
+    written at all in that state, so the file's age at this moment is the whole
+    outage. The Telegram loop ran throughout.
+    """
+    clock = _ManualClock()
+    health = _CountingHealth(
+        ["device", "telegram"],
+        health_file=str(tmp_path / "healthy"),
+        clock=clock,
+    )
+    for name in ("device", "telegram"):
+        health.mark_up(name)
+        health.record_progress(name)
+    health.refresh_file()
+
+    health.mark_down("device")
+    clock.advance(_OUTAGE)
+    health.record_progress("telegram")
+    health.mark_up("device")
+    return health, clock
+
+
+async def test_a_recovery_does_not_read_as_a_stall(tmp_path):
+    """The age an outage leaves on the snapshot must not be read as a stall the
+    moment the component comes back, or the process is restarted for having
+    reconnected. Driven through the real HealthState, which is where the moment
+    of the recovery is known: an inspection here can only sample it.
+    """
+    health, clock = _recovered_health(tmp_path)
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+
+    task = asyncio.create_task(
+        supervisor.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    for _ in range(_INERT_STEPS):
+        clock.advance(1.0)  # Well inside the threshold, and genuinely elapsing.
+        await asyncio.sleep(0)
+
+    assert not task.done()
+    assert supervisor.exit_reason is None
+    # It kept inspecting the recovered state rather than never looking at it.
+    assert health.stall_reads >= _MIN_INSPECTIONS
+    shutdown.set()
+    await task
+
+
+async def test_a_stall_beginning_after_a_recovery_is_still_caught(tmp_path):
+    """Discounting the outage delays detection to one threshold past the
+    recovery. It must not disable it: a component that comes back and then
+    stops advancing is exactly the failure this criterion is for."""
+    health, clock = _recovered_health(tmp_path)
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+
+    async def time_passes():
+        """Nothing advances and nothing is written; only the clock moves."""
+        while not shutdown.is_set():
+            clock.advance(10.0)
+            await asyncio.sleep(0)
+
+    driver = asyncio.create_task(time_passes())
+    watched = asyncio.create_task(
+        supervisor.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    try:
+        await asyncio.wait_for(watched, timeout=_FAILSAFE)
+    finally:
+        shutdown.set()
+        await asyncio.gather(driver, return_exceptions=True)
+
+    assert supervisor.exit_reason == "stalled"
+
+
+async def test_the_stall_line_names_the_figure_it_tripped_on(tmp_path):
+    """The number printed beside the threshold has to be the number the
+    threshold was compared against. An age carrying an outage that was
+    discounted cannot be reconciled with the threshold beside it: it reads as a
+    240s threshold that somehow took 900s to fire, and sends whoever is
+    debugging it looking for a block that lasted that long.
+    """
+    health, clock = _recovered_health(tmp_path)
+    clock.advance(300.0)
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+
+    with _LogCapture() as log:
+        await asyncio.wait_for(
+            supervisor.watchdog_loop(
+                threshold=3600.0, interval=0.0, stall_threshold=240.0
+            ),
+            timeout=_FAILSAFE,
+        )
+
+    assert supervisor.exit_reason == "stalled"
+    assert "300s" in log.text
+    assert "240s" in log.text
+    assert f"{_OUTAGE + 300.0:.0f}s" not in log.text
 
 
 def _legitimate_refresh_gap(cfg) -> float:
