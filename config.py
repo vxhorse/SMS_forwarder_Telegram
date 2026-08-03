@@ -37,3 +37,8 @@ WATCHDOG_CHECK_INTERVAL = max(1.0, float(os.getenv("WATCHDOG_CHECK_INTERVAL", "3
 SMS_DEV_ROOT = os.getenv("SMS_DEV_ROOT", "/dev")
 # How long a candidate port has to answer AT during discovery, in seconds.
 PORT_PROBE_TIMEOUT = float(os.getenv("PORT_PROBE_TIMEOUT", "3.0"))
+
+# Timeout for a single AT command to produce a terminating response, in seconds.
+AT_COMMAND_TIMEOUT = float(os.getenv("AT_COMMAND_TIMEOUT", "3.0"))
+# Longer timeout for commands the modem processes slowly (AT&F, AT+CFUN, AT&W).
+AT_SLOW_COMMAND_TIMEOUT = float(os.getenv("AT_SLOW_COMMAND_TIMEOUT", "10.0"))

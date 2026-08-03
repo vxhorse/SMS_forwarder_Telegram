@@ -1,12 +1,16 @@
 import serial
 import serial_asyncio
 import asyncio
+import os
 import time
 import re
 from datetime import datetime, timedelta
 from typing import Optional, Callable, Dict, Any
+import config
 from config import SMS_PORT, SMS_BAUDRATE
 from logger import setup_logger
+from module.discovery import discover_port
+from module.supervisor import Backoff
 from gsmmodem.pdu import encodeSmsSubmitPdu, decodeSmsPdu, Concatenation
 
 logger = setup_logger(__name__)
@@ -87,6 +91,11 @@ class DeviceManager:
         # 启动后的事件
         self.priming_event = asyncio.Event()
 
+        # Injection points so tests do not have to touch the real filesystem.
+        self._sleep = asyncio.sleep
+        self._port_exists = os.path.exists
+        self.probe_timeout = config.AT_COMMAND_TIMEOUT
+
     def send_at_command(self, port: str, command: str) -> Optional[list]:
         """
         通过已连接的串口发送AT指令并检查响应。
@@ -130,6 +139,110 @@ class DeviceManager:
             logger.warning(f"串口写入器发送 {command} 出现错误: {e}")
         else:
             logger.debug(f"串口写入器发送命令: {command}")
+
+    async def resolve_port(self) -> str:
+        """Return the port to use: the configured one, or a discovered one.
+
+        An explicit setting always wins, which keeps multi-modem and unusual
+        layouts working. Leaving it empty is the normal case.
+        """
+        if self.port:
+            return self.port
+
+        found = await discover_port(
+            config.SMS_DEV_ROOT, self.baudrate, config.PORT_PROBE_TIMEOUT
+        )
+        if found is None:
+            raise RuntimeError(
+                f"No modem AT port found under {config.SMS_DEV_ROOT}; "
+                f"set SMS_PORT explicitly if the device lives elsewhere"
+            )
+        return found
+
+    async def _wait_for_port(self, path: str) -> None:
+        """Wait for the device node to appear. No deadline, by design.
+
+        A container can be created before its USB device finishes enumerating,
+        so waiting is unbounded on purpose: there is no correct timeout for
+        "the hardware is not here yet". Visibility comes from the healthcheck
+        and from the notification channel instead.
+        """
+        backoff = Backoff(
+            minimum=config.RECONNECT_BACKOFF_MIN,
+            maximum=config.RECONNECT_BACKOFF_MAX,
+        )
+        attempts = 0
+        # Every check that comes back negative is followed by a wait, and the
+        # loop is the only place the node is tested, so a present node costs
+        # nothing and an absent one can never fall out of the loop early.
+        while not self._port_exists(path):
+            attempts += 1
+            delay = backoff.next_delay()
+            if attempts <= 5 or attempts % 20 == 0:
+                logger.warning(
+                    f"Device {path} is not present yet (check {attempts}); "
+                    f"retrying in {delay:.1f}s"
+                )
+            await self._sleep(delay)
+
+        if attempts:
+            logger.info(f"Device {path} appeared after {attempts} failed check(s)")
+
+    async def _send_and_wait(self, command: str, timeout: float) -> list:
+        """Send one AT command and read until a terminating line or timeout.
+
+        This replaces a fixed sleep after each command, which was wrong in both
+        directions: across nineteen setup commands, two seconds each spent
+        thirty-eight seconds waiting on modems that had already answered, while
+        still being too short for a command that happened to run long.
+        """
+        if self.writer is None or self.reader is None:
+            raise RuntimeError("Serial connection is not open")
+
+        self.writer.write(f"{command}\r\n".encode())
+        await self.writer.drain()
+
+        # Monotonic: this runs on boards whose wall clock jumps once the time
+        # is synchronised, which would corrupt any wall-clock deadline.
+        deadline = time.monotonic() + timeout
+        lines: list = []
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(f"{command} timed out after {len(lines)} line(s)")
+                return lines
+            try:
+                raw = await asyncio.wait_for(self.reader.readline(), timeout=remaining)
+            except asyncio.TimeoutError:
+                logger.warning(f"{command} timed out after {len(lines)} line(s)")
+                return lines
+
+            if not raw:
+                # An empty read means end of stream: the device is gone. A
+                # closed stream yields it again immediately every time, so
+                # treating it as a blank line would spin at full speed until
+                # the deadline instead of reporting the loss.
+                raise RuntimeError(f"Serial connection closed while awaiting {command}")
+
+            line = raw.strip()
+            if not line:
+                continue
+            lines.append(line)
+            if line in (b"OK", b"ERROR") or line.startswith((b"+CME ERROR", b"+CMS ERROR")):
+                return lines
+
+    async def _probe_modem(self) -> None:
+        """Confirm the modem actually responds.
+
+        A device node existing does not mean the modem is ready; enumeration
+        completes before its firmware finishes starting, and AT may be silent
+        for a while after the node appears.
+        """
+        lines = await self._send_and_wait("AT", timeout=self.probe_timeout)
+        if b"OK" not in lines:
+            raise RuntimeError(f"Modem did not answer AT within {self.probe_timeout}s")
+        logger.info("Modem handshake succeeded")
 
     async def connect(self) -> None:
         """
