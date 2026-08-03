@@ -39,8 +39,18 @@ WATCHDOG_CHECK_INTERVAL = max(1.0, float(os.getenv("WATCHDOG_CHECK_INTERVAL", "3
 # while it is shutting down: unbounded, the first slows every reconnect cycle
 # and the second can outlast the stop grace period the container runtime allows,
 # turning a clean stop into a kill. Floored because zero would abandon every
-# notification before it was attempted.
-NOTIFY_TIMEOUT = max(1.0, float(os.getenv("NOTIFY_TIMEOUT", "5.0")))
+# notification before it was attempted, and capped because an over-large value
+# reinstates exactly the stall the deadline exists to prevent.
+#
+# There is nothing in this process to clamp the cap against: the stop grace
+# period is chosen by whatever starts the container and is not visible from in
+# here. Ten seconds is the shortest one in common use, so a notification that
+# could outlast that is one that could outlast the whole stop.
+NOTIFY_TIMEOUT_CEILING = 10.0
+NOTIFY_TIMEOUT = max(1.0, min(
+    float(os.getenv("NOTIFY_TIMEOUT", "5.0")),
+    NOTIFY_TIMEOUT_CEILING,
+))
 
 # Root of the device tree to scan. Inside a container this points at the
 # bind-mounted host /dev; running directly on a host it is just /dev.
