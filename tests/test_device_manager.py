@@ -1,11 +1,16 @@
 import asyncio
 import logging
 import time
+from datetime import datetime
 
 import pytest
+from gsmmodem.pdu import encodeSmsSubmitPdu
 
 import config
 from module.device_manager import DeviceManager
+
+# Self-generated PDU with meaningless body text. Never use real message content.
+STORED_PDU = encodeSmsSubmitPdu("+8613800138000", "TESTMSG")[0].data.hex().upper()
 
 
 class FakeReader:
@@ -199,7 +204,7 @@ async def test_wait_for_port_waits_without_a_deadline():
     assert calls["n"] == 6
     assert len(slept) == 5
     assert slept == sorted(slept)
-    assert max(slept) <= 30.0 * 1.2
+    assert max(slept) <= config.RECONNECT_BACKOFF_MAX * 1.2
 
 
 async def test_wait_for_port_has_no_retry_ceiling():
@@ -228,9 +233,16 @@ async def test_wait_for_port_has_no_retry_ceiling():
     assert max(slept) <= config.RECONNECT_BACKOFF_MAX * 1.2
 
 
-async def test_resolve_port_uses_explicit_setting():
+async def test_resolve_port_uses_explicit_setting(monkeypatch):
+    from module import device_manager as dm_module
+
+    # Without this, a regression in the explicit-port branch would silently
+    # fall through to real discovery and scan the machine's own device tree.
+    async def fail_discover(*args, **kwargs):
+        raise AssertionError("discovery must not run when a port is configured")
+
+    monkeypatch.setattr(dm_module, "discover_port", fail_discover)
     manager = DeviceManager(_noop_callback, port="/hostdev/ttyUSB7")
-    manager._port_exists = lambda path: True
     assert await manager.resolve_port() == "/hostdev/ttyUSB7"
 
 
@@ -240,6 +252,10 @@ async def test_resolve_port_falls_back_to_discovery(monkeypatch):
     async def fake_discover(dev_root, baudrate, timeout, **kwargs):
         return "/hostdev/ttyUSB2"
 
+    # An empty port argument falls back to the module level SMS_PORT, so the
+    # test pins it instead of relying on that variable being unset in whatever
+    # shell or job runs the suite.
+    monkeypatch.setattr(dm_module, "SMS_PORT", "")
     monkeypatch.setattr(dm_module, "discover_port", fake_discover)
     manager = DeviceManager(_noop_callback, port="")
     assert await manager.resolve_port() == "/hostdev/ttyUSB2"
@@ -251,7 +267,203 @@ async def test_resolve_port_raises_when_discovery_finds_nothing(monkeypatch):
     async def fake_discover(dev_root, baudrate, timeout, **kwargs):
         return None
 
+    monkeypatch.setattr(dm_module, "SMS_PORT", "")
     monkeypatch.setattr(dm_module, "discover_port", fake_discover)
     manager = DeviceManager(_noop_callback, port="")
     with pytest.raises(RuntimeError):
         await manager.resolve_port()
+
+
+async def test_drain_runs_before_the_delete_command():
+    """AT+CMGD=1,4 wipes the modem's store. Messages that arrived while the
+    process was down must be read out before that happens."""
+    commands = DeviceManager.SETUP_COMMANDS
+    marker = DeviceManager.DRAIN_MARKER
+    assert marker in commands
+    assert "AT+CMGD=1,4" in commands
+    assert commands.index("AT+CMGF=0") < commands.index(marker)
+    assert commands.index('AT+CPMS="ME","ME","ME"') < commands.index(marker)
+    assert commands.index(marker) < commands.index("AT+CMGD=1,4")
+
+
+async def test_setup_no_longer_sets_the_modem_clock():
+    """Nothing reads the modem RTC, and a wrong boot clock would be written
+    straight into it. Network time updates handle this instead."""
+    assert not any(cmd.startswith("AT+CCLK") for cmd in DeviceManager.SETUP_COMMANDS)
+
+
+async def test_drain_parses_cmgl_and_forwards_each_message():
+    forwarded = []
+
+    async def collect(sender, timestamp, content):
+        forwarded.append((sender, timestamp, content))
+        return True
+
+    manager = DeviceManager(collect, port="/hostdev/ttyUSB2")
+    manager.reader = FakeReader([
+        b"+CMGL: 0,1,,26\r\n",
+        f"{STORED_PDU}\r\n".encode(),
+        b"+CMGL: 1,1,,26\r\n",
+        f"{STORED_PDU}\r\n".encode(),
+        b"OK\r\n",
+    ])
+    manager.writer = FakeWriter()
+
+    assert await manager._drain_stored_sms() == 2
+    assert len(forwarded) == 2
+
+
+async def test_drain_returns_zero_when_store_is_empty():
+    manager = _make([b"OK\r\n"])
+    assert await manager._drain_stored_sms() == 0
+
+
+async def test_drain_survives_a_corrupt_pdu():
+    manager = _make([b"+CMGL: 0,1,,26\r\n", b"not a valid pdu\r\n", b"OK\r\n"])
+    assert await manager._drain_stored_sms() == 0
+
+
+async def test_drain_survives_a_trailing_header_without_a_pdu():
+    manager = _make([b"+CMGL: 0,1,,26\r\n", b"OK\r\n"])
+    assert await manager._drain_stored_sms() == 0
+
+
+async def test_drain_keeps_going_after_an_undecodable_entry():
+    """One unreadable entry must not cost us the rest of the store."""
+    forwarded = []
+
+    async def collect(sender, timestamp, content):
+        forwarded.append(sender)
+        return True
+
+    manager = DeviceManager(collect, port="/hostdev/ttyUSB2")
+    manager.reader = FakeReader([
+        b"+CMGL: 0,1,,26\r\n",
+        b"not a valid pdu\r\n",
+        b"+CMGL: 1,1,,26\r\n",
+        f"{STORED_PDU}\r\n".encode(),
+        b"OK\r\n",
+    ])
+    manager.writer = FakeWriter()
+
+    assert await manager._drain_stored_sms() == 1
+    assert len(forwarded) == 1
+
+
+async def test_forward_uses_the_operator_timestamp_not_local_time():
+    """The library returns the delivery time under 'time'. Reading 'date'
+    silently fell through to the local clock on every single message, which
+    also destroyed the point of draining the store on startup."""
+    captured = {}
+
+    async def collect(sender, timestamp, content):
+        captured["timestamp"] = timestamp
+        return True
+
+    manager = DeviceManager(collect, port="/hostdev/ttyUSB2")
+    # A DELIVER PDU carrying a service-centre timestamp of 2024-11-02 13:15:51 +08.
+    deliver = "0791683108200155040D91683103943254F60008421120315115238A02597D"
+    assert await manager._forward_pdu(deliver) is True
+    assert captured["timestamp"].startswith("2024-11-02 13:15:51")
+    assert not captured["timestamp"].startswith(str(datetime.now().year))
+
+
+def _recording_manager(callback=_noop_callback, responder=None):
+    """A manager whose AT layer is replaced by a recorder.
+
+    setup_sms is driven through this rather than through a fake stream so the
+    assertions are about the sequence itself, and so no test can block on a
+    reader that never answers.
+    """
+    manager = DeviceManager(callback, port="/hostdev/ttyUSB2")
+    manager.writer = FakeWriter()
+    sent = []
+
+    async def fake_send(command, timeout):
+        sent.append((command, timeout))
+        return responder(command) if responder else [b"OK"]
+
+    manager._send_and_wait = fake_send
+    return manager, sent
+
+
+async def test_setup_drains_the_store_before_erasing_it():
+    """The ordering that matters is the one setup_sms actually performs: the
+    marker has to trigger a read of the store, not be sent as an AT command."""
+    forwarded = []
+
+    async def collect(sender, timestamp, content):
+        forwarded.append(sender)
+        return True
+
+    def responder(command):
+        if command == "AT+CMGL=4":
+            return [b"+CMGL: 0,1,,26", STORED_PDU.encode(), b"OK"]
+        return [b"OK"]
+
+    manager, sent = _recording_manager(collect, responder)
+    await manager.setup_sms()
+
+    commands = [command for command, _ in sent]
+    assert DeviceManager.DRAIN_MARKER not in commands
+    assert commands.index('AT+CPMS="ME","ME","ME"') < commands.index("AT+CMGL=4")
+    assert commands.index("AT+CMGL=4") < commands.index("AT+CMGD=1,4")
+    assert len(forwarded) == 1
+
+
+async def test_setup_gives_slow_commands_the_longer_deadline():
+    manager, sent = _recording_manager()
+    await manager.setup_sms()
+
+    deadlines = dict(sent)
+    assert deadlines["AT&F"] == config.AT_SLOW_COMMAND_TIMEOUT
+    assert deadlines["AT&W"] == config.AT_SLOW_COMMAND_TIMEOUT
+    assert deadlines["ATE0"] == config.AT_COMMAND_TIMEOUT
+
+
+async def test_setup_aborts_when_a_required_command_goes_unanswered():
+    """_send_and_wait reports a timeout as an empty list. Ignoring that lets a
+    modem that has stopped answering pass initialisation, leaving a process
+    that believes it is healthy while forwarding nothing."""
+    def responder(command):
+        return [] if command == "AT+CMGF=0" else [b"OK"]
+
+    manager, sent = _recording_manager(responder=responder)
+    with pytest.raises(RuntimeError):
+        await manager.setup_sms()
+
+    commands = [command for command, _ in sent]
+    assert "AT+CMGD=1,4" not in commands
+
+
+async def test_setup_does_not_erase_a_store_it_could_not_read():
+    """A silent modem is not an empty store. Reading the drain's timeout as
+    "nothing there" would hand control straight to the erase, destroying
+    unread messages - the loss this whole sequence exists to prevent."""
+    def responder(command):
+        return [] if command == "AT+CMGL=4" else [b"OK"]
+
+    manager, sent = _recording_manager(responder=responder)
+    with pytest.raises(RuntimeError):
+        await manager.setup_sms()
+
+    commands = [command for command, _ in sent]
+    assert "AT+CMGD=1,4" not in commands
+
+
+async def test_setup_continues_past_an_unsupported_optional_command():
+    """Vendor specific commands are answered with ERROR by other modules, and
+    an optional command may not answer at all. Neither is a reason to give up
+    on a modem that is otherwise working."""
+    def responder(command):
+        if command.startswith("AT+Q"):
+            return [b"ERROR"]
+        if command == "AT+CSDH=1":
+            return []
+        return [b"OK"]
+
+    manager, sent = _recording_manager(responder=responder)
+    await manager.setup_sms()
+
+    commands = [command for command, _ in sent]
+    assert commands[-1] == "AT&W"
