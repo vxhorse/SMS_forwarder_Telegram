@@ -928,6 +928,19 @@ class _LogCapture:
     def text(self):
         return " ".join(record.getMessage() for record in self.records)
 
+    @property
+    def formatted(self):
+        """Everything a real handler would print, including any traceback.
+
+        getMessage() renders the interpolated message and nothing else, so a
+        record carrying exc_info can keep an exception's text out of `text`
+        while a real handler prints it in full - a formatted traceback ends
+        with the exception's own str(). Anything asserting that a body cannot
+        reach the log has to look here as well.
+        """
+        formatter = logging.Formatter("%(levelname)s %(message)s")
+        return " ".join(formatter.format(record) for record in self.records)
+
 
 async def test_device_manager_is_a_managed_service():
     manager = _make()
@@ -1604,6 +1617,51 @@ async def test_a_failed_send_logs_no_full_destination_number():
 
     assert NUMBER not in captured.text
     assert NUMBER[:-4] not in captured.text
+
+
+async def test_a_raising_send_logs_neither_the_message_nor_the_number(monkeypatch):
+    """The send path is the one place holding an outbound body, so its failure
+    handler may not interpolate the exception it caught.
+
+    The failure is injected rather than provoked, deliberately. The bundled
+    encoder happens to fall back to UCS2 instead of raising on a character it
+    cannot fit into GSM-7, so today it does not leak - but two raise sites in
+    that module do name the offending character, no version is pinned, and the
+    writes further down this block carry the encoded message too. The rule this
+    asserts cannot be allowed to rest on which of those happens to fire.
+    """
+    from module import device_manager as dm_module
+
+    marker = "QQZZWWXX"
+
+    def refuse(number, text, **kwargs):
+        # Shaped like the library's own message, which quotes the character it
+        # rejected, and carrying the whole body and number for good measure.
+        raise ValueError(
+            f'Cannot encode char "{text[0]}" using GSM-7 encoding: '
+            f'{text} to {number}'
+        )
+
+    monkeypatch.setattr(dm_module, "encodeSmsSubmitPdu", refuse)
+
+    manager = _make()
+    manager._sleep = _no_delay
+
+    with _LogCapture(dm_module) as captured:
+        assert await manager.handle_send_sms(NUMBER, marker) is False
+
+    # Both views: `formatted` also renders a traceback, so reattaching exc_info
+    # cannot smuggle the exception text back past this test.
+    for rendered in (captured.text, captured.formatted):
+        assert marker not in rendered
+        assert marker[0] not in rendered
+        assert NUMBER not in rendered
+        assert NUMBER[:-4] not in rendered
+
+    # Still diagnosable: the kind of failure, the masked destination, the length.
+    assert "ValueError" in captured.text
+    assert NUMBER[-4:] in captured.text
+    assert f"{len(marker)} character(s)" in captured.text
 
 
 async def test_a_timed_out_send_logs_no_full_destination_number():
