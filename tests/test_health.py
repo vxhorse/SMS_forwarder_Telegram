@@ -94,15 +94,30 @@ def test_down_duration_takes_the_longest(tmp_path):
     assert health.down_duration() == 40.0
 
 
+def test_registration_state_appears_in_the_snapshot(tmp_path):
+    """Diagnostic only, and the reason it is worth carrying: a modem that
+    answers every probe while sitting off the network looks identical to a
+    healthy one from outside the process."""
+    health, _, _ = _make(tmp_path)
+    assert health.snapshot()["registration"] is None
+    health.record_registration(1)
+    assert health.snapshot()["registration"] == 1
+
+
 def test_file_written_when_all_up(tmp_path):
     health, _, path = _make(tmp_path)
     health.mark_up("device")
     health.mark_up("telegram")
     health.record_rssi(21)
+    health.record_registration(5)
     health.refresh_file()
     with open(path) as handle:
         data = json.load(handle)
-    assert data == {"services": {"device": True, "telegram": True}, "rssi": 21}
+    assert data == {
+        "services": {"device": True, "telegram": True},
+        "rssi": 21,
+        "registration": 5,
+    }
 
 
 def test_file_not_written_while_any_component_is_down(tmp_path):

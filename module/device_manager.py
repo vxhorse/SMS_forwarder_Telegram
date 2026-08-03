@@ -104,6 +104,96 @@ def _mask_number(number: Any) -> str:
     return f"…{text[-_NUMBER_SUFFIX_LENGTH:]}"
 
 
+# What the modem reports about its network registration.
+#
+# 1 is registered on the home network and 5 is registered while roaming. There
+# is no third state in which a message can be delivered: 0 is not registered,
+# 2 is still searching for an operator, 3 is a registration the network
+# refused, and 4 is a state the modem cannot describe. Under every one of them
+# the radio is not attached and nothing can arrive.
+_REGISTERED_STATES = frozenset({1, 5})
+
+_REGISTRATION_DESCRIPTIONS = {
+    0: "not registered",
+    1: "registered, home network",
+    2: "not registered, searching",
+    3: "registration denied",
+    4: "unknown",
+    5: "registered, roaming",
+}
+
+# The values <n> can take: whether the modem reports registration changes by
+# itself, and whether those reports carry location information.
+_REGISTRATION_URC_MODES = frozenset({0, 1, 2})
+
+# The radio technology a registration line may name, for the log only.
+_ACCESS_TECHNOLOGIES = {
+    0: "GSM",
+    2: "UTRAN",
+    3: "GSM w/EGPRS",
+    4: "UTRAN w/HSDPA",
+    5: "UTRAN w/HSUPA",
+    6: "UTRAN w/HSDPA and HSUPA",
+    7: "E-UTRAN",
+    8: "UTRAN HSPA+",
+}
+
+
+def _as_int(field: str) -> Optional[int]:
+    """Read one comma-separated field as an integer, or None if it is not one."""
+    try:
+        return int(field)
+    except (TypeError, ValueError):
+        return None
+
+
+def _registration_state_index(fields: list) -> int:
+    """Which field of a +CREG line holds the registration state.
+
+    Two shapes arrive here and they differ by exactly one leading field. The
+    AT command set gives the answer to AT+CREG? as
+
+        +CREG: <n>,<stat>[,<lac>,<ci>[,<AcT>]]
+
+    and the report a modem sends by itself as
+
+        +CREG: <stat>[,<lac>,<ci>[,<AcT>]]
+
+    Both reach this code, because setup asks for the reports and the heartbeat
+    asks the question, and nothing in the line says which one it is. Reading
+    the second field whenever there is one therefore takes a registered
+    modem's location area for its registration state, and every cell whose
+    area does not happen to number 1 or 5 would read as a modem that is not on
+    the network - restarting a session that was working, over and over.
+
+    Two further rules from the same specification settle it without guessing:
+
+    - <n> is one of 0, 1 and 2, so a line leading with anything else is a
+      report;
+    - location information accompanies the state only when the modem is
+      registered and <n> is 2, so a report that is not registered is a single
+      field, and a report that leads with 1 and carries location cannot be a
+      reply - a reply whose <n> is 1 has no location to carry.
+
+    A second field that is not a number is location data as well, since a
+    location area is a string. That leaves the two-field form as the only one
+    a reply can take.
+    """
+    first = _as_int(fields[0]) if fields else None
+    if first is None or first not in _REGISTRATION_URC_MODES or len(fields) < 2:
+        return 0
+    if first == 1 and len(fields) > 2:
+        return 0
+    return 1 if _as_int(fields[1]) is not None else 0
+
+
+def _describe_registration(state: Optional[int]) -> str:
+    """Name a registration state for the log, including the absence of one."""
+    if state is None:
+        return "no reading"
+    return _REGISTRATION_DESCRIPTIONS.get(state, f"unrecognised state {state}")
+
+
 class ForwardOutcome(Enum):
     """What became of one PDU handed to _forward_pdu.
 
@@ -322,6 +412,17 @@ class DeviceManager:
         # Set whenever a +CSQ reply arrives, which is what proves the modem is
         # still answering rather than merely still connected.
         self._probe_event = asyncio.Event()
+        self.registration_failures = config.MODEM_REGISTRATION_FAILURES
+        # Consecutive probes that found the modem off the network.
+        self.registration_misses = 0
+        # What the modem last said about being on the network, or None if the
+        # current probe has not been answered readably. Cleared before each
+        # probe so a reading can never outlive the round it was taken in.
+        self._registration_state: Optional[int] = None
+        # Set whenever a readable registration state arrives, from the reply
+        # to the heartbeat's question or from a report the modem sent by
+        # itself. Both answer the same question, so both end the wait.
+        self._registration_event = asyncio.Event()
         # One AT transaction on the port at a time. The heartbeat and the
         # sending path are independent writers, and AT+CMGS puts the modem into
         # a prompt where every byte written becomes part of the outgoing
@@ -553,8 +654,19 @@ class DeviceManager:
         AT+CSQ is used rather than a bare AT because its reply prefix is
         distinctive and cannot be confused with the OK produced by the message
         sending path; the signal strength it returns is useful diagnostically.
+
+        Answering is only half of what has to be true, so each answered probe
+        is followed by AT+CREG?. A modem that has been detached from the
+        network answers every command exactly as it did before while not one
+        message can reach it - the same silent failure as a wedged modem,
+        arrived at by a different route, and invisible to a probe that asks
+        only whether the modem is still talking.
         """
         failures = 0
+        # Reset with the loop, not with the object: this runs once per
+        # session, and readings taken through a connection that has since been
+        # torn down say nothing about the one that replaced it.
+        self.registration_misses = 0
         while True:
             await self._sleep(self.probe_interval)
             self._probe_event.clear()
@@ -572,6 +684,43 @@ class DeviceManager:
             # A single answer clears the count: an occasional miss on a busy
             # modem is normal, only a run of them means it has gone quiet.
             failures = 0
+
+            # The state is discarded before the question is asked, so what the
+            # wait leaves behind is a reading taken in this round or nothing
+            # at all. Carrying the previous round's reading forward would let
+            # one report of being registered stand in for every probe after
+            # it, which is exactly the silence this is looking for.
+            self._registration_state = None
+            self._registration_event.clear()
+            async with self._at_lock:
+                await self.send_at_command_async("AT+CREG?")
+            try:
+                await asyncio.wait_for(
+                    self._registration_event.wait(), timeout=self.probe_timeout
+                )
+            except asyncio.TimeoutError:
+                # No reading, which is not the same as a reading that says the
+                # modem is registered, and must not be counted as one.
+                pass
+
+            if self._registration_state in _REGISTERED_STATES:
+                # Registration dips while a modem hands over between cells and
+                # comes back by itself, so one reading clears the count for
+                # the same reason a single answered probe clears the other.
+                self.registration_misses = 0
+            else:
+                self.registration_misses += 1
+                logger.warning(
+                    f"Modem is not on the network "
+                    f"({_describe_registration(self._registration_state)}, "
+                    f"{self.registration_misses} in a row)"
+                )
+                if self.registration_misses >= self.registration_failures:
+                    raise RuntimeError(
+                        f"Modem was not registered on the network for "
+                        f"{self.registration_misses} consecutive checks"
+                    )
+
             if self.health is not None:
                 # Keep the snapshot file fresh so the container healthcheck can
                 # tell a live process from a wedged one. Refreshing only, never
@@ -758,44 +907,9 @@ class DeviceManager:
             # destroys one received message.
             await self.handle_incoming_sms_pdu(message)
         elif message.startswith(b'+CREG:'):
-            # Decoded outside the try so the failure path below can always
-            # name the line it could not parse.
-            creg_msg = message.decode('utf-8', errors='replace')
-            try:
-                parts = creg_msg.replace('+CREG:', '').strip().split(',')
-
-                status = parts[0].strip()
-                lac = parts[1].strip(' "') if len(parts) > 1 else "Unknown"
-                ci = parts[2].strip(' "') if len(parts) > 2 else "Unknown"
-                act = parts[3].strip() if len(parts) > 3 else "Unknown"
-
-                status_desc = {
-                    "0": "not registered",
-                    "1": "registered, home network",
-                    "2": "not registered, searching",
-                    "3": "registration denied",
-                    "4": "unknown",
-                    "5": "registered, roaming",
-                }.get(status, "unknown state")
-
-                act_desc = {
-                    "0": "GSM",
-                    "2": "UTRAN",
-                    "3": "GSM w/EGPRS",
-                    "4": "UTRAN w/HSDPA",
-                    "5": "UTRAN w/HSUPA",
-                    "6": "UTRAN w/HSDPA and HSUPA",
-                    "7": "E-UTRAN",
-                }.get(act, "Unknown")
-
-                logger.debug(
-                    f"Network registration: {status_desc}, "
-                    f"area {lac}, cell {ci}, access technology {act_desc}"
-                )
-            except Exception as e:
-                # A +CREG line reports registration state only; it has no
-                # message payload, so quoting it back is safe and useful.
-                logger.debug(f"Could not parse a CREG line: {e}, line: {creg_msg!r}")
+            # Registration reports arrive unasked as well as in answer to the
+            # heartbeat's question, and both say the same thing.
+            self._handle_creg(message)
         else:
             logger.warning(f"Unhandled serial line: {_describe_line(message)}")
 
@@ -812,6 +926,44 @@ class DeviceManager:
         # Set regardless of whether the value parsed: the probe asks whether
         # the modem answers, not what it answered.
         self._probe_event.set()
+
+    def _handle_creg(self, message: bytes) -> None:
+        """Record what one +CREG line says about being on the network.
+
+        A line that cannot be read is logged and otherwise ignored, and in
+        particular it does not end the heartbeat's wait. That is the opposite
+        of what a malformed +CSQ does, deliberately: the liveness probe asks
+        only whether the modem answered, while this one asks what it answered,
+        and an answer nothing can read is not one. Waiting on instead gives
+        the reply that can be read the rest of the deadline to arrive.
+        """
+        # A +CREG line carries registration state and location only - never
+        # any part of a message - so it can be quoted in full, which is what
+        # makes an unfamiliar shape diagnosable.
+        text = message.decode('utf-8', errors='replace')
+        fields = [field.strip() for field in text.split(':', 1)[-1].split(',')]
+
+        index = _registration_state_index(fields)
+        state = _as_int(fields[index])
+        if state is None:
+            logger.debug(f"Could not read a registration state from {text!r}")
+            return
+
+        location = fields[index + 1:]
+        area = location[0].strip('"') if location else "unknown"
+        cell = location[1].strip('"') if len(location) > 1 else "unknown"
+        technology = _ACCESS_TECHNOLOGIES.get(
+            _as_int(location[2]) if len(location) > 2 else None, "unknown"
+        )
+        logger.debug(
+            f"Network registration: {_describe_registration(state)}, "
+            f"area {area}, cell {cell}, access technology {technology}"
+        )
+
+        self._registration_state = state
+        if self.health is not None:
+            self.health.record_registration(state)
+        self._registration_event.set()
 
     async def handle_incoming_sms_header(self, bytes_message: bytes) -> None:
         """

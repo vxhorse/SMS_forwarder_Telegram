@@ -30,6 +30,7 @@ class HealthState:
         self._clock = clock
         self._health_file = health_file
         self._rssi: Optional[int] = None
+        self._registration: Optional[int] = None
         now = clock()
         # Every component starts down, so the watchdog clock effectively runs
         # from process start. A device that never appears is therefore visible
@@ -67,6 +68,16 @@ class HealthState:
         """Record the most recent signal strength. Diagnostic only."""
         self._rssi = value
 
+    def record_registration(self, state: Optional[int]) -> None:
+        """Record the most recent network registration state. Diagnostic only.
+
+        Deliberately not part of the up/down decision: whether being off the
+        network ends a session is the modem component's judgement, taken over
+        several readings, and duplicating it here would let one dip in a
+        handover take the whole snapshot down.
+        """
+        self._registration = state
+
     def all_up(self) -> bool:
         return all(service["up"] for service in self._services.values())
 
@@ -84,6 +95,7 @@ class HealthState:
         return {
             "services": {name: service["up"] for name, service in self._services.items()},
             "rssi": self._rssi,
+            "registration": self._registration,
         }
 
     def refresh_file(self) -> None:

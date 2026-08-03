@@ -949,11 +949,37 @@ async def test_device_manager_is_a_managed_service():
         assert callable(getattr(manager, method))
 
 
-async def test_probe_settings_come_from_config():
+async def test_probe_settings_come_from_config(monkeypatch):
+    """Each setting is given a value that is not its default, so a field wired
+    to a literal that happens to equal the default cannot pass this."""
+    monkeypatch.setattr(config, "MODEM_PROBE_INTERVAL", 11.0)
+    monkeypatch.setattr(config, "MODEM_PROBE_TIMEOUT", 13.0)
+    monkeypatch.setattr(config, "MODEM_PROBE_FAILURES", 7)
+    monkeypatch.setattr(config, "MODEM_REGISTRATION_FAILURES", 9)
+
     manager = _make()
-    assert manager.probe_interval == config.MODEM_PROBE_INTERVAL
-    assert manager.probe_timeout == config.MODEM_PROBE_TIMEOUT
-    assert manager.probe_failures == config.MODEM_PROBE_FAILURES
+    assert manager.probe_interval == 11.0
+    assert manager.probe_timeout == 13.0
+    assert manager.probe_failures == 7
+    assert manager.registration_failures == 9
+
+
+async def test_one_reading_can_never_be_enough_to_drop_the_connection(monkeypatch):
+    """Registration dips for a moment during a handover, so a threshold of one
+    would restart a working session for an event that fixes itself, and zero
+    would switch the check off while still looking like a setting."""
+    import importlib
+
+    original = config.MODEM_REGISTRATION_FAILURES
+    try:
+        for value in ("0", "1"):
+            monkeypatch.setenv("MODEM_REGISTRATION_FAILURES", value)
+            assert importlib.reload(config).MODEM_REGISTRATION_FAILURES >= 2
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    assert config.MODEM_REGISTRATION_FAILURES == original
 
 
 async def test_the_probe_interval_cannot_outrun_the_health_staleness_window(monkeypatch):
@@ -1064,6 +1090,60 @@ async def test_a_registration_urc_is_not_mistaken_for_pdu_data():
     assert manager.pending_sms["pdu"] is None
 
 
+async def test_every_registration_shape_the_manual_gives_is_read_correctly():
+    """The two shapes differ by one leading field, and telling them apart is
+    the whole of this parse.
+
+    The vendor manual (AT+CREG) gives the answer to AT+CREG? as
+    `+CREG: <n>,<stat>[,<lac>,<ci>[,<AcT>]]` and the modem's own report as
+    `+CREG: <stat>[,<lac>,<ci>[,<AcT>]]`. Both are routed through here,
+    because AT+CREG=2 is part of setup and the heartbeat now asks the question
+    as well. Reading the second field of a report yields the location area
+    instead of the registration state, which would count a registered modem as
+    absent from the network and restart a session that was working.
+
+    Two further facts from the same section separate them without guessing:
+    <n> is one of 0, 1 and 2, and location information accompanies a state
+    only when the modem is registered, so a report that is not registered is a
+    single field and a report that leads with 1 and carries location cannot be
+    a reply.
+    """
+    shapes = {
+        # Replies to AT+CREG?, which always lead with <n>.
+        b"+CREG: 2,0": 0,
+        b"+CREG: 2,2": 2,
+        b"+CREG: 0,3": 3,
+        b'+CREG: 2,1,"D509","80D413D",7': 1,
+        b'+CREG: 2,5,"D509","80D413D",7': 5,
+        # The modem's own reports, which lead with <stat>.
+        b"+CREG: 0": 0,
+        b"+CREG: 1": 1,
+        b"+CREG: 3": 3,
+        b"+CREG: 4": 4,
+        b'+CREG: 1,"D509","80D413D",7': 1,
+        b'+CREG: 5,"2AF3","0123ABC",7': 5,
+    }
+
+    for line, expected in shapes.items():
+        health = HealthState(["device", "telegram"])
+        manager = DeviceManager(_noop_callback, health=health, port="/hostdev/ttyUSB2")
+        await manager.process_message(line + b"\r\n")
+        assert health.snapshot()["registration"] == expected, line
+
+
+async def test_an_unreadable_registration_line_is_not_taken_for_an_answer():
+    """The opposite conclusion to the liveness probe's, on purpose. A +CSQ
+    that will not parse still proves the modem answered, which is all that
+    probe asks. This probe asks what the modem said, so a line it cannot read
+    tells it nothing and must not end the wait: treating it as an answer would
+    leave the loop reading whatever the previous round happened to record."""
+    health = HealthState(["device", "telegram"])
+    manager = DeviceManager(_noop_callback, health=health, port="/hostdev/ttyUSB2")
+    await manager.process_message(b"+CREG: garbage\r\n")
+    assert health.snapshot()["registration"] is None
+    assert manager._registration_event.is_set() is False
+
+
 async def test_an_unhandled_urc_is_not_mistaken_for_pdu_data():
     """The guard has to hold for lines this code has never seen, which is why
     it tests what a PDU is made of instead of naming the intruders."""
@@ -1106,6 +1186,11 @@ async def test_an_answered_heartbeat_resets_the_failure_count():
     probes = []
 
     async def fake_probe(command):
+        if command == "AT+CREG?":
+            # On the network throughout: this test is about the liveness path,
+            # so the registration path must not be what ends the loop.
+            await manager.process_message(b"+CREG: 2,1")
+            return
         probes.append(command)
         if next(answers):
             manager._probe_event.set()
@@ -1131,6 +1216,10 @@ async def test_a_single_missed_heartbeat_keeps_the_session():
     settled = asyncio.Event()
 
     async def fake_probe(command):
+        if command == "AT+CREG?":
+            # On the network throughout: only the liveness path is under test.
+            await manager.process_message(b"+CREG: 2,1")
+            return
         probes.append(command)
         if len(probes) == 1:
             return  # the first probe goes unanswered
@@ -1150,6 +1239,133 @@ async def test_a_single_missed_heartbeat_keeps_the_session():
             await task
 
 
+def _answering_modem(manager, replies):
+    """Answer the heartbeat's probes, one registration reading at a time.
+
+    Every AT+CSQ is answered, so the liveness path can never be what decides
+    the outcome of a test about registration. Each AT+CREG? is answered with
+    the next entry of `replies`, fed through the real routing path so it is
+    parsed exactly as a modem's line would be; an entry of None is a probe the
+    modem does not answer at all.
+
+    Once the entries run out the returned event is set and the probe parks
+    rather than answering, so a test that has seen every round it scripted
+    ends the loop itself instead of racing a deadline.
+
+    :return: the commands as they are sent, and the event announcing that the
+        scripted rounds are over.
+    """
+    remaining = list(replies)
+    sent = []
+    exhausted = asyncio.Event()
+
+    async def respond(command):
+        sent.append(command)
+        if command == "AT+CSQ":
+            manager._probe_event.set()
+            return
+        if not remaining:
+            exhausted.set()
+            await asyncio.sleep(3600)
+            return
+        line = remaining.pop(0)
+        if line is not None:
+            await manager.process_message(line)
+
+    manager.send_at_command_async = respond
+    return sent, exhausted
+
+
+async def test_the_heartbeat_gives_up_on_a_modem_that_is_not_on_the_network():
+    """AT+CSQ proves the modem answers; it does not prove a message can reach
+    it. A SIM the carrier has detached keeps answering exactly as before while
+    nothing arrives, so the liveness probe is answered throughout this test and
+    only the registration state can decide it."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99  # the liveness path must not be what raises
+    manager.registration_failures = 3
+    # Not registered, searching for an operator.
+    sent, _ = _answering_modem(manager, [b"+CREG: 2,2"] * 10)
+
+    with pytest.raises(RuntimeError, match="registered"):
+        await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+
+    # Given up on the third consecutive reading: not before, and not later.
+    assert sent.count("AT+CREG?") == 3
+
+
+async def test_a_registered_reply_clears_the_deregistration_count():
+    """Registration dips as a modem moves between cells and comes back on its
+    own. Only a run of readings means the SIM is no longer attached, so one
+    reply saying registered has to put the count back to zero."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 3
+    # Searching, searching, registered, searching, searching: five readings
+    # that are never three in a row.
+    sent, exhausted = _answering_modem(manager, [
+        b"+CREG: 2,2", b"+CREG: 2,2", b"+CREG: 2,1", b"+CREG: 2,2", b"+CREG: 2,2",
+    ])
+
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(exhausted.wait(), timeout=2.0)
+        assert task.done() is False
+        # The two after the registered reply, not the four before it.
+        assert manager.registration_misses == 2
+        assert sent.count("AT+CREG?") == 6
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_roaming_counts_as_being_on_the_network():
+    """5 is a modem registered on an operator that is not its own, and it
+    receives messages exactly as the home network does. Counting it as a
+    failure would restart the session every few minutes on a travelling SIM."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    sent, exhausted = _answering_modem(manager, [b"+CREG: 2,5"] * 3)
+
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(exhausted.wait(), timeout=2.0)
+        assert task.done() is False
+        assert manager.registration_misses == 0
+        assert sent.count("AT+CREG?") == 4
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_an_unanswered_registration_probe_is_not_read_as_registered():
+    """Silence is not an answer, and the reply that did arrive belongs to the
+    round it arrived in. A modem that stops answering AT+CREG? while still
+    answering AT+CSQ is precisely the failure this probe exists to catch, so
+    reading the last known state again would keep the count at zero for ever
+    and hide it."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    sent, _ = _answering_modem(manager, [b"+CREG: 2,1", None, None])
+
+    with pytest.raises(RuntimeError, match="registered"):
+        await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+
+    assert sent.count("AT+CREG?") == 3
+
+
 async def test_run_parks_while_the_modem_keeps_answering():
     """The supervisor treats a run body that returns as a failed session, and a
     session shorter than SERVICE_STABLE_SECONDS as flapping. A healthy run must
@@ -1160,6 +1376,12 @@ async def test_run_parks_while_the_modem_keeps_answering():
     settled = asyncio.Event()
 
     async def fake_probe(command):
+        if command == "AT+CREG?":
+            # Answering both probes is what a healthy modem does; a run body
+            # that ends because one of them went unanswered would prove
+            # nothing about the case this test is making.
+            await manager.process_message(b"+CREG: 2,1")
+            return
         probes.append(command)
         manager._probe_event.set()
         if len(probes) >= 3:
