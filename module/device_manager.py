@@ -49,6 +49,28 @@ _SAFE_BARE_RESPONSES = frozenset({
 })
 
 
+# The alphabet a PDU is transmitted in. Both cases are accepted because the
+# standard fixes the encoding, not the case, and modules differ.
+_HEX_DIGITS = frozenset(b"0123456789ABCDEFabcdef")
+
+
+def _is_pdu_line(message: bytes) -> bool:
+    """Whether a line could be PDU data at all.
+
+    A PDU reaches us as hexadecimal text, so a line holding anything else is
+    not part of one. That matters because a header and the PDU it announces
+    are two separate reads, and the modem is free to emit an unrelated URC in
+    between: registration state, a vendor notification, anything. Appended to
+    the pending PDU such a line corrupts the message past decoding and the
+    message is dropped, while the URC itself is swallowed unrouted.
+
+    Testing the line for what a PDU is made of, rather than listing the URCs
+    that might intrude, is what keeps this correct when a module emits a URC
+    this code has never seen.
+    """
+    return bool(message) and all(byte in _HEX_DIGITS for byte in message)
+
+
 def _describe_line(message: bytes) -> str:
     """Describe a serial line for the log without reproducing its payload."""
     if message in _SAFE_BARE_RESPONSES:
@@ -705,25 +727,30 @@ class DeviceManager:
         if message.startswith(b'+CMT:'):
             await self.handle_incoming_sms_header(message)
         elif message.startswith(b'+CSQ:'):
-            # Checked ahead of the pending-PDU branch on purpose: a heartbeat
-            # reply can land between a +CMT header and its PDU, and appending
-            # it to the PDU would corrupt the message and lose the heartbeat.
-            # A PDU line is hexadecimal, so it can never be mistaken for this.
+            # A heartbeat reply can land between a +CMT header and its PDU.
             self._handle_csq(message)
         elif message.startswith(b'+CMGS:'):
-            # Ahead of the pending-PDU branch for the same reason as +CSQ, and
-            # safe for the same reason. A send confirmation arrives whenever
-            # the modem accepts an outgoing message, which is independent of
-            # what is arriving, so it can land between a +CMT header and its
-            # PDU. Appending it there breaks two things at once: the inbound
-            # message fails to decode and is dropped, and the confirmation is
-            # never seen, so the sending path waits out its deadline and
-            # reports a failure for a message the modem did accept.
+            # A send confirmation can land in the same window: it is produced
+            # by the outgoing path, so it is unrelated to what is arriving. If
+            # it were taken for PDU data the inbound message would fail to
+            # decode and the confirmation would never be seen, so the sending
+            # path would wait out its deadline and report a failure for a
+            # message the modem did accept.
             #
             # +CMGS carries only the message reference number.
             logger.info(f"Message accepted by the modem: {message.decode('utf-8')}")
             self.sms_sent_event.set()
-        elif self.pending_sms["pdu"] is not None:
+        elif self.pending_sms["pdu"] is not None and _is_pdu_line(message):
+            # The two branches above are ordered ahead of this one for
+            # readability, but neither is what keeps them safe: this is. Any
+            # line at all can arrive between a +CMT header and the PDU it
+            # announced, and only a line made entirely of hexadecimal can be
+            # part of that PDU. Everything else falls through to its own
+            # branch, so the URC is routed and the pending PDU is left intact
+            # for the line that really does belong to it. A guard that instead
+            # listed the URCs allowed to interrupt would have to be extended
+            # for every URC a module invents, and each omission silently
+            # destroys one received message.
             await self.handle_incoming_sms_pdu(message)
         elif message.startswith(b'+CREG:'):
             # Decoded outside the try so the failure path below can always
