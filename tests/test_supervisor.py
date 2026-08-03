@@ -151,6 +151,19 @@ class _SlowBackoff:
         pass
 
 
+class _ManualClock:
+    """Monotonic stand-in that only ever moves when the test moves it."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class _StepClock:
     """Monotonic stand-in whose reading advances by a fixed step per call."""
 
@@ -732,6 +745,55 @@ async def test_a_refresh_after_a_recovery_stops_the_outage_being_discounted():
     assert sup.exit_reason == "stalled"
 
 
+async def test_the_watchdog_exits_when_one_component_stops_advancing(tmp_path):
+    """The failure the shared snapshot cannot see, driven through the real
+    HealthState rather than a double.
+
+    The device loop stops advancing without raising, so it stays marked up and
+    nothing is reported down. The Telegram loop carries on and keeps rewriting
+    the snapshot, which is what makes the shared reading useless here: it never
+    ages, so a criterion built on it alone reports a perfectly healthy process
+    that is forwarding nothing.
+    """
+    clock = _ManualClock()
+    health = HealthState(
+        ["device", "telegram"],
+        health_file=str(tmp_path / "healthy"),
+        clock=clock,
+    )
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+
+    health.mark_up("device")
+    health.mark_up("telegram")
+    health.record_progress("device")
+    health.record_progress("telegram")
+    health.refresh_file()
+
+    async def telegram_keeps_going():
+        """One Telegram cycle per scheduling step, for as long as it takes."""
+        while not shutdown.is_set():
+            clock.advance(10.0)
+            health.record_progress("telegram")
+            health.refresh_file()
+            await asyncio.sleep(0)
+
+    driver = asyncio.create_task(telegram_keeps_going())
+    watched = asyncio.create_task(
+        supervisor.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    try:
+        await asyncio.wait_for(watched, timeout=_FAILSAFE)
+    finally:
+        shutdown.set()
+        await asyncio.gather(driver, return_exceptions=True)
+
+    assert supervisor.exit_reason == "stalled"
+    # Nothing was ever reported down, so this cannot have been the other
+    # criterion wearing the wrong name.
+    assert health.down_duration() == 0.0
+
+
 def _legitimate_refresh_gap(cfg) -> float:
     """The longest gap the heartbeat can leave between two refreshes.
 
@@ -789,6 +851,30 @@ def test_the_stall_floor_still_clears_the_budget_at_the_shortest_window(monkeypa
     try:
         reloaded = importlib.reload(config)
         assert reloaded.WATCHDOG_STALL_SECONDS >= 2 * _legitimate_refresh_gap(reloaded)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+
+def test_the_stall_floor_clears_one_telegram_polling_iteration():
+    """Now that each loop is measured on its own, the Telegram loop's own pace
+    is load-bearing. It was not before: the device heartbeat rewrote the shared
+    snapshot every half-minute whatever Telegram was doing, so a long poll never
+    showed up in the reading. A threshold under one working iteration would
+    restart the process for polling."""
+    assert config.WATCHDOG_STALL_SECONDS >= config.TELEGRAM_PROGRESS_BUDGET
+
+
+def test_the_stall_floor_clears_telegram_at_the_shortest_window(monkeypatch):
+    """The floor's other terms are derived from the modem probe settings, which
+    are clamped down by the staleness window. The Telegram loop is not clamped
+    by anything, so at the shortest window a floor built from the probe alone
+    lands under a single long poll."""
+    monkeypatch.setenv("HEALTH_STALE_SECONDS", "2")
+    monkeypatch.setenv("WATCHDOG_STALL_SECONDS", "0")
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.WATCHDOG_STALL_SECONDS >= reloaded.TELEGRAM_PROGRESS_BUDGET
     finally:
         monkeypatch.undo()
         importlib.reload(config)

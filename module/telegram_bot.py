@@ -13,6 +13,7 @@ import json
 import re
 import html
 from typing import Optional, Callable, Dict, Any
+import config
 from logger import setup_logger
 from module.supervisor import FatalConfigError
 
@@ -113,10 +114,12 @@ class TelegramBot:
         self.proxy_url = proxy_url
         self.base_url = f'https://api.telegram.org/bot{self.bot_token}/'
 
-        # Connection parameters.
-        self.max_retries = 3
-        self.retry_delay = 5
-        self.timeout = aiohttp.ClientTimeout(total=60)
+        # Connection parameters. They come from config because the watchdog's
+        # stall threshold is floored against the gap they add up to, and a
+        # figure that no longer describes this loop would floor it wrongly.
+        self.max_retries = config.TELEGRAM_SEND_ATTEMPTS
+        self.retry_delay = config.TELEGRAM_SEND_RETRY_DELAY
+        self.timeout = aiohttp.ClientTimeout(total=config.TELEGRAM_REQUEST_TIMEOUT)
 
         # Running state.
         self.is_running = False
@@ -267,8 +270,15 @@ class TelegramBot:
 
         while self.is_running:
             updates = await self.get_updates()
+            # The API answered, so this loop advanced. Reported here as well as
+            # after each update because handling one update can legitimately
+            # take minutes - an outgoing send is retried several times, each
+            # behind its own deadline - and a report written only at the end of
+            # the iteration would present that as a loop that had stopped.
+            self._record_progress()
             for update in updates:
                 await self.process_update(update)
+                self._record_progress()
             # Refreshing only, never mark_up(): see Supervisor._serve_session
             # for why that decision cannot be made from inside a component's
             # own loop.
@@ -282,10 +292,21 @@ class TelegramBot:
 
         logger.info("Long polling stopped")
 
+    def _record_progress(self) -> None:
+        """Report that this loop advanced.
+
+        Written from the loop itself rather than through refresh_file(), which
+        every component loop calls and which is gated on all of them being up.
+        See HealthState.record_progress for why only the former can be
+        attributed to this component.
+        """
+        if self.health is not None:
+            self.health.record_progress(self.name)
+
     async def get_updates(self) -> list:
         """Fetch pending updates from the API."""
         url = f'{self.base_url}getUpdates'
-        params = {'offset': self.offset, 'timeout': 50}
+        params = {'offset': self.offset, 'timeout': config.TELEGRAM_LONG_POLL_SECONDS}
         try:
             async with self.session.get(url, params=params, proxy=self.proxy_url) as response:
                 if response.status == 200:

@@ -173,12 +173,18 @@ def test_stall_duration_survives_a_component_going_down(tmp_path):
     assert health.stall_duration() == 50.0
 
 
-def test_a_successful_refresh_resets_the_stall_age(tmp_path):
+def test_a_completed_cycle_resets_the_stall_age(tmp_path):
+    """One cycle of both loops: each reports its own progress and one of them
+    rewrites the snapshot. Refreshing the file alone is deliberately not enough
+    -- either loop refreshes it for both components, so a refresh says nothing
+    about the component that stopped."""
     health, clock, _ = _make(tmp_path)
     health.mark_up("device")
     health.mark_up("telegram")
     health.refresh_file()
     clock.advance(40.0)
+    health.record_progress("device")
+    health.record_progress("telegram")
     health.refresh_file()
     assert health.stall_duration() == 0.0
 
@@ -194,7 +200,98 @@ def test_a_failed_write_does_not_count_as_a_refresh(tmp_path, monkeypatch):
         raise OSError("disk full")
 
     monkeypatch.setattr("module.health.os.replace", explode)
+    # Both loops advanced, so nothing but the unwritable file is behind.
+    health.record_progress("device")
+    health.record_progress("telegram")
     health.refresh_file()
     # The write failed, so the healthcheck still sees the old file. Pretending
     # it was refreshed would hide exactly that.
     assert health.stall_duration() == 10.0
+
+
+def test_a_component_that_stops_advancing_is_stalled_while_the_other_advances(tmp_path):
+    """The failure a single shared stamp cannot see, which is the whole reason
+    progress is tracked per component.
+
+    Both loops refresh the snapshot independently, so the Telegram loop keeps
+    it fresh on behalf of a device loop that has stopped advancing, and the
+    device stays marked up because a blocked loop raises nothing. Measured
+    against the shared stamp alone the process looks perfectly healthy while it
+    forwards nothing at all.
+    """
+    health, clock, _ = _make(tmp_path)
+    health.mark_up("device")
+    health.mark_up("telegram")
+    health.record_progress("device")
+    health.record_progress("telegram")
+    health.refresh_file()
+
+    # Ten Telegram cycles. The device loop reports nothing in any of them.
+    for _ in range(10):
+        clock.advance(30.0)
+        health.record_progress("telegram")
+        health.refresh_file()
+
+    assert health.stall_duration() == 300.0
+
+
+def test_marking_a_component_up_restamps_its_progress(tmp_path):
+    """A component that has just come back has made no progress under this
+    session yet, and the age its previous one left behind measures the outage.
+    Carrying that age across the recovery would restart the process for having
+    reconnected."""
+    health, clock, _ = _make(tmp_path)
+    health.mark_up("device")
+    health.mark_up("telegram")
+    health.record_progress("device")
+    health.record_progress("telegram")
+    health.refresh_file()
+
+    health.mark_down("device")
+    clock.advance(600.0)
+    health.record_progress("telegram")
+    health.mark_up("device")
+    health.refresh_file()
+
+    clock.advance(5.0)
+    assert health.stall_duration() == 5.0
+
+
+def test_a_component_that_is_down_does_not_count_as_stalled(tmp_path):
+    """A component that is down is the down-duration criterion's business, with
+    the far longer tolerance chosen for it. Counting its idle loop as a stall
+    would put a second, much shorter ceiling on a reconnection."""
+    health, clock, _ = _make(tmp_path)
+    health.mark_up("device")
+    health.mark_up("telegram")
+    health.record_progress("device")
+    health.record_progress("telegram")
+
+    clock.advance(600.0)  # The device loop has been silent for the whole outage.
+    health.record_progress("telegram")
+    health.refresh_file()
+    health.mark_down("device")
+
+    clock.advance(10.0)
+    health.record_progress("telegram")
+    assert health.stall_duration() == 10.0
+
+
+def test_progress_from_an_unregistered_component_is_ignored(tmp_path):
+    health, clock, _ = _make(tmp_path)
+    health.record_progress("nonexistent")
+    assert health.snapshot()["services"] == {"device": False, "telegram": False}
+
+
+def test_a_progressing_component_does_not_start_the_stall_clock_on_its_own(tmp_path):
+    """Cold boot with the modem absent. The Telegram loop is up and advancing,
+    the device has never appeared, and stall detection must stay switched off
+    for as long as that lasts -- reporting a stall here would be the startup
+    deadline this project exists to remove."""
+    health, clock, _ = _make(tmp_path)
+    health.mark_up("telegram")
+    for _ in range(200):
+        clock.advance(52.0)
+        health.record_progress("telegram")
+        health.refresh_file()
+    assert health.stall_duration() is None
