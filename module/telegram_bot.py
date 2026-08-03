@@ -108,7 +108,6 @@ class TelegramBot:
         :param proxy_url: outbound proxy, or None
         :param health: HealthState whose snapshot file this keeps fresh
         """
-        # Basic configuration.
         self.send_sms_callback = send_sms_callback
         self.bot_token = bot_token
         self.chat_id = chat_id
@@ -263,9 +262,10 @@ class TelegramBot:
     async def polling_loop(self) -> None:
         """Long polling loop. Any error propagates to the supervisor.
 
-        The previous implementation kept its own error counter and multiplied
-        its retry delay into minutes between attempts, which both duplicated
-        the supervisor's job and could stall the bot for half an hour.
+        Nothing is retried here. Counting errors and backing off is the
+        supervisor's job, and a second copy of that policy inside this loop
+        would compound with it: two delays multiplied together can stall the
+        bot for far longer than either was meant to allow.
         """
         logger.info("Long polling started")
         self.is_running = True
@@ -275,12 +275,9 @@ class TelegramBot:
             for update in updates:
                 await self.process_update(update)
             self.last_activity = time.monotonic()
-            # Deliberately no mark_up() here. Reporting "up" once per poll
-            # would re-stamp HealthState's down timestamp on every cycle, so a
-            # component that keeps reconnecting could never accumulate enough
-            # continuous downtime for the watchdog to notice. Whether a
-            # session counts as a recovery is the supervisor's decision, made
-            # once the session has lasted SERVICE_STABLE_SECONDS.
+            # Refreshing only, never mark_up(): see Supervisor._serve_session
+            # for why that decision cannot be made from inside a component's
+            # own loop.
             if self.health is not None:
                 self.health.refresh_file()
             if not updates:
@@ -302,9 +299,11 @@ class TelegramBot:
                     return data.get('result', [])
                 # The body is not quoted: an error reply is an unbounded
                 # server-controlled string, and its size is enough to tell an
-                # empty answer from a real one. This was a ClientResponseError,
-                # which carries the request it came from and prints the URL, so
-                # a routine 409 or 401 published the token on every attempt.
+                # empty answer from a real one. Raising this rather than letting
+                # aiohttp raise for status matters just as much: a
+                # ClientResponseError carries the request it came from and
+                # prints the URL, so a routine 409 or 401 would publish the
+                # token on every attempt.
                 error_text = await response.text()
                 raise TelegramApiError(
                     f"Could not fetch updates: HTTP {response.status}, "
@@ -486,9 +485,9 @@ class TelegramBot:
                 if response.status != 200:
                     logger.warning(f'Could not answer a callback query: HTTP {response.status}')
         except _REQUEST_ERRORS as exc:
-            # Still propagates, as it always did - this runs inside the polling
-            # loop, so the supervisor should see a broken session. Only its
-            # rendering changes.
+            # Propagates on purpose: this runs inside the polling loop, so a
+            # session broken here has to reach the supervisor rather than being
+            # swallowed by a button press.
             raise TelegramApiError(
                 f"Could not answer a callback query: {self._describe_error(exc)}"
             ) from None

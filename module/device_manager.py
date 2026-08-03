@@ -406,10 +406,11 @@ class DeviceManager:
     async def _send_and_wait(self, command: str, timeout: float) -> list:
         """Send one AT command and read until a terminating line or timeout.
 
-        This replaces a fixed sleep after each command, which was wrong in both
-        directions: across nineteen setup commands, two seconds each spent
-        thirty-eight seconds waiting on modems that had already answered, while
-        still being too short for a command that happened to run long.
+        Driven by the modem's own reply rather than by a fixed wait after each
+        command. A fixed wait is wrong in both directions at once: multiplied
+        across the setup sequence it spends most of a minute waiting on a modem
+        that answered immediately, and it is still too short for the one command
+        that happens to run long.
         """
         if self.writer is None or self.reader is None:
             raise RuntimeError("Serial connection is not open")
@@ -571,13 +572,9 @@ class DeviceManager:
             failures = 0
             if self.health is not None:
                 # Keep the snapshot file fresh so the container healthcheck can
-                # tell a live process from a wedged one. Marking the component
-                # up is deliberately not done here: that belongs to the
-                # supervisor, which waits until a session has proved stable.
-                # Doing it from the heartbeat would re-stamp the health
-                # timestamp on every flap cycle, and a component that keeps
-                # failing just slower than this interval would never let the
-                # watchdog reach its threshold.
+                # tell a live process from a wedged one. Refreshing only, never
+                # mark_up(): see Supervisor._serve_session for why that decision
+                # cannot be made from inside a component's own loop.
                 self.health.refresh_file()
 
     async def setup_sms(self) -> None:
@@ -723,7 +720,9 @@ class DeviceManager:
             message = message[1:-1]
 
         if message in [b'', b' ', b'OK', b'>']:
-            # Nothing to route.
+            # Padding, a bare acknowledgement, and the send prompt. None of them
+            # carries a payload, and the sending path watches for its own
+            # confirmation rather than for these, so there is nothing to route.
             return
         else:
             logger.debug(f"Processing serial line: {_describe_line(message)}")
