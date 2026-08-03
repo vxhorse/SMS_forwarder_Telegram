@@ -261,7 +261,10 @@ MODEM_REGISTRATION_CHECK = os.getenv(
 # MODEM_PROBE_FAILURES - 1 of them can pass before the next one gives up and
 # raises. The round that does refresh costs an interval and two deadlines rather
 # than one, because an answered liveness probe is followed by the registration
-# probe, which waits the same deadline for its own answer:
+# probe, which waits the same deadline for its own answer. That second deadline
+# is counted whether or not MODEM_REGISTRATION_CHECK is on: a threshold derived
+# from this figure has to hold for every configuration, and the round that asks
+# one question is the shorter of the two, so the longer one is the bound:
 #
 #     max(0, F - 1) x (I + T)  +  (I + 2T)
 #

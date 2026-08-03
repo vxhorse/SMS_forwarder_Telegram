@@ -855,8 +855,11 @@ def _legitimate_refresh_gap(cfg) -> float:
     MODEM_PROBE_FAILURES - 1 of them can pass before the next gives up and
     raises. The round that does refresh costs an interval and two deadlines,
     because an answered liveness probe is followed by the registration probe,
-    which waits the same deadline for its own answer. Until the count runs out
-    the component is working and simply has not refreshed the snapshot.
+    which waits the same deadline for its own answer. That holds whether or not
+    MODEM_REGISTRATION_CHECK is on: the round that asks one question is the
+    shorter of the two, and a threshold has to clear the longer one. Until the
+    count runs out the component is working and simply has not refreshed the
+    snapshot.
     """
     missed = max(0, cfg.MODEM_PROBE_FAILURES - 1) * (
         cfg.MODEM_PROBE_INTERVAL + cfg.MODEM_PROBE_TIMEOUT
