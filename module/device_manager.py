@@ -193,8 +193,6 @@ class DeviceManager:
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
 
-        self.is_running = False
-
         self.message_queue: asyncio.Queue = asyncio.Queue()
         self.pending_sms = {"pdu": None, "expected_length": None}
 
@@ -381,7 +379,6 @@ class DeviceManager:
         self.active_port = path
         await self._probe_modem()
         await self.setup_sms()
-        self.is_running = True
         logger.warning(f"Connected to {path}")
         await self._notify(f"📶 Modem connected: {path}")
 
@@ -412,8 +409,6 @@ class DeviceManager:
 
     async def teardown(self) -> None:
         """Release the serial connection. Idempotent, never raises."""
-        self.is_running = False
-
         # Per-session parse state, dropped with the session it belongs to. A
         # disconnect can land between a +CMT header and the PDU it announced;
         # carrying that half-read state forward would make the first line of
