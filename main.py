@@ -25,10 +25,14 @@ EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_CONFIG = 2
 
-# Keyed by the supervisor's recorded reason for stopping.
+# Keyed by the supervisor's recorded reason for stopping. Both watchdog reasons
+# share a code on purpose: a component that stopped answering and a snapshot
+# that stopped being refreshed are the same request, which is to be restarted.
+# The logs say which of the two it was.
 EXIT_CODES = {
     None: EXIT_OK,
     "watchdog": EXIT_FAILURE,
+    "stalled": EXIT_FAILURE,
     "fatal_config": EXIT_CONFIG,
 }
 
@@ -94,6 +98,13 @@ def build_services():
 
 async def run() -> int:
     """Run until shutdown is requested. Returns the process exit code."""
+    # config.py cannot log a clamped setting itself - it cannot import the
+    # logger without a circular import, since logger.py reads its level from
+    # config - so it only records what got clamped. Logged here, once, before
+    # anything the clamped values might affect gets built.
+    for notice in config.CLAMP_NOTICES:
+        logger.warning(f"Configuration adjusted: {notice}")
+
     health, supervisor, device, telegram, shutdown_event = build_services()
 
     # Cleared on the way in as well as on the way out. A process that was

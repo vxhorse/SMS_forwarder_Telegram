@@ -62,6 +62,7 @@ Three are slow enough to get a longer deadline
 | `AT` | Port discovery, and the handshake right after the port opens | Bare command. A port that answers `OK` is the module's AT port, and a module that answers has finished starting |
 | `AT+CMGL=4` | The stored-message drain, at step 13 above | List every message already in the store, so messages that arrived while the process was down are forwarded before step 14 erases them |
 | `AT+CSQ` | The liveness heartbeat, every `MODEM_PROBE_INTERVAL` | Signal quality. Asking a question the module must answer is the only way to tell a live module from an open port behind a wedged one |
+| `AT+CREG?` | The same heartbeat, after each answered `AT+CSQ`, and only with `MODEM_REGISTRATION_CHECK=1` (off by default) | Network registration state. Answering proves the module is alive, not that it is attached to a network: a SIM the carrier has detached answers every command exactly as before while no message can arrive |
 | `AT+CMGS=<length>` | The send path | Announce an outgoing PDU of that length. The module answers with a prompt, the hex PDU is written, and Ctrl+Z (0x1A) submits it |
 
 ## Responses and URCs this project reads
@@ -74,9 +75,38 @@ Three are slow enough to get a longer deadline
 | `+CMGL:` | One entry of a stored-message listing; its PDU follows on the next line |
 | `+CMGS:` | The module accepted an outgoing message, and reports its reference number |
 | `+CSQ:` | Signal quality reply, which is also the heartbeat's proof of life |
-| `+CREG:` | Network registration state |
+| `+CREG:` | Network registration state, in either of its two shapes: `+CREG: <n>,<stat>[,<lac>,<ci>[,<AcT>]]` in answer to `AT+CREG?`, and `+CREG: <stat>[,<lac>,<ci>[,<AcT>]]` when the module reports a change by itself. `<stat>` 1 and 5 are registered at home and roaming, 6 and 7 the same two limited to messages alone; under any other value a message cannot be delivered |
 
 Any other line is logged as an unhandled line and otherwise ignored. Nothing in
 this project writes a message body to the log, so an unrecognised line is
 reported by length rather than quoted; look it up here by the URC name the
 module's own documentation gives it.
+
+## Known limitation of the registration check
+
+`+CREG` describes the circuit-switched domain. A module that a network attaches
+for packet service alone, with messages delivered over a path that domain does
+not describe, reports one of the unregistered states while every message
+arrives — and on firmware predating `<stat>` 6 and 7 there is no value that
+expresses that case either. The heartbeat would then drop the session every few
+minutes and reinitialise the radio each time, which is worse than not checking.
+
+Because that failure cannot be distinguished from a real one without knowing
+what the SIM and the network actually report, `MODEM_REGISTRATION_CHECK`
+defaults to `0`. The state is still parsed, published in the health snapshot and
+logged with the check off — setup asks the module to report registration changes
+unasked — so the reading needed to make the decision is available without the
+check acting on it. Watch the snapshot's `registration` field over a period that
+includes ordinary message traffic: if it settles on 1, 5, 6 or 7, set
+`MODEM_REGISTRATION_CHECK=1` and the heartbeat will act on a run of unregistered
+readings. If it sits at 0 or 2 while messages keep arriving, this is the network
+described above and the check must stay off.
+
+Asking `AT+CGREG?` and `AT+CEREG?` as well — on the failing path only, counting
+a miss only when every domain agrees — is the complete answer, and it is not a
+copy of the `+CREG` code: `process_message` routes `+CREG:` alone, so those
+replies currently reach no parser at all, and 3GPP TS 27.007 allows their `<n>`
+to range up to 5, which breaks the rule the `+CREG` parser depends on (a leading
+value above 2 cannot be an `<n>`, so the line must be an unsolicited report).
+They need a shape rule of their own. See `_REGISTERED_STATES` in
+[`module/device_manager.py`](../module/device_manager.py).

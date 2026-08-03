@@ -15,6 +15,7 @@ import pytest
 from multidict import CIMultiDict
 from yarl import URL as YarlURL
 
+import config
 from module.supervisor import FatalConfigError
 from module.telegram_bot import TelegramApiError, TelegramBot
 
@@ -184,6 +185,7 @@ class _RecordingHealth:
     def __init__(self, settle_after=None):
         self.marked_up = []
         self.marked_down = []
+        self.progress = []
         self.refreshes = 0
         self.settled = asyncio.Event()
         self._settle_after = settle_after
@@ -193,6 +195,9 @@ class _RecordingHealth:
 
     def mark_down(self, name, error=None):
         self.marked_down.append(name)
+
+    def record_progress(self, name):
+        self.progress.append(name)
 
     def refresh_file(self):
         self.refreshes += 1
@@ -439,6 +444,61 @@ async def test_polling_refreshes_the_health_file_without_marking_up():
 
     assert health.refreshes >= 3
     assert health.marked_up == []
+
+
+async def test_polling_reports_its_own_progress_as_well_as_refreshing():
+    """The shared snapshot cannot attribute progress. Either component loop
+    refreshes it, so a Telegram loop that is still running keeps it fresh on
+    behalf of a device loop that has stopped, and the device raises nothing
+    while it is blocked. Only a stamp this loop writes itself says this loop
+    advanced.
+
+    Reported once for the poll and once for every update handled, because
+    handling a single update can legitimately outlast the poll that found it.
+    """
+    health = _RecordingHealth(settle_after=2)
+    bot = TelegramBot(_noop_send, "123:ABC", "1", None, health=health)
+    polls = {"n": 0}
+
+    async def poll():
+        polls["n"] += 1
+        await asyncio.sleep(0)
+        return [{"update_id": polls["n"]}]
+
+    async def swallow(update):
+        return None
+
+    bot.get_updates = poll
+    bot.process_update = swallow
+
+    task = asyncio.create_task(bot.run())
+    try:
+        await asyncio.wait_for(health.settled.wait(), timeout=2.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Two completed iterations, each carrying one update: the poll and the
+    # update are separate reports, so anything less than two per iteration
+    # means one of them is missing.
+    assert health.progress.count("telegram") >= 4
+    assert set(health.progress) == {"telegram"}
+
+
+def test_the_polling_loop_uses_the_timings_the_watchdog_floor_is_built_from():
+    """WATCHDOG_STALL_FLOOR is floored against config.TELEGRAM_PROGRESS_BUDGET,
+    which is only the right floor while it describes this loop. A deadline
+    lengthened here and not there would put the stall threshold underneath the
+    time one working iteration can take, and the watchdog would restart a
+    process that is doing its job."""
+    bot = _make()
+    assert bot.timeout.total == config.TELEGRAM_REQUEST_TIMEOUT
+    assert bot.max_retries == config.TELEGRAM_SEND_ATTEMPTS
+    assert bot.retry_delay == config.TELEGRAM_SEND_RETRY_DELAY
+    # The poll parks on the server inside one request, so it has to end before
+    # the request deadline does or every poll expires before the API answers.
+    assert config.TELEGRAM_LONG_POLL_SECONDS < config.TELEGRAM_REQUEST_TIMEOUT
 
 
 # --- Nothing in the log may carry a message -----------------------------------

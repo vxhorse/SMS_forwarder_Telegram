@@ -1,5 +1,9 @@
+import ast
 import asyncio
+import importlib
 import logging
+import os
+import pathlib
 import time
 from datetime import datetime, timedelta
 
@@ -9,6 +13,7 @@ from gsmmodem.pdu import encodeSmsSubmitPdu
 import config
 from module.device_manager import DeviceManager, ForwardOutcome
 from module.health import HealthState
+from tests.ast_helpers import dotted_name
 
 # A reserved test number, not anyone's. Long enough that a masked form and the
 # full form are clearly different strings.
@@ -80,6 +85,35 @@ class FakeWriter:
 
     async def wait_closed(self):
         pass
+
+
+class FlowControlledWriter(FakeWriter):
+    """A port that takes one command's bytes and never lets them go.
+
+    This is what serial flow control does when the modem stops reading. The
+    write itself returns, because it only hands the bytes to the transport;
+    the drain that waits for that buffer to empty never returns and never
+    raises. Nothing is reported anywhere, because reporting it would need the
+    same port.
+
+    :param blocked: the command whose flush never completes. Every other
+        command is flushed normally, which is what a modem that goes quiet
+        part-way through a session actually does.
+    :param answer: awaited once a command has been flushed, standing in for
+        the modem's reply arriving on the read path.
+    """
+
+    def __init__(self, blocked: str = "", answer=None):
+        super().__init__()
+        self._blocked = f"{blocked}\r\n".encode() if blocked else None
+        self._answer = answer
+
+    async def drain(self):
+        last = self.written[-1] if self.written else b""
+        if last == self._blocked:
+            await asyncio.Event().wait()
+        if self._answer is not None:
+            await self._answer(last)
 
 
 class ClosedReader:
@@ -949,11 +983,39 @@ async def test_device_manager_is_a_managed_service():
         assert callable(getattr(manager, method))
 
 
-async def test_probe_settings_come_from_config():
+async def test_probe_settings_come_from_config(monkeypatch):
+    """Each setting is given a value that is not its default, so a field wired
+    to a literal that happens to equal the default cannot pass this."""
+    monkeypatch.setattr(config, "MODEM_PROBE_INTERVAL", 11.0)
+    monkeypatch.setattr(config, "MODEM_PROBE_TIMEOUT", 13.0)
+    monkeypatch.setattr(config, "MODEM_PROBE_FAILURES", 7)
+    monkeypatch.setattr(config, "MODEM_REGISTRATION_FAILURES", 9)
+    monkeypatch.setattr(config, "MODEM_REGISTRATION_CHECK", False)
+
     manager = _make()
-    assert manager.probe_interval == config.MODEM_PROBE_INTERVAL
-    assert manager.probe_timeout == config.MODEM_PROBE_TIMEOUT
-    assert manager.probe_failures == config.MODEM_PROBE_FAILURES
+    assert manager.probe_interval == 11.0
+    assert manager.probe_timeout == 13.0
+    assert manager.probe_failures == 7
+    assert manager.registration_failures == 9
+    assert manager.registration_check is False
+
+
+async def test_one_reading_can_never_be_enough_to_drop_the_connection(monkeypatch):
+    """Registration dips for a moment during a handover, so a threshold of one
+    would restart a working session for an event that fixes itself, and zero
+    would switch the check off while still looking like a setting."""
+    import importlib
+
+    original = config.MODEM_REGISTRATION_FAILURES
+    try:
+        for value in ("0", "1"):
+            monkeypatch.setenv("MODEM_REGISTRATION_FAILURES", value)
+            assert importlib.reload(config).MODEM_REGISTRATION_FAILURES >= 2
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    assert config.MODEM_REGISTRATION_FAILURES == original
 
 
 async def test_the_probe_interval_cannot_outrun_the_health_staleness_window(monkeypatch):
@@ -1064,6 +1126,63 @@ async def test_a_registration_urc_is_not_mistaken_for_pdu_data():
     assert manager.pending_sms["pdu"] is None
 
 
+async def test_every_registration_shape_the_manual_gives_is_read_correctly():
+    """The two shapes differ by one leading field, and telling them apart is
+    the whole of this parse.
+
+    The vendor manual (AT+CREG) gives the answer to AT+CREG? as
+    `+CREG: <n>,<stat>[,<lac>,<ci>[,<AcT>]]` and the modem's own report as
+    `+CREG: <stat>[,<lac>,<ci>[,<AcT>]]`. Both are routed through here,
+    because AT+CREG=2 is part of setup and the heartbeat now asks the question
+    as well. Reading the second field of a report yields the location area
+    instead of the registration state, which would count a registered modem as
+    absent from the network and restart a session that was working.
+
+    Two further facts from the same section separate them without guessing:
+    <n> is one of 0, 1 and 2, and location information accompanies a state
+    only when the modem is registered, so a report that is not registered is a
+    single field and a report that leads with 1 and carries location cannot be
+    a reply.
+    """
+    shapes = {
+        # Replies to AT+CREG?, which always lead with <n>.
+        b"+CREG: 2,0": 0,
+        b"+CREG: 2,2": 2,
+        b"+CREG: 0,3": 3,
+        b"+CREG: 2,6": 6,
+        b'+CREG: 2,1,"D509","80D413D",7': 1,
+        b'+CREG: 2,5,"D509","80D413D",7': 5,
+        b'+CREG: 2,7,"D509","80D413D",7': 7,
+        # The modem's own reports, which lead with <stat>.
+        b"+CREG: 0": 0,
+        b"+CREG: 1": 1,
+        b"+CREG: 3": 3,
+        b"+CREG: 4": 4,
+        b'+CREG: 1,"D509","80D413D",7': 1,
+        b'+CREG: 5,"2AF3","0123ABC",7': 5,
+        b'+CREG: 6,"2AF3","0123ABC",7': 6,
+    }
+
+    for line, expected in shapes.items():
+        health = HealthState(["device", "telegram"])
+        manager = DeviceManager(_noop_callback, health=health, port="/hostdev/ttyUSB2")
+        await manager.process_message(line + b"\r\n")
+        assert health.snapshot()["registration"] == expected, line
+
+
+async def test_an_unreadable_registration_line_is_not_taken_for_an_answer():
+    """The opposite conclusion to the liveness probe's, on purpose. A +CSQ
+    that will not parse still proves the modem answered, which is all that
+    probe asks. This probe asks what the modem said, so a line it cannot read
+    tells it nothing and must not end the wait: treating it as an answer would
+    leave the loop reading whatever the previous round happened to record."""
+    health = HealthState(["device", "telegram"])
+    manager = DeviceManager(_noop_callback, health=health, port="/hostdev/ttyUSB2")
+    await manager.process_message(b"+CREG: garbage\r\n")
+    assert health.snapshot()["registration"] is None
+    assert manager._registration_event.is_set() is False
+
+
 async def test_an_unhandled_urc_is_not_mistaken_for_pdu_data():
     """The guard has to hold for lines this code has never seen, which is why
     it tests what a PDU is made of instead of naming the intruders."""
@@ -1102,10 +1221,18 @@ async def test_an_answered_heartbeat_resets_the_failure_count():
     manager.probe_timeout = 0.01
     manager.probe_failures = 2
     manager._sleep = _no_delay
+    # The whole round, both questions, as an operator who enabled the check
+    # gets it: the liveness count has to behave the same either way.
+    manager.registration_check = True
     answers = iter([False, True, False, False])
     probes = []
 
     async def fake_probe(command):
+        if command == "AT+CREG?":
+            # On the network throughout: this test is about the liveness path,
+            # so the registration path must not be what ends the loop.
+            await manager.process_message(b"+CREG: 2,1")
+            return
         probes.append(command)
         if next(answers):
             manager._probe_event.set()
@@ -1127,10 +1254,15 @@ async def test_a_single_missed_heartbeat_keeps_the_session():
     manager.probe_timeout = 0.01
     manager.probe_failures = 3
     manager._sleep = _no_delay
+    manager.registration_check = True  # the full round, as an operator who enabled it
     probes = []
     settled = asyncio.Event()
 
     async def fake_probe(command):
+        if command == "AT+CREG?":
+            # On the network throughout: only the liveness path is under test.
+            await manager.process_message(b"+CREG: 2,1")
+            return
         probes.append(command)
         if len(probes) == 1:
             return  # the first probe goes unanswered
@@ -1150,16 +1282,674 @@ async def test_a_single_missed_heartbeat_keeps_the_session():
             await task
 
 
+class _RecordingHealth(HealthState):
+    """The real HealthState, with a note of every progress report it is given."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.progress = []
+
+    def record_progress(self, name):
+        self.progress.append(name)
+        super().record_progress(name)
+
+
+async def test_the_heartbeat_reports_progress_even_with_nothing_to_refresh(tmp_path):
+    """The stamp has to be written by this loop, and refresh_file() cannot be
+    the route.
+
+    The snapshot is written only while every component is up, so it falls
+    silent for reasons that have nothing to do with this loop - here, a
+    Telegram component that has not connected yet. A stamp that travelled
+    through it would go silent with it and the loop would look stopped. It
+    would be no better the other way round either: both component loops refresh
+    the same file, so one that is still running keeps it fresh on behalf of one
+    that has stopped.
+    """
+    health = _RecordingHealth(
+        ["device", "telegram"], health_file=str(tmp_path / "healthy")
+    )
+    health.mark_up("device")  # Telegram deliberately left down.
+    manager = DeviceManager(_noop_callback, health=health, port="/hostdev/ttyUSB2")
+    manager.reader = FakeReader()
+    manager.writer = FakeWriter()
+    manager.probe_timeout = 0.01
+    manager._sleep = _no_delay
+    # The longer of the two rounds, so the report being asserted is the one a
+    # round that asks both questions makes.
+    manager.registration_check = True
+    rounds = []
+    settled = asyncio.Event()
+
+    async def fake_probe(command):
+        if command == "AT+CREG?":
+            await manager.process_message(b"+CREG: 2,1")
+            return
+        rounds.append(command)
+        manager._probe_event.set()
+        if len(rounds) >= 2:
+            settled.set()
+
+    manager.send_at_command_async = fake_probe
+
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(settled.wait(), timeout=2.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert health.progress[:2] == ["device", "device"]
+    # Not one refresh landed in all that time, which is the point.
+    assert not os.path.exists(str(tmp_path / "healthy"))
+
+
+async def _heartbeat_must_give_up(manager, blocked_on: str) -> str:
+    """Run one heartbeat loop until it reports a failure, and never longer.
+
+    The outer deadline is what protects the suite rather than the component:
+    without it a regression here does not fail, it hangs, and a hung suite
+    says nothing about which test hung it. Reaching that deadline is turned
+    into this test's own failure, naming what the loop was still waiting on.
+
+    :param blocked_on: what a regression would still be waiting for, quoted
+        back in the failure so the report says which bound was lost.
+    :return: the message the loop raised.
+    """
+    try:
+        await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail(
+            f"the heartbeat never reached a deadline of its own: it was still "
+            f"blocked on {blocked_on}"
+        )
+    except RuntimeError as exc:
+        return str(exc)
+    pytest.fail("the heartbeat loop ended without reporting a failure")
+
+
+async def _probe_must_finish(manager, command, answered, blocked_on: str):
+    """Run one probe with a deadline of the test's own around it.
+
+    The same protection _heartbeat_must_give_up gives the loop, for the tests
+    that drive a single probe directly. Without it a regression does not fail
+    these either: the probe blocks, and with nothing above it to give up, the
+    suite stops here rather than reporting anything.
+
+    :param blocked_on: what a regression would still be waiting for.
+    :return: what the probe reported.
+    """
+    try:
+        return await asyncio.wait_for(
+            manager._probe_once(command, answered), timeout=2.0
+        )
+    except asyncio.TimeoutError:
+        pytest.fail(
+            f"the probe never reached a deadline of its own: it was still "
+            f"blocked on {blocked_on}"
+        )
+
+
+async def test_a_blocked_write_is_a_missed_heartbeat_not_a_hang():
+    """Serial flow control has no deadline of its own, and no exception. A
+    modem that has stopped accepting bytes blocks the write, so a probe that
+    times only the reply never reaches the point where it would give up: the
+    check built to notice a silent modem is itself what stops running, and
+    nothing raises, so nothing downstream ever hears about it."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 1
+    manager.writer = FlowControlledWriter(blocked="AT+CSQ")
+
+    message = await _heartbeat_must_give_up(manager, "the write of AT+CSQ")
+
+    assert "heartbeat" in message
+    # The command was handed over: what never completed is the flush.
+    assert manager.writer.written == [b"AT+CSQ\r\n"]
+
+
+async def test_a_held_lock_is_a_missed_heartbeat_not_a_hang():
+    """The compounding case, and the worse one. A send whose write blocks is
+    holding the AT lock across both of its writes, so a probe that waits for
+    that lock outside its own deadline is waiting on a transaction that will
+    never finish - and the modem never has to go quiet for it to happen."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 1
+    await manager._at_lock.acquire()  # a send stuck mid-transaction
+
+    try:
+        message = await _heartbeat_must_give_up(manager, "the AT lock")
+    finally:
+        manager._at_lock.release()
+
+    assert "heartbeat" in message
+    # Nothing was written: the probe gave up before it ever took the port,
+    # which is what keeps it out of the middle of somebody else's transaction.
+    assert manager.writer.written == []
+
+
+async def test_a_blocked_write_on_the_registration_probe_is_a_miss_not_a_hang():
+    """The second question the heartbeat asks needs the same bound as the
+    first. It is written the same way and under the same lock, so a modem
+    that stops accepting bytes between the two probes blocks this one
+    instead - and a bound on the first alone would leave the loop hanging one
+    step further along."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99  # the liveness path must not be what raises
+    manager.registration_failures = 2
+    manager.registration_check = True  # the question this test is about
+
+    async def answer(command):
+        if command == b"AT+CSQ\r\n":
+            manager._probe_event.set()
+
+    manager.writer = FlowControlledWriter(blocked="AT+CREG?", answer=answer)
+
+    message = await _heartbeat_must_give_up(manager, "the write of AT+CREG?")
+
+    assert "registered" in message
+
+
+async def test_a_probe_cancelled_while_writing_leaves_the_lock_free():
+    """The deadline is only half of it. A probe that gave up while still
+    holding the port would hand the next probe, and every send after it, a
+    lock nothing will ever release: a bounded probe that deadlocks the whole
+    component instead of merely hanging itself."""
+    manager = _make()
+    manager.probe_timeout = 0.01
+    manager.writer = FlowControlledWriter(blocked="AT+CSQ")
+
+    gave_up = await _probe_must_finish(
+        manager, "AT+CSQ", manager._probe_event, "the write of AT+CSQ"
+    )
+    assert gave_up is False
+    assert manager._at_lock.locked() is False
+
+    # Not merely unlocked but usable: the next probe takes the port and is
+    # answered through it.
+    async def answer(command):
+        manager._probe_event.set()
+
+    manager.writer = FlowControlledWriter(answer=answer)
+    answered = await _probe_must_finish(
+        manager, "AT+CSQ", manager._probe_event, "the lock the last probe held"
+    )
+    assert answered is True
+
+
+async def test_a_probe_cancelled_while_waiting_for_the_lock_leaves_it_to_its_holder():
+    """Giving up on the lock must take nothing away from whoever holds it. A
+    probe that released a lock it never acquired would drop the next writer
+    into the middle of a send, where every byte written becomes part of the
+    outgoing message."""
+    manager = _make()
+    manager.probe_timeout = 0.01
+    await manager._at_lock.acquire()
+
+    gave_up = await _probe_must_finish(
+        manager, "AT+CSQ", manager._probe_event, "the AT lock"
+    )
+    assert gave_up is False
+    assert manager._at_lock.locked() is True
+    assert manager.writer.written == []
+
+    manager._at_lock.release()
+    assert manager._at_lock.locked() is False
+
+
+async def test_an_answered_probe_still_takes_the_port_and_gives_it_back():
+    """The bound must cost the ordinary case nothing. The command still goes
+    out under the lock, the reply still ends the wait, and the port is handed
+    back as soon as the write is done rather than kept for the whole deadline:
+    a probe holding it until its reply arrives would put every send behind
+    every probe, and a send that lost that race would wait out a deadline of
+    its own for a message the modem never saw."""
+    manager = _make()
+    manager.probe_timeout = 5.0
+    held_while_writing = []
+    held_while_waiting = []
+
+    async def reply():
+        # Runs once the probe is waiting for its answer, which is where the
+        # port has to be free again.
+        held_while_waiting.append(manager._at_lock.locked())
+        await manager.process_message(b"+CSQ: 21,99\r\n")
+
+    async def answer(command):
+        held_while_writing.append(manager._at_lock.locked())
+        asyncio.create_task(reply())
+
+    manager.writer = FlowControlledWriter(answer=answer)
+
+    answered = await _probe_must_finish(
+        manager, "AT+CSQ", manager._probe_event, "a reply that had already arrived"
+    )
+    assert answered is True
+    assert manager.writer.written == [b"AT+CSQ\r\n"]
+    assert held_while_writing == [True]
+    assert held_while_waiting == [False]
+    assert manager._at_lock.locked() is False
+
+
+# How long a wait that is meant never to finish waits for. Nothing reaches it:
+# whatever is parked on it is cancelled by the test that parked it. It exists
+# so a test ends on a condition the test controls rather than on a deadline
+# elapsing, which no assertion could then be sure of having beaten.
+_PARKED = 3600
+
+
+def _answering_modem(manager, replies):
+    """Answer the heartbeat's probes, one registration reading at a time.
+
+    The registration check is switched on here, because it ships off and every
+    test using this helper is a test of what the check does once an operator
+    has turned it on. Turning the default off must not quietly delete that
+    coverage: with this line removed, every test below would stop asking the
+    question and the assertions counting AT+CREG? would fail rather than pass
+    vacuously.
+
+    Every AT+CSQ is answered, so the liveness path can never be what decides
+    the outcome of a test about registration. Each AT+CREG? is answered with
+    the next entry of `replies`, fed through the real routing path so it is
+    parsed exactly as a modem's line would be; an entry of None is a probe the
+    modem does not answer at all.
+
+    Once the entries run out the returned event is set and the probe parks
+    rather than answering, so a test that has seen every round it scripted
+    ends the loop itself instead of racing a deadline. Parking now needs the
+    probe's deadline lifted first, because that deadline covers the whole
+    probe: left at the value the test chose to make an unanswered probe give
+    up quickly, it would end the parked probe too and count a miss no test
+    wrote. The deadline is lifted a step early, at the liveness probe of the
+    unscripted round, because _probe_once reads it before this responder is
+    called.
+
+    :return: the commands as they are sent, and the event announcing that the
+        scripted rounds are over.
+    """
+    manager.registration_check = True
+    remaining = list(replies)
+    sent = []
+    exhausted = asyncio.Event()
+
+    async def respond(command):
+        sent.append(command)
+        if command == "AT+CSQ":
+            if not remaining:
+                manager.probe_timeout = _PARKED
+            manager._probe_event.set()
+            return
+        if not remaining:
+            exhausted.set()
+            await asyncio.sleep(_PARKED)
+            return
+        line = remaining.pop(0)
+        if line is not None:
+            await manager.process_message(line)
+
+    manager.send_at_command_async = respond
+    return sent, exhausted
+
+
+async def test_the_heartbeat_gives_up_on_a_modem_that_is_not_on_the_network():
+    """AT+CSQ proves the modem answers; it does not prove a message can reach
+    it. A SIM the carrier has detached keeps answering exactly as before while
+    nothing arrives, so the liveness probe is answered throughout this test and
+    only the registration state can decide it."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99  # the liveness path must not be what raises
+    manager.registration_failures = 3
+    # Not registered, searching for an operator.
+    sent, _ = _answering_modem(manager, [b"+CREG: 2,2"] * 10)
+
+    with pytest.raises(RuntimeError, match="registered"):
+        await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+
+    # Given up on the third consecutive reading: not before, and not later.
+    assert sent.count("AT+CREG?") == 3
+
+
+async def test_a_registered_reply_clears_the_deregistration_count():
+    """Registration dips as a modem moves between cells and comes back on its
+    own. Only a run of readings means the SIM is no longer attached, so one
+    reply saying registered has to put the count back to zero."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 3
+    # Searching, searching, registered, searching, searching: five readings
+    # that are never three in a row.
+    sent, exhausted = _answering_modem(manager, [
+        b"+CREG: 2,2", b"+CREG: 2,2", b"+CREG: 2,1", b"+CREG: 2,2", b"+CREG: 2,2",
+    ])
+
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(exhausted.wait(), timeout=2.0)
+        assert task.done() is False
+        # The two after the registered reply, not the four before it.
+        assert manager.registration_misses == 2
+        assert sent.count("AT+CREG?") == 6
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_roaming_counts_as_being_on_the_network():
+    """5 is a modem registered on an operator that is not its own, and it
+    receives messages exactly as the home network does. Counting it as a
+    failure would restart the session every few minutes on a travelling SIM."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    sent, exhausted = _answering_modem(manager, [b"+CREG: 2,5"] * 3)
+
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(exhausted.wait(), timeout=2.0)
+        assert task.done() is False
+        assert manager.registration_misses == 0
+        assert sent.count("AT+CREG?") == 4
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_an_unanswered_registration_probe_is_not_read_as_registered():
+    """Silence is not an answer, and the reply that did arrive belongs to the
+    round it arrived in. A modem that stops answering AT+CREG? while still
+    answering AT+CSQ is precisely the failure this probe exists to catch, so
+    reading the last known state again would keep the count at zero for ever
+    and hide it."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    sent, _ = _answering_modem(manager, [b"+CREG: 2,1", None, None])
+
+    with pytest.raises(RuntimeError, match="registered"):
+        await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+
+    assert sent.count("AT+CREG?") == 3
+
+
+async def test_the_deregistration_count_does_not_cross_a_session():
+    """This loop runs once per session, and the count belongs to the session.
+    Readings taken through a connection that has since been torn down say
+    nothing about the one that replaced it: carried over, they would give a
+    modem that has just reconnected a single probe to prove itself before the
+    new session was dropped too."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    manager.registration_misses = 1  # left behind by a session that has ended
+
+    sent, exhausted = _answering_modem(manager, [b"+CREG: 2,0", b"+CREG: 2,1"])
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(exhausted.wait(), timeout=2.0)
+        # The first reading of this session is its first miss, not its second.
+        assert task.done() is False
+        assert manager.registration_misses == 0
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_a_timed_out_probe_clears_the_published_registration_state():
+    """The snapshot is where the state is read from outside the process, and
+    it is read precisely while the count is climbing. Leaving the last reading
+    in it would show a modem on the network for the whole time the loop spends
+    giving up on one that has gone silent, which hides the failure the
+    snapshot exists to expose."""
+    health = HealthState(["device", "telegram"])
+    manager = DeviceManager(_noop_callback, health=health, port="/hostdev/ttyUSB2")
+    manager.writer = FakeWriter()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    _answering_modem(manager, [b"+CREG: 2,1", None, None])
+
+    assert health.snapshot()["registration"] is None
+    with pytest.raises(RuntimeError, match="registered"):
+        await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+
+    assert health.snapshot()["registration"] is None
+
+
+async def test_registration_for_messages_only_counts_as_being_on_the_network():
+    """6 and 7 are a network that granted the modem an association for
+    messages and nothing else, which is the most registered it can be for a
+    service that only carries messages. Counting them as failures would cycle
+    the radio for ever on a network that attaches this way, in both the shape
+    that leads with <n> and the shape that leads with the state."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    sent, exhausted = _answering_modem(manager, [
+        b"+CREG: 2,6",                     # reply: messages only, home
+        b'+CREG: 6,"2AF3","0123ABC",7',    # report: the same state
+        b"+CREG: 2,7",                     # reply: messages only, roaming
+    ])
+
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(exhausted.wait(), timeout=2.0)
+        assert task.done() is False
+        assert manager.registration_misses == 0
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_an_emergency_only_attach_does_not_count_as_being_on_the_network():
+    """The boundary on the other side of 6 and 7. 8 is a modem attached for
+    emergency bearer services alone: it is on a network and no ordinary
+    message can reach it, which is exactly the condition this probe exists to
+    report."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    sent, _ = _answering_modem(manager, [b"+CREG: 2,8"] * 5)
+
+    with pytest.raises(RuntimeError, match="registered"):
+        await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+
+    assert sent.count("AT+CREG?") == 2
+
+
+async def test_the_off_network_warning_names_one_state_and_one_count():
+    """The line an operator greps for, and the only place the reason appears.
+    A description carrying a comma of its own inside a parenthesised list
+    reads as two fields plus a count as a third, so nothing in the line may
+    use the separator that divides its parts."""
+    from module import device_manager as dm_module
+
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    _answering_modem(manager, [b"+CREG: 2,2"] * 5)
+
+    with _LogCapture(dm_module) as captured:
+        with pytest.raises(RuntimeError, match="registered"):
+            await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+
+    warnings = [
+        record.getMessage() for record in captured.records
+        if record.levelno >= logging.WARNING and "not on the network" in record.getMessage()
+    ]
+    assert len(warnings) == 2, warnings
+    # Both halves are there: why, and for how long.
+    assert "searching" in warnings[0], warnings
+    assert "1 in a row" in warnings[0], warnings
+    assert "2 in a row" in warnings[1], warnings
+    # And neither half can be mistaken for the other, or for a third field.
+    assert "," not in warnings[0], warnings
+
+
+async def test_a_stock_start_asks_the_liveness_question_and_nothing_else():
+    """What an unconfigured deployment does, asserted through the real config
+    default rather than a value the test chose.
+
+    The check ships off, so the heartbeat asks AT+CSQ and stops there. Nothing
+    about the modem's registration is asked, no reading is counted, and a
+    network that cannot answer the question truthfully cannot end a session
+    over it.
+    """
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    # Straight from config, untouched: this is the assertion that fails if the
+    # default is flipped back without the reasoning that flipped it off.
+    assert manager.registration_check is False
+
+    probes = []
+    settled = asyncio.Event()
+
+    async def fake_probe(command):
+        probes.append(command)
+        manager._probe_event.set()
+        if len(probes) >= 5:
+            settled.set()
+
+    manager.send_at_command_async = fake_probe
+
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(settled.wait(), timeout=2.0)
+        assert task.done() is False
+        assert probes == ["AT+CSQ"] * 5
+        assert manager.registration_misses == 0
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_the_registration_check_can_be_switched_off():
+    """A network that attaches the modem for data alone, with messages
+    arriving over a path this question does not describe, has no true answer
+    to give it. An operator who enabled the check and then saw that must be
+    able to stop asking without waiting for a release, and without the radio
+    being reinitialised every few minutes in the meantime."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    manager.registration_failures = 2
+    manager.registration_check = False
+
+    probes = []
+    settled = asyncio.Event()
+
+    async def fake_probe(command):
+        probes.append(command)
+        manager._probe_event.set()
+        if len(probes) >= 5:
+            settled.set()
+
+    manager.send_at_command_async = fake_probe
+
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(settled.wait(), timeout=2.0)
+        # Five rounds is more than the threshold, and the modem answered
+        # nothing about registration in any of them.
+        assert task.done() is False
+        assert probes == ["AT+CSQ"] * 5
+        assert manager.registration_misses == 0
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_the_registration_check_is_switched_off_separately_from_its_threshold(
+    monkeypatch,
+):
+    """A switch and a count are deliberately two settings. Folding the switch
+    into the count would let an operator raising the threshold disable the
+    guard by accident, which is why the count keeps a floor it cannot be
+    tuned below.
+
+    The switch defaults to off, and an unset environment must read the same as
+    an explicit no. What the check asks cannot be answered truthfully on every
+    network, and where it cannot the misreading ends a session on a timescale
+    longer than the one a session takes to count as recovered - so each cycle
+    resets what the watchdog measures and the loop registers nowhere. Enabling
+    it is a decision to take per SIM, once the state that modem reports is
+    known.
+    """
+    import importlib
+
+    original = config.MODEM_REGISTRATION_CHECK
+    try:
+        monkeypatch.delenv("MODEM_REGISTRATION_CHECK", raising=False)
+        assert importlib.reload(config).MODEM_REGISTRATION_CHECK is False
+
+        for value in ("0", "false", "no", "off"):
+            monkeypatch.setenv("MODEM_REGISTRATION_CHECK", value)
+            reloaded = importlib.reload(config)
+            assert reloaded.MODEM_REGISTRATION_CHECK is False, value
+            # Switching the check off does not lower the floor on the count.
+            assert reloaded.MODEM_REGISTRATION_FAILURES >= 2
+
+        # And the opt-in still works, from every spelling an operator is
+        # likely to reach for: a default of off would be worth nothing if
+        # turning it on were unreachable.
+        for value in ("1", "true", "yes", "on"):
+            monkeypatch.setenv("MODEM_REGISTRATION_CHECK", value)
+            assert importlib.reload(config).MODEM_REGISTRATION_CHECK is True, value
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    assert config.MODEM_REGISTRATION_CHECK == original
+
+
 async def test_run_parks_while_the_modem_keeps_answering():
     """The supervisor treats a run body that returns as a failed session, and a
     session shorter than SERVICE_STABLE_SECONDS as flapping. A healthy run must
     therefore never end, while its heartbeat keeps going underneath it."""
     manager = _make([])
     manager._sleep = _no_delay
+    manager.registration_check = True  # both questions, as the longer round
     probes = []
     settled = asyncio.Event()
 
     async def fake_probe(command):
+        if command == "AT+CREG?":
+            # Answering both probes is what a healthy modem does; a run body
+            # that ends because one of them went unanswered would prove
+            # nothing about the case this test is making.
+            await manager.process_message(b"+CREG: 2,1")
+            return
         probes.append(command)
         manager._probe_event.set()
         if len(probes) >= 3:
@@ -1287,7 +2077,14 @@ async def test_the_send_path_holds_the_port_across_the_prompt_window():
 
 async def test_the_heartbeat_waits_for_the_port_to_be_free():
     """The probe is the second writer this component gained. It must queue
-    behind a message being sent rather than writing into the middle of it."""
+    behind a message being sent rather than writing into the middle of it.
+
+    Queueing is bounded now: a probe that does not reach the port within its
+    deadline gives up and asks again next round rather than waiting for ever,
+    because a send whose own write has blocked never gives the port back. What
+    is unchanged, and is what this asserts, is that nothing is written while
+    somebody else holds it.
+    """
     manager = _make()
     manager._sleep = _no_delay
     manager.probe_timeout = 0.01
@@ -1386,6 +2183,220 @@ async def test_teardown_without_a_connection_does_nothing():
     assert manager.writer is None
 
 
+class WedgedPort:
+    """The port behind a transport that has stopped accepting bytes.
+
+    Two of its calls matter here and they are opposites. flush() waits for the
+    kernel's own output queue to empty and carries no deadline; on a queue that
+    is not moving it never returns, and it is called on whichever thread asked
+    for it. reset_output_buffer() discards that queue and returns at once.
+    """
+
+    def __init__(self, calls):
+        # Bytes the file descriptor refused, which is the only reason the
+        # transport still holds any - and so the only reason its close could
+        # not complete in the first place.
+        self.queued = True
+        self.discarded = False
+        self.parked = False
+        self.closed = False
+        self.calls = calls
+
+    def reset_output_buffer(self):
+        self.calls.append("discard")
+        self.queued = False
+        self.discarded = True
+
+    def flush(self):
+        if self.queued:
+            # Recorded rather than reproduced. Really parking here would park
+            # the thread running this test, and with it the event loop and the
+            # rest of the suite; what a caller can observe is the same either
+            # way, which is that nothing after this point ever runs.
+            self.parked = True
+
+    def close(self):
+        self.closed = True
+
+
+class UnflushableWriter(FakeWriter):
+    """A port whose close can never complete, and the transport behind it.
+
+    A transport finishes a close only once its own write buffer has drained,
+    and leaves it to the write path to report that it has. A port that has
+    stopped accepting bytes never reports it and raises nothing: the bytes are
+    merely queued behind flow control.
+
+    abort() is the way out, but it only forces the *rest* of the close to be
+    scheduled - and that remainder begins by flushing the port, which is the
+    call that waits for the very queue that is not moving. So an abort issued
+    without discarding the queue first hands the wait to the event loop
+    instead of to one task.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.aborted = False
+        self.connection_lost = False
+        self.calls = []
+        self.serial = WedgedPort(self.calls)
+        # A StreamWriter exposes the transport this reaches for; here the two
+        # are the same object.
+        self.transport = self
+
+    async def wait_closed(self):
+        await asyncio.Event().wait()
+
+    def abort(self):
+        self.aborted = True
+        self.calls.append("abort")
+        # The real one schedules the remainder for the next loop iteration.
+        asyncio.get_running_loop().call_soon(self._finish_closing)
+
+    def _finish_closing(self):
+        self.serial.flush()
+        if self.serial.parked:
+            return  # The real transport does not reach its next line either.
+        self.connection_lost = True
+        self.serial.close()
+
+
+async def _teardown_must_return(manager) -> None:
+    """Tear the connection down, and fail rather than hang if it will not end.
+
+    The deadline protects the suite rather than the component: without it a
+    regression here does not fail, it stops the run, and a stuck run says
+    nothing about which test stuck it.
+    """
+    try:
+        await asyncio.wait_for(manager.teardown(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail(
+            "teardown never returned: closing a port that has stopped "
+            "accepting bytes is unbounded"
+        )
+
+
+async def test_teardown_gives_up_on_a_port_that_will_not_close(monkeypatch):
+    """The heartbeat detects a wedged modem in a minute or two and ends the
+    session, and then the teardown that follows waits for a close that can
+    never complete. Nothing raises, so the guard around it never fires, and by
+    then the component is marked down - which is the one state the stall
+    criterion deliberately keeps off. Detection would lead to a process parked
+    in teardown until the down tolerance ran out, an hour later.
+
+    The bound belongs here rather than in the supervisor, which cannot tell a
+    slow teardown from a slow session body and holds no transport to abort.
+    """
+    monkeypatch.setattr(config, "SERIAL_CLOSE_TIMEOUT", 0.01)
+    manager = _make()
+    writer = UnflushableWriter()
+    manager.writer = writer
+    # What makes _flushed() false at close in the first place: the probe that
+    # noticed the modem had gone quiet left its command in the buffer.
+    writer.written.append(b"AT+CSQ\r\n")
+
+    await _teardown_must_return(manager)
+
+    assert writer.aborted is True
+    assert manager.writer is None
+
+
+async def test_the_abort_leaves_the_transport_nothing_to_wait_for(monkeypatch):
+    """Forcing the close is not the whole of it. What the abort schedules
+    begins by flushing the port, and flushing waits for the kernel's output
+    queue - the queue that is not moving, which is why the close needed forcing
+    at all. That wait runs on the event loop rather than on one task, so it
+    parks the watchdog, the reconnect and the signal handler together, and a
+    process that cannot exit is not restarted by any policy outside it.
+
+    Discarding the queue first is what leaves the flush nothing to wait for.
+    """
+    monkeypatch.setattr(config, "SERIAL_CLOSE_TIMEOUT", 0.01)
+    manager = _make()
+    writer = UnflushableWriter()
+    manager.writer = writer
+
+    await _teardown_must_return(manager)
+    # The transport completes the close on the next iteration, as the real one
+    # does; nothing before this point could have run it.
+    await asyncio.sleep(0)
+
+    assert writer.serial.parked is False, (
+        "the flush inside the abort waited for a queue that is not moving, "
+        "which parks the event loop rather than one task"
+    )
+    assert writer.connection_lost is True
+    assert writer.serial.closed is True
+    # Ordered, not merely both present. The abort schedules the flush rather
+    # than performing it, so today the two happen to work either way round;
+    # pinning the order is what keeps that true if anything is ever awaited
+    # between them, which would let the flush run first.
+    assert writer.calls == ["discard", "abort"]
+
+
+async def test_the_port_can_be_reopened_after_a_close_that_never_completed(monkeypatch):
+    """Returning is only half of it. The supervisor reconnects straight after a
+    teardown, so the point of aborting is that the close really does run to the
+    end and the next attempt finds the port free rather than still held by a
+    transport that is waiting to flush it.
+    """
+    from module import device_manager as dm_module
+
+    monkeypatch.setattr(config, "SERIAL_CLOSE_TIMEOUT", 0.01)
+    manager = _make()
+    writer = UnflushableWriter()
+    manager.writer = writer
+    await _teardown_must_return(manager)
+    await asyncio.sleep(0)
+
+    # The port was actually given back, rather than teardown merely returning.
+    assert writer.connection_lost is True
+    assert writer.serial.closed is True
+
+    reopened = FakeWriter()
+
+    async def fake_open(url, baudrate):
+        return FakeReader([b"OK\r\n"]), reopened
+
+    monkeypatch.setattr(
+        dm_module.serial_asyncio, "open_serial_connection", fake_open
+    )
+    manager._port_exists = lambda path: True
+    manager.setup_sms = _noop_callback
+
+    await asyncio.wait_for(manager.connect_once(), timeout=2.0)
+    assert manager.writer is reopened
+
+
+async def test_a_port_that_closes_normally_is_not_aborted():
+    """Aborting discards whatever the transport still holds, so it must be the
+    escalation and never the ordinary path."""
+    manager = _make()
+    writer = UnflushableWriter()
+
+    async def closes_cleanly():
+        return None
+
+    writer.wait_closed = closes_cleanly
+    manager.writer = writer
+
+    await _teardown_must_return(manager)
+    assert writer.closed is True
+    assert writer.aborted is False
+
+
+def test_the_serial_close_deadline_has_a_floor(monkeypatch):
+    """Zero would abort every ordinary disconnect before the transport had a
+    chance to flush, which is the opposite of what the deadline is for."""
+    monkeypatch.setenv("SERIAL_CLOSE_TIMEOUT", "0")
+    try:
+        assert importlib.reload(config).SERIAL_CLOSE_TIMEOUT >= 1.0
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+
 async def test_teardown_does_not_raise_when_closing_fails():
     manager = _make()
 
@@ -1431,6 +2442,63 @@ async def test_a_notify_failure_cannot_break_the_device_path():
     manager.notify = failing_notify
     await manager.teardown()
     assert manager.writer is None
+
+
+def test_the_write_cannot_start_swallowing_cancellations():
+    """The property in send_at_command_async that a widening edit could undo in
+    silence, guarded on the shape of the code rather than on behaviour.
+
+    The heartbeat's deadline works by cancelling the probe, and a cancelled
+    probe has to leave through this method rather than be caught in it: a
+    handler that swallowed the cancellation would turn that bound back into the
+    hang it was written to remove. The guard here is narrow only because
+    CancelledError derives from BaseException while the handler below catches
+    Exception - a distinction one word wide, and one that no behavioural test
+    can object to until the day it is edited away. Handling the cancellation
+    explicitly is what makes widening the handler visibly wrong.
+    """
+    from module import device_manager as dm_module
+
+    tree = ast.parse(pathlib.Path(dm_module.__file__).read_text())
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "send_at_command_async"
+    )
+    # Anchored to the try that guards the drain, not to whichever try comes
+    # first in the method. Taking the first would let a second, unrelated try
+    # satisfy this while the drain's own handler went on swallowing the
+    # cancellation - the guard would pass on exactly the code it exists to
+    # reject. Only the body is searched, so a handler mentioning drain cannot
+    # nominate its own try.
+    guarded = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(inner, ast.Call)
+            and (dotted_name(inner.func) or "").endswith(".drain")
+            for statement in node.body
+            for inner in ast.walk(statement)
+        )
+    ]
+
+    assert len(guarded) == 1, (
+        "the drain is not guarded by exactly one try, so which handlers "
+        "protect it can no longer be read off"
+    )
+    handlers = guarded[0].handlers
+    assert handlers, "the write around which this property exists is gone"
+    first = handlers[0]
+    assert dotted_name(first.type) in ("asyncio.CancelledError", "CancelledError"), (
+        "a cancellation must be handled before anything broader can catch it"
+    )
+    assert len(first.body) == 1 and isinstance(first.body[0], ast.Raise), (
+        "the cancellation handler must do nothing but re-raise"
+    )
+    assert first.body[0].exc is None, (
+        "the cancellation must be re-raised as it arrived"
+    )
 
 
 async def test_obsolete_methods_are_gone():
