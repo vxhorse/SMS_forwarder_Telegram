@@ -95,6 +95,18 @@ MODEM_PROBE_INTERVAL = max(1.0, min(
 MODEM_PROBE_TIMEOUT = float(os.getenv("MODEM_PROBE_TIMEOUT", "5.0"))
 MODEM_PROBE_FAILURES = int(os.getenv("MODEM_PROBE_FAILURES", "3"))
 
+# Consecutive heartbeat readings of "not on the network" before the connection
+# counts as failed.
+#
+# The liveness probe above proves the modem answers, which is not the same as
+# proving a message can reach it: a SIM the network has detached answers every
+# command exactly as before while nothing arrives. Registration also dips for a
+# moment whenever a modem hands over between cells, so one reading is not
+# evidence of anything and only a run of them means the radio is not attached.
+# Floored at two for that reason, and because zero would switch the check off
+# while looking like a setting.
+MODEM_REGISTRATION_FAILURES = max(2, int(os.getenv("MODEM_REGISTRATION_FAILURES", "3")))
+
 # The longest gap the heartbeat can legitimately leave between two refreshes of
 # the health snapshot. A missed probe costs its whole interval plus the deadline
 # it waits for a reply, and MODEM_PROBE_FAILURES of them in a row have to pass

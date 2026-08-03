@@ -62,6 +62,7 @@ Three are slow enough to get a longer deadline
 | `AT` | Port discovery, and the handshake right after the port opens | Bare command. A port that answers `OK` is the module's AT port, and a module that answers has finished starting |
 | `AT+CMGL=4` | The stored-message drain, at step 13 above | List every message already in the store, so messages that arrived while the process was down are forwarded before step 14 erases them |
 | `AT+CSQ` | The liveness heartbeat, every `MODEM_PROBE_INTERVAL` | Signal quality. Asking a question the module must answer is the only way to tell a live module from an open port behind a wedged one |
+| `AT+CREG?` | The same heartbeat, after each answered `AT+CSQ` | Network registration state. Answering proves the module is alive, not that it is attached to a network: a SIM the carrier has detached answers every command exactly as before while no message can arrive |
 | `AT+CMGS=<length>` | The send path | Announce an outgoing PDU of that length. The module answers with a prompt, the hex PDU is written, and Ctrl+Z (0x1A) submits it |
 
 ## Responses and URCs this project reads
@@ -74,7 +75,7 @@ Three are slow enough to get a longer deadline
 | `+CMGL:` | One entry of a stored-message listing; its PDU follows on the next line |
 | `+CMGS:` | The module accepted an outgoing message, and reports its reference number |
 | `+CSQ:` | Signal quality reply, which is also the heartbeat's proof of life |
-| `+CREG:` | Network registration state |
+| `+CREG:` | Network registration state, in either of its two shapes: `+CREG: <n>,<stat>[,<lac>,<ci>[,<AcT>]]` in answer to `AT+CREG?`, and `+CREG: <stat>[,<lac>,<ci>[,<AcT>]]` when the module reports a change by itself. `<stat>` is 1 registered at home and 5 registered while roaming; under any other value a message cannot be delivered |
 
 Any other line is logged as an unhandled line and otherwise ignored. Nothing in
 this project writes a message body to the log, so an unrecognised line is
