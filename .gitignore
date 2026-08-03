@@ -23,6 +23,9 @@ logs/
 *.tgz
 docker-compose.yml
 docker-compose.yaml
+# Backups of the local compose file carry the same credentials it does.
+docker-compose.yml.bak-*
+docker-compose.yaml.bak-*
 
 # System files
 .DS_Store
