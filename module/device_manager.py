@@ -104,22 +104,53 @@ def _mask_number(number: Any) -> str:
     return f"…{text[-_NUMBER_SUFFIX_LENGTH:]}"
 
 
-# What the modem reports about its network registration.
+# What the modem reports about its network registration, and which of those
+# reports mean a message can arrive.
 #
-# 1 is registered on the home network and 5 is registered while roaming. There
-# is no third state in which a message can be delivered: 0 is not registered,
-# 2 is still searching for an operator, 3 is a registration the network
-# refused, and 4 is a state the modem cannot describe. Under every one of them
-# the radio is not attached and nothing can arrive.
-_REGISTERED_STATES = frozenset({1, 5})
+# 1 and 5 are registered outright, at home and while roaming. 6 and 7 are the
+# same two cases limited to messages alone - a network that granted the module
+# an association for messaging without the rest - which for a service that
+# carries nothing but messages is as attached as it needs to be, so counting
+# them as failures would cycle the radio for ever on a network that attaches
+# this way. They are not in every module's table, since 3GPP TS 27.007 added
+# them later than the rest, and accepting a value a module never emits costs
+# nothing.
+#
+# Everything else means nothing can arrive: 0 not registered, 2 still
+# searching, 3 refused by the network, 4 a state the module cannot describe,
+# and 8 attached for emergency bearer services alone - on a network, and
+# reachable by no ordinary message, which is exactly the condition this check
+# exists to report.
+#
+# Known limitation, for whoever needs the check to be right on a network it is
+# currently wrong about. +CREG describes the circuit-switched domain only. A
+# module attached for packet service alone, delivering messages over a path
+# that domain does not describe, reports one of the unregistered states here
+# while every message arrives - and on firmware predating the addition of 6
+# and 7 there is no state that expresses it either, so those two do not cover
+# the case. The complete answer is to ask +CGREG and +CEREG as well, on the
+# failing path only, and to count a miss only when every domain agrees. Two
+# things make that more than a copy of this code: process_message routes
+# +CREG: alone, so those replies currently fall through to the unhandled
+# branch and never reach a parser; and 27.007 allows their <n> to range up to
+# 5, which destroys the rule _registration_state_index relies on - that a
+# leading value above 2 cannot be an <n> - so they need a shape rule of their
+# own rather than this one. Until then MODEM_REGISTRATION_CHECK is the way out.
+_REGISTERED_STATES = frozenset({1, 5, 6, 7})
 
+# No description carries a comma. They are interpolated into lines that
+# separate their own fields with one, and a state that arrived with a comma
+# inside it would read as two fields and turn the count beside it into a third.
 _REGISTRATION_DESCRIPTIONS = {
     0: "not registered",
-    1: "registered, home network",
-    2: "not registered, searching",
+    1: "registered on the home network",
+    2: "not registered - searching",
     3: "registration denied",
     4: "unknown",
-    5: "registered, roaming",
+    5: "registered while roaming",
+    6: "registered for messages only on the home network",
+    7: "registered for messages only while roaming",
+    8: "attached for emergency bearer services only",
 }
 
 # The values <n> can take: whether the modem reports registration changes by
@@ -412,6 +443,7 @@ class DeviceManager:
         # Set whenever a +CSQ reply arrives, which is what proves the modem is
         # still answering rather than merely still connected.
         self._probe_event = asyncio.Event()
+        self.registration_check = config.MODEM_REGISTRATION_CHECK
         self.registration_failures = config.MODEM_REGISTRATION_FAILURES
         # Consecutive probes that found the modem off the network.
         self.registration_misses = 0
@@ -656,9 +688,9 @@ class DeviceManager:
         sending path; the signal strength it returns is useful diagnostically.
 
         Answering is only half of what has to be true, so each answered probe
-        is followed by AT+CREG?. A modem that has been detached from the
-        network answers every command exactly as it did before while not one
-        message can reach it - the same silent failure as a wedged modem,
+        is followed by _probe_registration. A modem that has been detached from
+        the network answers every command exactly as it did before while not
+        one message can reach it - the same silent failure as a wedged modem,
         arrived at by a different route, and invisible to a probe that asks
         only whether the modem is still talking.
         """
@@ -685,41 +717,8 @@ class DeviceManager:
             # modem is normal, only a run of them means it has gone quiet.
             failures = 0
 
-            # The state is discarded before the question is asked, so what the
-            # wait leaves behind is a reading taken in this round or nothing
-            # at all. Carrying the previous round's reading forward would let
-            # one report of being registered stand in for every probe after
-            # it, which is exactly the silence this is looking for.
-            self._registration_state = None
-            self._registration_event.clear()
-            async with self._at_lock:
-                await self.send_at_command_async("AT+CREG?")
-            try:
-                await asyncio.wait_for(
-                    self._registration_event.wait(), timeout=self.probe_timeout
-                )
-            except asyncio.TimeoutError:
-                # No reading, which is not the same as a reading that says the
-                # modem is registered, and must not be counted as one.
-                pass
-
-            if self._registration_state in _REGISTERED_STATES:
-                # Registration dips while a modem hands over between cells and
-                # comes back by itself, so one reading clears the count for
-                # the same reason a single answered probe clears the other.
-                self.registration_misses = 0
-            else:
-                self.registration_misses += 1
-                logger.warning(
-                    f"Modem is not on the network "
-                    f"({_describe_registration(self._registration_state)}, "
-                    f"{self.registration_misses} in a row)"
-                )
-                if self.registration_misses >= self.registration_failures:
-                    raise RuntimeError(
-                        f"Modem was not registered on the network for "
-                        f"{self.registration_misses} consecutive checks"
-                    )
+            if self.registration_check:
+                await self._probe_registration()
 
             if self.health is not None:
                 # Keep the snapshot file fresh so the container healthcheck can
@@ -727,6 +726,67 @@ class DeviceManager:
                 # mark_up(): see Supervisor._serve_session for why that decision
                 # cannot be made from inside a component's own loop.
                 self.health.refresh_file()
+
+    async def _probe_registration(self) -> None:
+        """Ask whether the modem is on a network, and act on a run of noes.
+
+        Raises once registration_failures consecutive probes have failed to
+        find it there, which ends the session and hands the decision to the
+        supervisor - the same shape, and the same reasoning, as the liveness
+        count in the caller.
+
+        Every state that is not registered is counted alike, including the one
+        the network refused. There is exactly one remedy available from here,
+        and reaching for it sooner because a refusal looks permanent would only
+        reinitialise the radio more often without making it likelier to be
+        accepted; a refusal during an attach that the next attempt completes is
+        ordinary. What distinguishes a passing condition from a lasting one is
+        that it passes, which is what the count measures. Which state it was is
+        named in the warning, so a refusal can still be told from a search by
+        whoever reads it.
+        """
+        # The state is discarded before the question is asked, so what the wait
+        # leaves behind is a reading taken in this round or nothing at all.
+        # Carrying the previous round's reading forward would let one report of
+        # being registered stand in for every probe after it, which is exactly
+        # the silence this is looking for.
+        self._registration_state = None
+        self._registration_event.clear()
+        async with self._at_lock:
+            await self.send_at_command_async("AT+CREG?")
+        try:
+            await asyncio.wait_for(
+                self._registration_event.wait(), timeout=self.probe_timeout
+            )
+        except asyncio.TimeoutError:
+            # No reading, which is not the same as a reading that says the
+            # modem is registered, and must not be counted as one. What was
+            # published goes with it: the snapshot is read from outside this
+            # process precisely while the count is climbing, and a stale
+            # reading left in it would describe a modem as on the network for
+            # the whole time this loop spends giving up on one that went quiet.
+            if self.health is not None:
+                self.health.record_registration(None)
+
+        if self._registration_state in _REGISTERED_STATES:
+            # Registration dips while a modem hands over between cells and
+            # comes back by itself, so one reading clears the count for the
+            # same reason a single answered probe clears the other.
+            self.registration_misses = 0
+            return
+
+        self.registration_misses += 1
+        # The count and the state are divided by something neither of them can
+        # contain, so the line cannot be read as three things.
+        logger.warning(
+            f"Modem is not on the network ({self.registration_misses} in a row): "
+            f"{_describe_registration(self._registration_state)}"
+        )
+        if self.registration_misses >= self.registration_failures:
+            raise RuntimeError(
+                f"Modem was not registered on the network for "
+                f"{self.registration_misses} consecutive checks"
+            )
 
     async def setup_sms(self) -> None:
         """Run the initialisation sequence, waiting for each response.
