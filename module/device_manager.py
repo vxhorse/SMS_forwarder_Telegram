@@ -59,6 +59,28 @@ def _describe_line(message: bytes) -> str:
     return f"{prefix}[{len(message)} bytes]"
 
 
+# How many trailing characters of a number a log line may keep. Four is enough
+# to tell concurrent conversations apart and short enough that the remaining
+# digits cannot be reconstructed from the log.
+_NUMBER_SUFFIX_LENGTH = 4
+
+
+def _mask_number(number: Any) -> str:
+    """Reduce a phone number to a suffix that identifies nobody.
+
+    The whole diagnostic value of a number in a log is distinguishing one
+    conversation from another, and a fixed suffix does that. The full number
+    does more: it names a person or an institution, and paired with the
+    timestamp printed beside it the log becomes a record of who messages this
+    SIM and when. The leading marker is always present so a masked number can
+    never be read as a complete one.
+    """
+    text = str(number) if number is not None else ""
+    if not text:
+        return "…"
+    return f"…{text[-_NUMBER_SUFFIX_LENGTH:]}"
+
+
 class DrainResult(NamedTuple):
     """What one pass over the modem's message store achieved.
 
@@ -799,7 +821,7 @@ class DeviceManager:
                 )
 
             logger.info(
-                f"Decoded message from {sender} at {timestamp_str}"
+                f"Decoded message from {_mask_number(sender)} at {timestamp_str}"
                 + (" (forced, may be incomplete)" if force_process else "")
             )
             return bool(await self.receive_sms_callback(sender, timestamp_str, content))
@@ -907,7 +929,7 @@ class DeviceManager:
         cache_key = (sender, ref_num)
 
         logger.debug(
-            f"Concatenated part from {sender}: ref={ref_num}, "
+            f"Concatenated part from {_mask_number(sender)}: ref={ref_num}, "
             f"part {seq_num}/{max_parts}, {len(content)} character(s)"
         )
 
@@ -925,7 +947,7 @@ class DeviceManager:
         buffer.add_part(seq_num, content)
 
         logger.info(
-            f"Concatenated part held from {sender}: ref={ref_num}, "
+            f"Concatenated part held from {_mask_number(sender)}: ref={ref_num}, "
             f"{len(buffer.parts)}/{max_parts} received"
         )
 
@@ -934,8 +956,9 @@ class DeviceManager:
             timestamp_str = buffer.timestamp.strftime("%Y-%m-%d %H:%M:%S") if isinstance(buffer.timestamp, datetime) else str(buffer.timestamp)
 
             logger.info(
-                f"Concatenated message complete from {sender} at {timestamp_str}: "
-                f"{max_parts} part(s), {len(merged_content)} character(s)"
+                f"Concatenated message complete from {_mask_number(sender)} at "
+                f"{timestamp_str}: {max_parts} part(s), "
+                f"{len(merged_content)} character(s)"
             )
 
             delivered = bool(
@@ -963,7 +986,7 @@ class DeviceManager:
             # The parts received so far are deliberately not forwarded: half a
             # message is worse than none, because it reads as a whole one.
             logger.warning(
-                f"Concatenated message timed out from {buffer.sender}: "
+                f"Concatenated message timed out from {_mask_number(buffer.sender)}: "
                 f"ref={buffer.ref_num}, only {len(buffer.parts)}/"
                 f"{buffer.max_parts} part(s) arrived; discarding them"
             )
@@ -977,7 +1000,8 @@ class DeviceManager:
         :param message: text to send
         :return: whether the modem confirmed the send
         """
-        logger.debug(f"Sending to {phone_number}, {len(message)} character(s)")
+        masked = _mask_number(phone_number)
+        logger.debug(f"Sending to {masked}, {len(message)} character(s)")
 
         try:
             self.sms_sent_event.clear()
@@ -1008,18 +1032,18 @@ class DeviceManager:
                     logger.debug(f"Writing {len(pdu_hex)} hex character(s) of PDU data")
                     await self.send_at_command_async(pdu_hex + chr(26))
 
-            logger.info(f"Sent to {phone_number}; awaiting the modem's result")
+            logger.info(f"Sent to {masked}; awaiting the modem's result")
             await asyncio.wait_for(self.sms_sent_event.wait(), timeout=10.0)
 
             # Reached only once the modem answered +CMGS.
-            logger.info(f"Send confirmed: {phone_number}")
+            logger.info(f"Send confirmed: {masked}")
             return True
 
         except asyncio.TimeoutError:
-            logger.error(f"Timed out awaiting the send result for {phone_number}")
+            logger.error(f"Timed out awaiting the send result for {masked}")
             return False
         except Exception as e:
-            logger.error(f"Send failed for {phone_number}: {e}", exc_info=True)
+            logger.error(f"Send failed for {masked}: {e}", exc_info=True)
             return False
         finally:
             self.sms_sent_event.clear()
