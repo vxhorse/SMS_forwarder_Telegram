@@ -17,6 +17,14 @@ NUMBER = "+8613800138000"
 # Self-generated PDU with meaningless body text. Never use real message content.
 STORED_PDU = encodeSmsSubmitPdu(NUMBER, "TESTMSG")[0].data.hex().upper()
 
+# One long message as the modem stores it: two entries, each carrying a
+# concatenation header that says which half it is. Body text is meaningless.
+CONCAT_MESSAGE_LENGTH = 200
+CONCAT_PDUS = [
+    pdu.data.hex().upper()
+    for pdu in encodeSmsSubmitPdu(NUMBER, "T" * CONCAT_MESSAGE_LENGTH)
+]
+
 # Not a PDU at all. Decoding it fails the same way on every attempt, which is
 # what makes an entry permanently unrecoverable rather than merely undelivered.
 CORRUPT_PDU = b"not a valid pdu"
@@ -716,6 +724,84 @@ async def test_setup_does_not_erase_when_a_readable_entry_went_undelivered():
     commands = [command for command, _ in sent]
     assert len(attempts) == 1
     assert "AT+CMGD=1,4" not in commands
+
+
+async def test_a_long_message_survives_a_drain_slower_than_the_part_timeout():
+    """The parts of one long message are separate entries in the listing, so a
+    drain slow enough to cross the part timeout between them would discard the
+    half already read. The second half would then open a fresh buffer and
+    report itself as a fragment still waiting - progress, by the drain's
+    reckoning - so every entry would look accounted for and the store holding
+    the only copy would be erased with nothing ever delivered.
+
+    A negative timeout stands in for that delay: it makes every buffer expired
+    the moment it is created, which is the same condition without spending the
+    time to reach it.
+    """
+    received = []
+
+    async def collect(sender, timestamp, content):
+        received.append(content)
+        return True
+
+    manager = DeviceManager(collect, port="/hostdev/ttyUSB2")
+    manager.CONCAT_SMS_TIMEOUT = -1
+    manager.reader = FakeReader([
+        b"+CMGL: 0,1,,26\r\n",
+        f"{CONCAT_PDUS[0]}\r\n".encode(),
+        b"+CMGL: 1,1,,26\r\n",
+        f"{CONCAT_PDUS[1]}\r\n".encode(),
+        b"OK\r\n",
+    ])
+    manager.writer = FakeWriter()
+
+    result = await manager._drain_stored_sms()
+
+    # Delivered once, whole.
+    assert len(received) == 1
+    assert len(received[0]) == CONCAT_MESSAGE_LENGTH
+    assert (result.entries, result.delivered, result.undecodable) == (2, 2, 0)
+    assert result.complete is True
+    # Nothing left holding a partial copy.
+    assert manager.concat_sms_cache == {}
+
+
+async def test_part_expiry_resumes_once_the_drain_is_over():
+    """The suspension is scoped to the pass, not switched off. Parts arriving
+    live still have to be given up on, or a half message waits for ever."""
+    manager = _make()
+    assert manager._draining is False
+
+    manager.reader = FakeReader([b"OK\r\n"])
+    await manager._drain_stored_sms()
+    assert manager._draining is False
+
+    await manager._handle_concat_sms_part(
+        NUMBER, datetime(2024, 11, 2, 13, 15, 51), "AAAA", 7, 2, 1
+    )
+    manager.concat_sms_cache[(NUMBER, 7)].first_received -= (
+        DeviceManager.CONCAT_SMS_TIMEOUT + 1
+    )
+    await manager._cleanup_expired_concat_cache()
+    assert manager.concat_sms_cache == {}
+
+
+async def test_the_drain_flag_is_cleared_even_when_a_forward_raises():
+    """A pass that ends badly must not leave expiry suspended for the life of
+    the process."""
+    async def explode(sender, timestamp, content):
+        raise RuntimeError("downstream unavailable")
+
+    manager = DeviceManager(explode, port="/hostdev/ttyUSB2")
+    manager.reader = FakeReader([
+        b"+CMGL: 0,1,,26\r\n",
+        f"{STORED_PDU}\r\n".encode(),
+        b"OK\r\n",
+    ])
+    manager.writer = FakeWriter()
+
+    await manager._drain_stored_sms()
+    assert manager._draining is False
 
 
 async def test_the_two_drain_failures_are_reported_apart():
