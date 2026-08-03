@@ -59,7 +59,8 @@ graph TD
 `Supervisor` 驱动两个相互独立的组件。每个组件各自连接、运行，失败后按指数退避重连，
 彼此不互相等待。只有当一次会话持续超过 `SERVICE_STABLE_SECONDS` 后，组件才算真正恢复，
 因此「连上就立刻断开」的组件仍会被判定为故障。`HealthState` 记录这一状态，
-若任一组件掉线时间超过 `WATCHDOG_DOWN_SECONDS`，看门狗会退出进程；
+看门狗会在组件失联的两种情形下退出进程——掉线时间超过 `WATCHDOG_DOWN_SECONDS`，
+或虽仍报告就绪、但其循环已停止推进达 `WATCHDOG_STALL_SECONDS`；
 `healthcheck.py` 则把同一状态报告给容器运行时。
 
 ## 硬件要求
@@ -201,11 +202,15 @@ docker compose logs -f     # 跟踪启动过程
 | `MODEM_PROBE_INTERVAL` | `30.0` | 心跳探测间隔，上限为 `HEALTH_STALE_SECONDS` 的一半 |
 | `MODEM_PROBE_TIMEOUT` | `5.0` | 模块应答一次探测的时限 |
 | `MODEM_PROBE_FAILURES` | `3` | 连续丢失多少次探测后触发重连 |
+| `MODEM_REGISTRATION_CHECK` | `0` | 是否额外询问模块是否已驻网。默认关闭——见[驻网检查](#驻网检查) |
+| `MODEM_REGISTRATION_FAILURES` | `3` | 开启该检查后，连续多少次读到「未驻网」触发重连，下限为 2 |
 | `AT_COMMAND_TIMEOUT` | `3.0` | 单条AT命令的时限 |
 | `AT_SLOW_COMMAND_TIMEOUT` | `10.0` | 慢速命令（`AT&F`、`AT+CFUN`、`AT&W`）的时限 |
+| `SERIAL_CLOSE_TIMEOUT` | `5.0` | 释放串口时等待缓冲区排空的时限，超时后强制关闭，下限为 1 |
 | `HEALTH_FILE` | `/tmp/healthy` | 健康检查读取的状态快照文件 |
 | `HEALTH_STALE_SECONDS` | `120` | 该快照的最大允许陈旧时间，下限为 2 |
 | `WATCHDOG_DOWN_SECONDS` | `3600` | 组件掉线超过该时长后退出进程 |
+| `WATCHDOG_STALL_SECONDS` | *(推导得出)* | 组件循环停止推进达该时长后退出进程。默认取 `HEALTH_STALE_SECONDS` 的两倍，再由推导出的下限抬高（当前默认约 310），并以 `WATCHDOG_DOWN_SECONDS` 为上限 |
 | `WATCHDOG_CHECK_INTERVAL` | `30.0` | 看门狗检查间隔，下限为 1 |
 
 ### 串口选择
@@ -224,6 +229,37 @@ docker compose logs -f     # 跟踪启动过程
 
 如果确实要设置，请按服务自身看到的路径填写。使用本仓库的编排文件时，
 主机的 `/dev` 被挂载到 `/hostdev`，因此端口是 `/hostdev/ttyUSB2`，而不是 `/dev/ttyUSB2`。
+
+### 驻网检查
+
+心跳能证明模块还在应答，却不能证明短信能送达它：被运营商摘网的SIM卡，
+对每一条命令的应答与之前一模一样，而短信一条也收不到。
+`MODEM_REGISTRATION_CHECK=1` 会加问第二个问题 `AT+CREG?`，
+并在连续 `MODEM_REGISTRATION_FAILURES` 次读到「未驻网」后结束当前会话。
+
+它**默认关闭**，因为这个问题并非在所有网络上都有真实答案。
+`+CREG` 描述的是电路域，因此当网络只为模块建立分组域附着时
+——短信经由该域无法描述的路径送达——它会在一切正常的同时报告「未驻网」。
+据此动作会每隔几分钟就中断一次本来正常的会话，每次都重新初始化射频
+（这只会拖长真正的断网恢复，而不是缩短），并且每个周期都改写模块的存储配置。
+这个循环从外部也很难看见：它触发失败的时间晚于一次会话被判定为恢复的时间，
+因此每个周期都会重置看门狗所测量的量；而快照仅在一次拆链的时间窗内变陈旧，
+所以容器健康检查全程保持绿色。
+
+在弄清情况之前保持关闭并不损失任何诊断能力。启动流程已要求模块主动上报驻网变化，
+因此无论开关与否，状态都会被解析、写入快照并记入日志；被推迟的只是
+「是否因此结束会话」这一动作。请在包含正常短信往来的一段时间内观察 `registration` 字段：
+
+```bash
+docker compose exec sms-forwarder cat /tmp/healthy
+```
+
+- 稳定为 `1`、`5`、`6` 或 `7`（本地驻网、漫游驻网，或二者仅限短信的形式）
+  ——说明这个问题在该网络上有真实答案，此时 `MODEM_REGISTRATION_CHECK=1`
+  才能带来它设计中的检测能力。
+- 在短信持续到达的同时停留在 `0` 或 `2` ——说明这正是该检查无法描述的网络，请保持关闭。
+
+[`doc/README.md`](doc/README.md) 记录了要给出完整答案还需要做什么。
 
 ### 为什么不使用 `devices:`
 
@@ -275,8 +311,17 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
   而快照要等到全部组件都就绪才写入，因此最早也要在两者都连上之后再过一分钟。
   `start_period` 必须覆盖这段时间，再加上模块枚举所需的时间；模块较慢时请调大它。
 - **`unhealthy`**——此时没有任何短信被转发。请注意它本身不会重启任何东西，
-  容器运行时只是把它记录下来。恢复要么靠服务自行重连，要么靠看门狗：
-  掉线超过 `WATCHDOG_DOWN_SECONDS` 后看门狗会退出进程，之后由重启策略接手。
+  容器运行时只是把它记录下来。恢复要么靠服务自行重连，要么靠看门狗退出进程、
+  再由重启策略接手。看门狗有两条退出路径，两者相差一个数量级：
+  - **明确失败**的组件会被标记为掉线，掉线满 `WATCHDOG_DOWN_SECONDS`
+    （默认一小时）后进程退出。日志为
+    `Watchdog tripped: a component has been down for ...`。
+  - **阻塞但未失败**的组件仍被标记为就绪，上面那个计时因此根本不会开始。
+    真正抓住它的是 `WATCHDOG_STALL_SECONDS`：没有任何组件循环上报推进，
+    快照也没有被写入，且持续了这么久。按当前默认约为 **310 秒**而非一小时，
+    因此「安静下来大约五分钟后」的意外重启属于这一条，而不是上一条。日志为
+    `Watchdog tripped: nothing has made progress for ...`；
+    `HEALTH_FILE` 无法写入同样会触发它。
 - **`healthy`**——快照是新鲜的，且全部组件均已就绪。
 
 ## 使用说明
@@ -300,7 +345,7 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
 
 - **长短信支持**：本服务已支持长短信自动合并，分片短信会在60秒内等待所有分片到达后合并转发
 - **兼容性**：不同型号的模块兼容性不同，某些模块可能不支持长文本短信的收发
-- **稳定性**：各组件独立按指数退避重连；若某组件掉线超过 `WATCHDOG_DOWN_SECONDS`，看门狗会重启进程
+- **稳定性**：各组件独立按指数退避重连；若某组件掉线超过 `WATCHDOG_DOWN_SECONDS`，或虽仍报告就绪却停止推进达 `WATCHDOG_STALL_SECONDS`，看门狗会重启进程
 - **串口选择**：优先让 `SMS_PORT` 保持为空，由自动发现决定；只有当发现选错设备时才设置，并填写 `SMS_DEV_ROOT` 之下的路径
 - **没有硬件不算错误**：未接入模块时，服务会无限期等待并重试，其间容器报告为不健康
 - **SIM卡检测**：确保SIM卡正确插入并有足够余额
@@ -343,5 +388,7 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
 5. **容器始终不进入健康状态**：
    - 最多三分钟的 `starting` 属于正常，详见「读懂健康检查」一节
    - 一直是 `unhealthy` 说明有组件掉线，日志会指出是哪一个：`Component <name> failed ...`
-   - 容器运行时不会因为不健康而自行重启容器。看门狗会在 `WATCHDOG_DOWN_SECONDS`
-     之后退出进程，随后由重启策略接手
+   - 容器运行时不会因为不健康而自行重启容器。看门狗会退出进程——组件已失败的
+     走 `WATCHDOG_DOWN_SECONDS`，未失败却停止推进的走短得多的
+     `WATCHDOG_STALL_SECONDS`——随后由重启策略接手。
+     `docker compose logs | grep 'Watchdog tripped'` 可看出是哪一条
