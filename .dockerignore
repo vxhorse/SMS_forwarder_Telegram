@@ -1,13 +1,17 @@
-__pycache__/
-*.py[cod]
+# These patterns are matched with filepath.Match, in which a single * never
+# crosses a directory separator: an unprefixed pattern excludes only what sits
+# at the root of the build context. Anything that must be kept out wherever it
+# appears is written with the **/ prefix, which does span directories.
+**/__pycache__/
+**/*.py[cod]
 *$py.class
 *.so
 .Python
 .git
 .gitattributes
 .gitignore
-.env
-.env.*
+**/.env
+**/.env.*
 venv/
 env/
 .venv/
@@ -17,6 +21,15 @@ Dockerfile
 docker-compose.yml
 docker-compose.yaml
 docker-compose.example.yml
+# Backups of the local compose file carry the same credentials it does, and
+# .gitignore already keeps them out of the repository. The entries above do not
+# cover them, because there is no implicit prefix matching here either: a name
+# that merely begins with docker-compose.yml is not excluded by it. Without
+# these three lines COPY . . places a file full of live credentials inside a
+# published image, where docker history or docker save will hand it to anyone.
+**/docker-compose.*.bak-*
+**/*.bak
+**/*.bak-*
 .DS_Store
 .idea/
 .vscode/
@@ -30,6 +43,11 @@ doc/
 docs/
 tests/
 pytest.ini
+.pytest_cache/
 requirements-dev.txt
-LICENSE
+# Local working notes, untracked and not part of the software.
+.superpowers/
+# LICENSE is deliberately not excluded. MIT requires the notice to travel with
+# substantial portions of the software, and publishing an image is a
+# distribution of it.
 .github/
