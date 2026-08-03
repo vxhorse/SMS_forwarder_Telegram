@@ -12,6 +12,11 @@ from module.device_manager import DeviceManager
 # Self-generated PDU with meaningless body text. Never use real message content.
 STORED_PDU = encodeSmsSubmitPdu("+8613800138000", "TESTMSG")[0].data.hex().upper()
 
+# A DELIVER PDU carrying a service-centre timestamp of 2024-11-02 13:15:51 +08.
+# Unlike a SUBMIT PDU this one actually has a carrier timestamp, which is what
+# makes it usable for asserting that the timestamp survives the drain.
+DELIVER_PDU = "0791683108200155040D91683103943254F60008421120315115238A02597D"
+
 
 class FakeReader:
     """Yields queued lines, then hangs to simulate a silent modem."""
@@ -350,6 +355,32 @@ async def test_drain_keeps_going_after_an_undecodable_entry():
     assert len(forwarded) == 1
 
 
+async def test_drain_forwards_a_stored_message_with_its_carrier_timestamp():
+    """The composed property this task exists for: a message recovered from
+    storage must arrive stamped with the time the carrier gave it, not the
+    moment it happened to be recovered. Covering _forward_pdu and the drain
+    separately does not establish this, because the drain's other fixtures are
+    SUBMIT PDUs, which carry no timestamp at all.
+    """
+    captured = []
+
+    async def collect(sender, timestamp, content):
+        captured.append(timestamp)
+        return True
+
+    manager = DeviceManager(collect, port="/hostdev/ttyUSB2")
+    manager.reader = FakeReader([
+        b"+CMGL: 0,1,,26\r\n",
+        f"{DELIVER_PDU}\r\n".encode(),
+        b"OK\r\n",
+    ])
+    manager.writer = FakeWriter()
+
+    assert await manager._drain_stored_sms() == 1
+    assert captured[0].startswith("2024-11-02 13:15:51")
+    assert not captured[0].startswith(str(datetime.now().year))
+
+
 async def test_forward_uses_the_operator_timestamp_not_local_time():
     """The library returns the delivery time under 'time'. Reading 'date'
     silently fell through to the local clock on every single message, which
@@ -449,6 +480,36 @@ async def test_setup_does_not_erase_a_store_it_could_not_read():
 
     commands = [command for command, _ in sent]
     assert "AT+CMGD=1,4" not in commands
+
+
+async def test_setup_does_not_erase_a_store_that_refused_to_be_listed():
+    """An error is an answer, but not the answer that permits an erase. A
+    modem whose store is still busy after a reset replies +CMS ERROR: 14 to
+    AT+CMGL=4, which says the listing failed - not that there is nothing to
+    list. Testing only the silent case misses this, because an error reply
+    comes back as a non-empty response.
+    """
+    def responder(command):
+        return [b"+CMS ERROR: 14"] if command == "AT+CMGL=4" else [b"OK"]
+
+    manager, sent = _recording_manager(responder=responder)
+    with pytest.raises(RuntimeError):
+        await manager.setup_sms()
+
+    commands = [command for command, _ in sent]
+    assert "AT+CMGD=1,4" not in commands
+
+
+async def test_setup_aborts_when_full_functionality_is_refused():
+    """AT+CFUN=1 is the other command with no degraded mode: a modem that
+    refuses it has no radio, so setup completing would leave a process that
+    forwards nothing while looking healthy."""
+    def responder(command):
+        return [b"ERROR"] if command == "AT+CFUN=1" else [b"OK"]
+
+    manager, sent = _recording_manager(responder=responder)
+    with pytest.raises(RuntimeError):
+        await manager.setup_sms()
 
 
 async def test_setup_continues_past_an_unsupported_optional_command():

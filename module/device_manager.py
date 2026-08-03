@@ -55,6 +55,10 @@ class DeviceManager:
     # runs _drain_stored_sms() instead.
     DRAIN_MARKER = "<DRAIN_STORED_SMS>"
 
+    # The one destructive command in the sequence, named so the code that
+    # reasons about it does not repeat the literal.
+    ERASE_COMMAND = r'AT+CMGD=1,4'
+
     # Modem initialisation sequence.
     # One ordering constraint is load-bearing: DRAIN_MARKER must come after
     # AT+CMGF=0 and AT+CPMS (PDU mode and storage area must be selected before
@@ -73,7 +77,7 @@ class DeviceManager:
         r'AT+QURCCFG="urcport","usbmodem"',  # vendor specific (Quectel): URC port
         r'AT+CPMS="ME","ME","ME"',  # message storage area
         DRAIN_MARKER,               # read out anything already stored, then continue
-        r'AT+CMGD=1,4',             # erase all stored messages
+        ERASE_COMMAND,              # erase all stored messages
         r'AT+CNMI=2,2,0,0,0',       # deliver new messages straight to us
         r'AT+CSMP=17,167,0,8',      # text mode parameters, long message support
         r'AT+CSDH=1',               # verbose message headers
@@ -84,13 +88,30 @@ class DeviceManager:
     # Commands the modem processes slowly enough to need a longer deadline.
     SLOW_COMMANDS = {r'AT&F', r'AT+CFUN=1', r'AT&W'}
 
-    # Commands without which the modem cannot do this job at all: PDU mode is
-    # what makes a message decodable, the storage area has to be selected
-    # before the store can be read or erased, and new-message routing is what
-    # hands live messages to us in the first place. Anything else may be
-    # refused by a module that does not implement it without costing us a
-    # message, so only these three abort initialisation.
+    # Which setup failures are fatal, in full:
+    #
+    # A command counts as acknowledged only when its response contains OK.
+    # _send_and_wait returns an empty list when the modem never answers and a
+    # list ending in an error line when it refuses, so both forms of failure
+    # are covered by the same test and neither is treated as success. For the
+    # commands below that is fatal and setup raises; for every other command
+    # it is a warning, because a module may refuse a vendor extension or a
+    # convenience setting without a single message being lost.
+    #
+    # These four have no degraded mode. Without full functionality the radio
+    # is off, without PDU mode nothing decodes, without a selected storage
+    # area the store cannot be read or erased, and without new-message routing
+    # nothing is ever handed to us. A process that finished setup regardless
+    # would look healthy while forwarding nothing, which is the failure this
+    # policy exists to prevent.
+    #
+    # There is a second abort path: _drain_stored_sms applies the same rule to
+    # its own AT+CMGL=4. It is not listed here because it is not an entry in
+    # SETUP_COMMANDS, but an unacknowledged listing is fatal for a sharper
+    # reason - the next command in the sequence erases the store, so treating
+    # a failed listing as an empty store destroys unread messages.
     REQUIRED_COMMANDS = {
+        r'AT+CFUN=1',
         r'AT+CMGF=0',
         r'AT+CPMS="ME","ME","ME"',
         r'AT+CNMI=2,2,0,0,0',
@@ -345,13 +366,23 @@ class DeviceManager:
             if b"OK" in lines:
                 continue
 
+            # Silence and refusal are both failures here; see REQUIRED_COMMANDS
+            # for which ones are fatal and why. Raising hands the decision to
+            # the caller, which reconnects and retries.
             if command in self.REQUIRED_COMMANDS:
-                # _send_and_wait reports a timeout as an empty list, so letting
-                # this pass would mean a modem that has stopped answering still
-                # completes initialisation: the process would then look healthy
-                # while being unable to receive anything. Raising hands the
-                # decision to the caller, which reconnects and retries.
                 raise RuntimeError(f"Modem did not acknowledge {command}")
+
+            if command == self.ERASE_COMMAND:
+                # Deliberately not fatal: the messages have already been read
+                # out at this point, so the cost is duplication rather than
+                # loss. It still needs saying plainly, because a store that
+                # was not erased is drained again on the next reconnect and
+                # every message in it is forwarded a second time.
+                logger.warning(
+                    "Modem did not acknowledge the erase; stored messages may "
+                    "be forwarded again after the next reconnect"
+                )
+                continue
 
             logger.warning(f"{command} was not acknowledged; continuing setup")
 
@@ -623,19 +654,21 @@ class DeviceManager:
             'AT+CMGL=4', timeout=config.AT_SLOW_COMMAND_TIMEOUT
         )
 
-        if not lines:
-            # No terminating response at all: the modem did not answer, so the
-            # store is unread rather than empty. The next command in the
-            # sequence erases it, and going ahead on that assumption is the
-            # exact loss this method exists to prevent. An explicit error is
-            # different - the modem is alive and told us something - so only
-            # silence stops the sequence here.
-            raise RuntimeError("Modem did not answer AT+CMGL=4; store left unread")
+        if b"OK" not in lines:
+            # Only an acknowledged listing proves anything about the store.
+            # Silence means the modem never answered; an error line means it
+            # answered that it could not list the store, which a modem whose
+            # storage is still busy after a reset does routinely. Neither says
+            # the store is empty, and the next command in the sequence erases
+            # it, so continuing would destroy messages that were never read.
+            raise RuntimeError("Modem did not acknowledge AT+CMGL=4; store left unread")
 
         forwarded = 0
+        entries = 0
         index = 0
         while index < len(lines):
             if lines[index].startswith(b'+CMGL:') and index + 1 < len(lines):
+                entries += 1
                 pdu_hex = lines[index + 1].decode('ascii', errors='ignore').strip()
                 # One unreadable entry must not cost us the rest of the store.
                 if await self._forward_pdu(pdu_hex):
@@ -644,10 +677,16 @@ class DeviceManager:
             else:
                 index += 1
 
+        if forwarded < entries:
+            # These are about to be erased and cannot be recovered afterwards.
+            logger.error(
+                f"{entries - forwarded} of {entries} stored message(s) could "
+                f"not be decoded and will not be forwarded"
+            )
         if forwarded:
             logger.warning(f"Recovered {forwarded} message(s) from modem storage")
-        else:
-            logger.info("Modem storage held no pending messages")
+        elif not entries:
+            logger.info("Modem listed an empty storage area")
         return forwarded
 
     async def handle_incoming_sms_pdu(self, pdu_part: bytes = b'', force_process: bool = False) -> None:
