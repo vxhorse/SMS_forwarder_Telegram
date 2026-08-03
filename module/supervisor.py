@@ -180,6 +180,9 @@ class Supervisor:
     ) -> None:
         """Run one connected session, returning only once shutdown is requested.
 
+        This is the authoritative statement of when a component counts as
+        recovered, and the only place one is ever marked up.
+
         Connecting is not the same as recovering. The component is reported up,
         and the backoff and log throttle are reset, only once the session has
         lasted config.SERVICE_STABLE_SECONDS. A component that connects and
@@ -188,6 +191,10 @@ class Supervisor:
         throttle would never engage, and HealthState would re-stamp its down
         timestamp each time, so down_duration() could never reach the watchdog
         threshold and a permanently broken component would look merely busy.
+
+        That is why a component may refresh the health file from its own loop
+        but must never call mark_up() there: reporting itself up once per cycle
+        would defeat the rule from the inside.
 
         Anything that ends the session is raised to the supervision loop, which
         treats it as a failed attempt.

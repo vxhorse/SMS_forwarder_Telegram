@@ -21,10 +21,11 @@ HEALTH_FILE = os.getenv("HEALTH_FILE", "/tmp/healthy")
 # How old the health file may be before the healthcheck considers it stale.
 #
 # Floored, because MODEM_PROBE_INTERVAL below is clamped to half this window
-# but never below one second, and the probe is the only thing that refreshes
-# the snapshot. A window under two seconds would therefore be shorter than the
-# interval at which the file can possibly be rewritten, and the healthcheck
-# would fail a process that is working perfectly. Two seconds is that bound.
+# but never below one second, and that probe is the shortest guaranteed refresh
+# interval in the process. A window under two seconds would therefore be
+# shorter than the interval at which the file can possibly be rewritten, and
+# the healthcheck would fail a process that is working perfectly. Two seconds
+# is that bound.
 HEALTH_STALE_SECONDS = max(2, int(os.getenv("HEALTH_STALE_SECONDS", "120")))
 # Exit the process once any component has been down this long, letting the
 # container runtime restart everything as a last resort.
@@ -33,14 +34,11 @@ WATCHDOG_DOWN_SECONDS = int(os.getenv("WATCHDOG_DOWN_SECONDS", "3600"))
 RECONNECT_BACKOFF_MIN = float(os.getenv("RECONNECT_BACKOFF_MIN", "1.0"))
 RECONNECT_BACKOFF_MAX = float(os.getenv("RECONNECT_BACKOFF_MAX", "30.0"))
 # How long a connected session must last before it counts as a recovery.
-# A component that connects and then fails immediately, over and over, is still
-# broken; treating the connection itself as success would reset the backoff and
-# the health timestamp every cycle, hiding the fault from the watchdog.
+# Supervisor._serve_session states what this buys and why; in short, a component
+# that connects and then fails immediately is still broken.
 #
-# Floored for that same reason: at zero every connection counts as a recovery
-# the instant it is made, which is precisely the behaviour this setting exists
-# to prevent - the backoff would never grow, the log throttle would never
-# engage, and the watchdog could never fire.
+# Floored because at zero every connection counts as a recovery the instant it
+# is made, which is precisely the behaviour this setting exists to prevent.
 SERVICE_STABLE_SECONDS = max(5.0, float(os.getenv("SERVICE_STABLE_SECONDS", "60.0")))
 # How often the watchdog inspects component health, in seconds. Floored because
 # a value of zero would turn the watchdog into a busy loop.
@@ -80,11 +78,13 @@ AT_SLOW_COMMAND_TIMEOUT = float(os.getenv("AT_SLOW_COMMAND_TIMEOUT", "10.0"))
 # Modem liveness probe (AT+CSQ): interval, response deadline, and how many
 # consecutive misses trigger a reconnect.
 #
-# The probe is also the only thing that refreshes the health snapshot file, so
-# its interval has to stay well inside HEALTH_STALE_SECONDS: a longer one would
-# leave the container healthcheck reading a stale file and failing a process
-# that is working perfectly. Clamped to half that window so a single missed
-# probe is not enough to trip it, and floored so a value of zero cannot turn
+# The probe also refreshes the health snapshot file. Both component loops do
+# that, and either one is enough, because the file is only written while every
+# component is up. The interval is still clamped to half of
+# HEALTH_STALE_SECONDS so that this side alone can keep the file fresh: leaving
+# it to the other component's loop would couple the healthcheck to whatever
+# period that loop happens to have. Half the window means a single missed probe
+# is not enough to trip it, and the floor keeps a value of zero from turning
 # the probe into a busy loop.
 MODEM_PROBE_INTERVAL = max(1.0, min(
     float(os.getenv("MODEM_PROBE_INTERVAL", "30.0")),
