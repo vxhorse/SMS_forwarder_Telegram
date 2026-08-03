@@ -5,7 +5,10 @@ with stand-in components. Every wait is bounded by a condition the test itself
 controls, and no test spends a real interval to synchronise.
 """
 
+import ast
 import asyncio
+import importlib
+import pathlib
 import signal
 import time
 
@@ -184,17 +187,70 @@ async def test_a_stalled_notification_cannot_hold_up_the_caller(monkeypatch):
     assert time.monotonic() - started < _FAILSAFE / 2
 
 
-def test_the_notify_deadline_has_a_floor(monkeypatch):
-    """The deadline is operator-settable, and zero would fail every
-    notification before it was even attempted."""
-    import importlib
-
-    monkeypatch.setenv("NOTIFY_TIMEOUT", "0")
+def test_the_notify_deadline_is_clamped_at_both_ends(monkeypatch):
+    """The deadline is operator-settable and both ends of the range break it.
+    Zero abandons every notification before it is attempted; an over-large
+    value reinstates the stall the deadline exists to prevent, because the
+    process cannot see the grace period it is being stopped within."""
     try:
+        monkeypatch.setenv("NOTIFY_TIMEOUT", "0")
         assert importlib.reload(config).NOTIFY_TIMEOUT >= 1.0
+        monkeypatch.setenv("NOTIFY_TIMEOUT", "600")
+        reloaded = importlib.reload(config)
+        assert reloaded.NOTIFY_TIMEOUT <= reloaded.NOTIFY_TIMEOUT_CEILING
     finally:
         monkeypatch.undo()
         importlib.reload(config)
+
+
+def _dotted_name(node):
+    """Render a call target as a dotted name, or None if it is not one."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _dotted_name(node.value)
+        return f"{parent}.{node.attr}" if parent else None
+    return None
+
+
+def test_the_supervisory_wait_carries_no_deadline():
+    """The regression this whole design exists to prevent, guarded structurally.
+
+    Every behavioural test in this file finishes in milliseconds, so a deadline
+    measured in tens of seconds would pass all of them and still be the defect:
+    a process that gives up on a dependency that has not arrived yet. This
+    walks the syntax tree of run() instead of its text, so it is indifferent to
+    formatting and to the length of any number, and it fires on the shape of
+    the mistake rather than on a spelling of it - a wait with a deadline.
+
+    Scoped to run(). The one deadline in the file is the notification wrapper's,
+    which bounds a single outward send rather than a wait for a dependency.
+    """
+    tree = ast.parse(pathlib.Path(main.__file__).read_text())
+    run = next(
+        node for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run"
+    )
+
+    waits = 0
+    for node in ast.walk(run):
+        if not isinstance(node, ast.Call):
+            continue
+        target = _dotted_name(node.func)
+        assert target not in ("asyncio.wait_for", "wait_for"), (
+            "run() must not put a deadline on waiting for a dependency"
+        )
+        assert target not in ("asyncio.timeout", "timeout"), (
+            "run() must not put a deadline on waiting for a dependency"
+        )
+        if target == "asyncio.wait":
+            waits += 1
+            assert not any(keyword.arg == "timeout" for keyword in node.keywords), (
+                "the supervisory wait must not carry a timeout"
+            )
+    # Keeps the assertions above from passing vacuously if run() is ever
+    # restructured to wait some other way.
+    assert waits == 1
 
 
 def test_the_devices_write_only_running_flag_is_gone():
@@ -266,6 +322,33 @@ async def test_nothing_gives_up_while_a_dependency_is_missing(monkeypatch, tmp_p
     assert await asyncio.wait_for(task, timeout=_FAILSAFE) == 0
 
 
+async def test_a_snapshot_left_by_a_killed_process_is_cleared_at_startup(
+    monkeypatch, tmp_path
+):
+    """A process that is killed rather than stopped cannot clear its own
+    snapshot, so the next one starts with a file claiming every component is
+    up. Until it goes stale that file is the only thing the healthcheck can
+    read, and nothing would correct it in the meantime: the snapshot is
+    rewritten only once every component really is up, which is precisely the
+    state that has not been reached yet.
+    """
+    device = _StalledComponent("device")
+    telegram = _FakeComponent("telegram", connect_error=ConnectionError("proxy refused"))
+    health, _, _, _, shutdown = _install(monkeypatch, tmp_path, device, telegram)
+    health_file = tmp_path / "healthy"
+    health_file.write_text('{"services": {"device": true, "telegram": true}}')
+
+    task = asyncio.create_task(main.run())
+    await asyncio.wait_for(device.connects.at(1).wait(), timeout=_FAILSAFE)
+    await asyncio.wait_for(telegram.connects.at(1).wait(), timeout=_FAILSAFE)
+
+    assert health.all_up() is False
+    assert health_file.exists() is False
+
+    shutdown.set()
+    assert await asyncio.wait_for(task, timeout=_FAILSAFE) == 0
+
+
 async def test_a_stop_request_reaches_a_component_parked_on_its_dependency(
     monkeypatch, tmp_path
 ):
@@ -302,11 +385,13 @@ async def test_sigterm_shuts_the_process_down_cleanly(monkeypatch, tmp_path):
     telegram = _FakeComponent("telegram")
     health, supervisor, _, _, _ = _install(monkeypatch, tmp_path, device, telegram)
     health_file = tmp_path / "healthy"
-    health_file.write_text("{}")
 
     task = asyncio.create_task(main.run())
     await asyncio.wait_for(device.serving.at(1).wait(), timeout=_FAILSAFE)
     await asyncio.wait_for(telegram.serving.at(1).wait(), timeout=_FAILSAFE)
+    # Written once the process is up, so that what this proves is the exit path
+    # removing it rather than the startup path having done so already.
+    health_file.write_text("{}")
 
     # Checked before the signal is raised, not after: an assembly that never
     # installed a handler would leave the default disposition in place and the
@@ -358,6 +443,37 @@ async def test_a_configuration_error_exits_two(monkeypatch, tmp_path):
     assert supervisor.exit_reason == "fatal_config"
     # The other component still gets its handle released.
     assert device.teardowns.count >= 1
+
+
+def _raise_through_a_helper(message):
+    raise RuntimeError(message)
+
+
+def test_an_unexplained_crash_keeps_its_location_but_not_its_message():
+    """The one failure nothing else describes, so it has to say where it broke.
+
+    The message still cannot be quoted - a client error renders the request it
+    came from in its own str(), and that request carries a credential - but the
+    frames come from the traceback object, which is built from code locations
+    and never from the exception, so they can be.
+    """
+    # Assembled at runtime: a literal would show up in the frames as the source
+    # text of the line that raised, which would prove nothing either way.
+    message = "sensitive-detail-%d" % 42
+    try:
+        _raise_through_a_helper(message)
+    except RuntimeError as error:
+        described = main._describe_crash(error)
+
+    assert "RuntimeError" in described
+    assert "test_main.py" in described
+    assert "_raise_through_a_helper" in described
+    assert message not in described
+
+
+def test_a_crash_with_no_traceback_is_still_named():
+    """An exception that was never raised has no frames to report."""
+    assert main._describe_crash(RuntimeError("unraised")) == "RuntimeError"
 
 
 async def test_an_unexpected_supervision_failure_exits_one(monkeypatch, tmp_path):

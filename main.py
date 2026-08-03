@@ -3,6 +3,7 @@
 import asyncio
 import signal
 import sys
+import traceback
 
 import config
 from config import BOT_TOKEN, CHAT_ID, PROXY_URL
@@ -52,6 +53,21 @@ def _bounded_notify(telegram: TelegramBot, timeout: float):
     return notify
 
 
+def _describe_crash(error: BaseException) -> str:
+    """Describe an unexpected failure by type and location, never by message.
+
+    Some client errors render the request they came from in their own str(),
+    and that request carries a credential, so the message stays out. The frames
+    are read from the traceback object rather than from the exception, which is
+    what keeps it out while still saying where the process broke - and for a
+    failure that is by definition unexplained, where is all there is to go on.
+    """
+    frames = "".join(traceback.format_tb(error.__traceback__)).rstrip()
+    if not frames:
+        return type(error).__name__
+    return f"{type(error).__name__}\n{frames}"
+
+
 def build_services():
     """Construct every component and wire them to each other.
 
@@ -79,6 +95,14 @@ def build_services():
 async def run() -> int:
     """Run until shutdown is requested. Returns the process exit code."""
     health, supervisor, device, telegram, shutdown_event = build_services()
+
+    # Cleared on the way in as well as on the way out. A process that was
+    # killed rather than stopped leaves its last snapshot behind, and until
+    # that file goes stale the healthcheck reads it as proof that every
+    # component is up. Nothing else would correct it: the snapshot is only
+    # rewritten once every component really is up, which is exactly the state
+    # the process has not reached yet.
+    health.clear_file()
 
     loop = asyncio.get_running_loop()
     if sys.platform != "win32":
@@ -124,9 +148,14 @@ async def run() -> int:
         # is where the components are actually torn down.
         await asyncio.gather(*tasks, stop_request, return_exceptions=True)
 
-        # Read after the gather rather than from the wait above: a task that
-        # failed at the same moment the shutdown was requested would not be
-        # in that result, and its failure still decides the exit code.
+        # Read after the gather rather than from the wait above, so that a task
+        # which failed at the same moment the shutdown was requested is still
+        # seen: it would not be in that result set. A task still unwinding when
+        # it was cancelled is not covered, because it ends up cancelled and the
+        # loop below skips it. Nothing depends on that: a supervision loop
+        # records its reason for stopping before it re-raises, so the exit code
+        # comes from the recorded reason either way, and this loop only adds
+        # the log line and the code for a failure with no reason recorded.
         for task in tasks:
             if task.cancelled():
                 continue
@@ -174,9 +203,7 @@ if __name__ == "__main__":
         # an interrupt sets the shutdown event instead.
         logger.warning("Interrupted before shutdown could be requested")
     except Exception as error:
-        # Named by type only: some client errors render the request they came
-        # from in their own str(), and that request carries a credential.
-        logger.error(f"Fatal error: {type(error).__name__}")
+        logger.error(f"Fatal error: {_describe_crash(error)}")
         code = EXIT_FAILURE
     finally:
         logger.info(f"Exiting with code {code}")
