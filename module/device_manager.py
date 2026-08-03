@@ -693,6 +693,11 @@ class DeviceManager:
         one message can reach it - the same silent failure as a wedged modem,
         arrived at by a different route, and invisible to a probe that asks
         only whether the modem is still talking.
+
+        Both questions are asked through _probe_once, which bounds the whole
+        transaction rather than the reply alone. Nothing this loop does can
+        block without eventually raising, which is what makes a missed
+        heartbeat something the supervisor hears about.
         """
         failures = 0
         # Reset with the loop, not with the object: this runs once per
@@ -701,12 +706,7 @@ class DeviceManager:
         self.registration_misses = 0
         while True:
             await self._sleep(self.probe_interval)
-            self._probe_event.clear()
-            async with self._at_lock:
-                await self.send_at_command_async("AT+CSQ")
-            try:
-                await asyncio.wait_for(self._probe_event.wait(), timeout=self.probe_timeout)
-            except asyncio.TimeoutError:
+            if not await self._probe_once("AT+CSQ", self._probe_event):
                 failures += 1
                 logger.warning(f"Modem heartbeat missed ({failures} in a row)")
                 if failures >= self.probe_failures:
@@ -726,6 +726,77 @@ class DeviceManager:
                 # mark_up(): see Supervisor._serve_session for why that decision
                 # cannot be made from inside a component's own loop.
                 self.health.refresh_file()
+
+    async def _probe_once(self, command: str, answered: asyncio.Event) -> bool:
+        """Ask the modem one question and say whether it answered in time.
+
+        The deadline covers taking the port and writing as well as waiting for
+        the reply, and that is the whole point of the method existing. Timing
+        the reply alone leaves the two steps most likely to be stuck outside
+        any bound at all:
+
+        - the write. Serial flow control is implemented by blocking the drain,
+          so a modem that has stopped accepting bytes - asserted flow control,
+          firmware wedged but still powered - suspends the write for ever. It
+          raises nothing, because there is nothing to raise: the port is open
+          and the bytes are merely queued.
+        - taking the port. The sending path holds the AT lock across both of
+          its writes, since everything between AT+CMGS and the terminating
+          Ctrl+Z is taken by the modem as message data. A send whose write is
+          stuck therefore holds the lock indefinitely, and a probe waiting for
+          that lock is waiting on the same block one step removed.
+
+        Either one hangs the probe built to notice a silent modem, and a probe
+        that hangs raises nothing, refreshes nothing, and reports nothing: the
+        component stays "up" while forwarding nothing at all. Bounding the
+        whole transaction turns both into an ordinary missed heartbeat, which
+        the caller already knows how to count.
+
+        :param command: the AT command to ask
+        :param answered: the event set when the matching reply is routed
+        :return: whether the reply arrived within probe_timeout
+        """
+        # Cleared before the question is asked, so what the wait observes is a
+        # reply to this round rather than one left set by the last.
+        answered.clear()
+        try:
+            await asyncio.wait_for(
+                self._ask_modem(command, answered), timeout=self.probe_timeout
+            )
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def _ask_modem(self, command: str, answered: asyncio.Event) -> None:
+        """Take the port, write one command, and wait for the answer.
+
+        Split from _probe_once only so the deadline can be wrapped around the
+        whole of it. Nothing here is left behind when that deadline cancels it:
+
+        - the lock is released by the `async with` on the way out, because
+          cancellation arrives as CancelledError, which derives from
+          BaseException and so is not swallowed by the `except Exception` in
+          send_at_command_async;
+        - a probe cancelled while still queueing for the lock never held it,
+          and asyncio.Lock unwinds its own waiter, including the case where
+          the lock was handed over in the same tick as the cancellation;
+        - the command cannot be cut in half. The write hands the whole line to
+          the transport before the only await in it, so what a cancelled probe
+          leaves behind is a complete command that has not been flushed yet,
+          never a truncated one. It reaches the modem late, in the order it
+          was queued, so it cannot land inside a later send's transaction
+          either. Its reply is discarded by the next probe's clear if it
+          arrives before the next question, and credited to that round if it
+          arrives after - late, but still this modem answering this question,
+          so neither round is credited with a reading nothing produced.
+
+        The reply is deliberately awaited outside the lock. Holding the port
+        for the whole deadline would put every send behind every probe, and
+        the reply is routed by the read loop, which needs no lock of its own.
+        """
+        async with self._at_lock:
+            await self.send_at_command_async(command)
+        await answered.wait()
 
     async def _probe_registration(self) -> None:
         """Ask whether the modem is on a network, and act on a run of noes.
@@ -751,14 +822,11 @@ class DeviceManager:
         # being registered stand in for every probe after it, which is exactly
         # the silence this is looking for.
         self._registration_state = None
-        self._registration_event.clear()
-        async with self._at_lock:
-            await self.send_at_command_async("AT+CREG?")
-        try:
-            await asyncio.wait_for(
-                self._registration_event.wait(), timeout=self.probe_timeout
-            )
-        except asyncio.TimeoutError:
+        # Bounded exactly as the liveness probe is, and for the same reasons:
+        # this question is written to the same port under the same lock, so a
+        # bound on the first probe alone would leave the loop hanging one step
+        # further along. See _probe_once.
+        if not await self._probe_once("AT+CREG?", self._registration_event):
             # No reading, which is not the same as a reading that says the
             # modem is registered, and must not be counted as one. What was
             # published goes with it: the snapshot is read from outside this

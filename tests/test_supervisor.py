@@ -735,12 +735,34 @@ async def test_a_refresh_after_a_recovery_stops_the_outage_being_discounted():
 def _legitimate_refresh_gap(cfg) -> float:
     """The longest gap the heartbeat can leave between two refreshes.
 
-    A missed probe costs its interval plus the deadline it waits for a reply,
-    and MODEM_PROBE_FAILURES of them in a row have to pass before the probe
-    gives up and raises. Until it does, the component is working and simply
-    has not refreshed the snapshot.
+    Counted as the rounds it is made of, rather than as the closed form the
+    configuration uses, so that the two have to agree about the loop rather
+    than merely about each other.
+
+    Only a round whose liveness probe went unanswered skips the refresh, and
+    it costs the interval before it plus the single deadline it spent waiting.
+    MODEM_PROBE_FAILURES - 1 of them can pass before the next gives up and
+    raises. The round that does refresh costs an interval and two deadlines,
+    because an answered liveness probe is followed by the registration probe,
+    which waits the same deadline for its own answer. Until the count runs out
+    the component is working and simply has not refreshed the snapshot.
     """
-    return cfg.MODEM_PROBE_FAILURES * (cfg.MODEM_PROBE_INTERVAL + cfg.MODEM_PROBE_TIMEOUT)
+    missed = max(0, cfg.MODEM_PROBE_FAILURES - 1) * (
+        cfg.MODEM_PROBE_INTERVAL + cfg.MODEM_PROBE_TIMEOUT
+    )
+    refreshing = cfg.MODEM_PROBE_INTERVAL + 2 * cfg.MODEM_PROBE_TIMEOUT
+    return missed + refreshing
+
+
+def test_the_refresh_budget_is_the_worst_gap_the_heartbeat_can_leave():
+    """Every floor below is measured against this figure, so it has to be the
+    gap the loop can actually produce. Understating it - by counting one
+    deadline for the round that asks two questions, or by leaving the probe's
+    own write and lock outside any deadline at all, which is what made the gap
+    unbounded before - puts the watchdog's threshold under the time a working
+    component legitimately spends not refreshing the snapshot.
+    """
+    assert config.WATCHDOG_REFRESH_BUDGET == _legitimate_refresh_gap(config)
 
 
 def test_watchdog_stall_threshold_clears_the_probes_own_retry_budget(monkeypatch):

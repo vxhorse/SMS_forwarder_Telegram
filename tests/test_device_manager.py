@@ -82,6 +82,35 @@ class FakeWriter:
         pass
 
 
+class FlowControlledWriter(FakeWriter):
+    """A port that takes one command's bytes and never lets them go.
+
+    This is what serial flow control does when the modem stops reading. The
+    write itself returns, because it only hands the bytes to the transport;
+    the drain that waits for that buffer to empty never returns and never
+    raises. Nothing is reported anywhere, because reporting it would need the
+    same port.
+
+    :param blocked: the command whose flush never completes. Every other
+        command is flushed normally, which is what a modem that goes quiet
+        part-way through a session actually does.
+    :param answer: awaited once a command has been flushed, standing in for
+        the modem's reply arriving on the read path.
+    """
+
+    def __init__(self, blocked: str = "", answer=None):
+        super().__init__()
+        self._blocked = f"{blocked}\r\n".encode() if blocked else None
+        self._answer = answer
+
+    async def drain(self):
+        last = self.written[-1] if self.written else b""
+        if last == self._blocked:
+            await asyncio.Event().wait()
+        if self._answer is not None:
+            await self._answer(last)
+
+
 class ClosedReader:
     """A stream at end of file: readline yields empty bytes, over and over."""
 
@@ -1244,6 +1273,204 @@ async def test_a_single_missed_heartbeat_keeps_the_session():
             await task
 
 
+async def _heartbeat_must_give_up(manager, blocked_on: str) -> str:
+    """Run one heartbeat loop until it reports a failure, and never longer.
+
+    The outer deadline is what protects the suite rather than the component:
+    without it a regression here does not fail, it hangs, and a hung suite
+    says nothing about which test hung it. Reaching that deadline is turned
+    into this test's own failure, naming what the loop was still waiting on.
+
+    :param blocked_on: what a regression would still be waiting for, quoted
+        back in the failure so the report says which bound was lost.
+    :return: the message the loop raised.
+    """
+    try:
+        await asyncio.wait_for(manager.heartbeat_loop(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail(
+            f"the heartbeat never reached a deadline of its own: it was still "
+            f"blocked on {blocked_on}"
+        )
+    except RuntimeError as exc:
+        return str(exc)
+    pytest.fail("the heartbeat loop ended without reporting a failure")
+
+
+async def _probe_must_finish(manager, command, answered, blocked_on: str):
+    """Run one probe with a deadline of the test's own around it.
+
+    The same protection _heartbeat_must_give_up gives the loop, for the tests
+    that drive a single probe directly. Without it a regression does not fail
+    these either: the probe blocks, and with nothing above it to give up, the
+    suite stops here rather than reporting anything.
+
+    :param blocked_on: what a regression would still be waiting for.
+    :return: what the probe reported.
+    """
+    try:
+        return await asyncio.wait_for(
+            manager._probe_once(command, answered), timeout=2.0
+        )
+    except asyncio.TimeoutError:
+        pytest.fail(
+            f"the probe never reached a deadline of its own: it was still "
+            f"blocked on {blocked_on}"
+        )
+
+
+async def test_a_blocked_write_is_a_missed_heartbeat_not_a_hang():
+    """Serial flow control has no deadline of its own, and no exception. A
+    modem that has stopped accepting bytes blocks the write, so a probe that
+    times only the reply never reaches the point where it would give up: the
+    check built to notice a silent modem is itself what stops running, and
+    nothing raises, so nothing downstream ever hears about it."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 1
+    manager.writer = FlowControlledWriter(blocked="AT+CSQ")
+
+    message = await _heartbeat_must_give_up(manager, "the write of AT+CSQ")
+
+    assert "heartbeat" in message
+    # The command was handed over: what never completed is the flush.
+    assert manager.writer.written == [b"AT+CSQ\r\n"]
+
+
+async def test_a_held_lock_is_a_missed_heartbeat_not_a_hang():
+    """The compounding case, and the worse one. A send whose write blocks is
+    holding the AT lock across both of its writes, so a probe that waits for
+    that lock outside its own deadline is waiting on a transaction that will
+    never finish - and the modem never has to go quiet for it to happen."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 1
+    await manager._at_lock.acquire()  # a send stuck mid-transaction
+
+    try:
+        message = await _heartbeat_must_give_up(manager, "the AT lock")
+    finally:
+        manager._at_lock.release()
+
+    assert "heartbeat" in message
+    # Nothing was written: the probe gave up before it ever took the port,
+    # which is what keeps it out of the middle of somebody else's transaction.
+    assert manager.writer.written == []
+
+
+async def test_a_blocked_write_on_the_registration_probe_is_a_miss_not_a_hang():
+    """The second question the heartbeat asks needs the same bound as the
+    first. It is written the same way and under the same lock, so a modem
+    that stops accepting bytes between the two probes blocks this one
+    instead - and a bound on the first alone would leave the loop hanging one
+    step further along."""
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99  # the liveness path must not be what raises
+    manager.registration_failures = 2
+
+    async def answer(command):
+        if command == b"AT+CSQ\r\n":
+            manager._probe_event.set()
+
+    manager.writer = FlowControlledWriter(blocked="AT+CREG?", answer=answer)
+
+    message = await _heartbeat_must_give_up(manager, "the write of AT+CREG?")
+
+    assert "registered" in message
+
+
+async def test_a_probe_cancelled_while_writing_leaves_the_lock_free():
+    """The deadline is only half of it. A probe that gave up while still
+    holding the port would hand the next probe, and every send after it, a
+    lock nothing will ever release: a bounded probe that deadlocks the whole
+    component instead of merely hanging itself."""
+    manager = _make()
+    manager.probe_timeout = 0.01
+    manager.writer = FlowControlledWriter(blocked="AT+CSQ")
+
+    gave_up = await _probe_must_finish(
+        manager, "AT+CSQ", manager._probe_event, "the write of AT+CSQ"
+    )
+    assert gave_up is False
+    assert manager._at_lock.locked() is False
+
+    # Not merely unlocked but usable: the next probe takes the port and is
+    # answered through it.
+    async def answer(command):
+        manager._probe_event.set()
+
+    manager.writer = FlowControlledWriter(answer=answer)
+    answered = await _probe_must_finish(
+        manager, "AT+CSQ", manager._probe_event, "the lock the last probe held"
+    )
+    assert answered is True
+
+
+async def test_a_probe_cancelled_while_waiting_for_the_lock_leaves_it_to_its_holder():
+    """Giving up on the lock must take nothing away from whoever holds it. A
+    probe that released a lock it never acquired would drop the next writer
+    into the middle of a send, where every byte written becomes part of the
+    outgoing message."""
+    manager = _make()
+    manager.probe_timeout = 0.01
+    await manager._at_lock.acquire()
+
+    gave_up = await _probe_must_finish(
+        manager, "AT+CSQ", manager._probe_event, "the AT lock"
+    )
+    assert gave_up is False
+    assert manager._at_lock.locked() is True
+    assert manager.writer.written == []
+
+    manager._at_lock.release()
+    assert manager._at_lock.locked() is False
+
+
+async def test_an_answered_probe_still_takes_the_port_and_gives_it_back():
+    """The bound must cost the ordinary case nothing. The command still goes
+    out under the lock, the reply still ends the wait, and the port is handed
+    back as soon as the write is done rather than kept for the whole deadline:
+    a probe holding it until its reply arrives would put every send behind
+    every probe, and a send that lost that race would wait out a deadline of
+    its own for a message the modem never saw."""
+    manager = _make()
+    manager.probe_timeout = 5.0
+    held_while_writing = []
+    held_while_waiting = []
+
+    async def reply():
+        # Runs once the probe is waiting for its answer, which is where the
+        # port has to be free again.
+        held_while_waiting.append(manager._at_lock.locked())
+        await manager.process_message(b"+CSQ: 21,99\r\n")
+
+    async def answer(command):
+        held_while_writing.append(manager._at_lock.locked())
+        asyncio.create_task(reply())
+
+    manager.writer = FlowControlledWriter(answer=answer)
+
+    answered = await _probe_must_finish(
+        manager, "AT+CSQ", manager._probe_event, "a reply that had already arrived"
+    )
+    assert answered is True
+    assert manager.writer.written == [b"AT+CSQ\r\n"]
+    assert held_while_writing == [True]
+    assert held_while_waiting == [False]
+    assert manager._at_lock.locked() is False
+
+
+# How long a wait that is meant never to finish waits for. Nothing reaches it:
+# whatever is parked on it is cancelled by the test that parked it. It exists
+# so a test ends on a condition the test controls rather than on a deadline
+# elapsing, which no assertion could then be sure of having beaten.
+_PARKED = 3600
+
+
 def _answering_modem(manager, replies):
     """Answer the heartbeat's probes, one registration reading at a time.
 
@@ -1255,7 +1482,13 @@ def _answering_modem(manager, replies):
 
     Once the entries run out the returned event is set and the probe parks
     rather than answering, so a test that has seen every round it scripted
-    ends the loop itself instead of racing a deadline.
+    ends the loop itself instead of racing a deadline. Parking now needs the
+    probe's deadline lifted first, because that deadline covers the whole
+    probe: left at the value the test chose to make an unanswered probe give
+    up quickly, it would end the parked probe too and count a miss no test
+    wrote. The deadline is lifted a step early, at the liveness probe of the
+    unscripted round, because _probe_once reads it before this responder is
+    called.
 
     :return: the commands as they are sent, and the event announcing that the
         scripted rounds are over.
@@ -1267,11 +1500,13 @@ def _answering_modem(manager, replies):
     async def respond(command):
         sent.append(command)
         if command == "AT+CSQ":
+            if not remaining:
+                manager.probe_timeout = _PARKED
             manager._probe_event.set()
             return
         if not remaining:
             exhausted.set()
-            await asyncio.sleep(3600)
+            await asyncio.sleep(_PARKED)
             return
         line = remaining.pop(0)
         if line is not None:
@@ -1707,7 +1942,14 @@ async def test_the_send_path_holds_the_port_across_the_prompt_window():
 
 async def test_the_heartbeat_waits_for_the_port_to_be_free():
     """The probe is the second writer this component gained. It must queue
-    behind a message being sent rather than writing into the middle of it."""
+    behind a message being sent rather than writing into the middle of it.
+
+    Queueing is bounded now: a probe that does not reach the port within its
+    deadline gives up and asks again next round rather than waiting for ever,
+    because a send whose own write has blocked never gives the port back. What
+    is unchanged, and is what this asserts, is that nothing is written while
+    somebody else holds it.
+    """
     manager = _make()
     manager._sleep = _no_delay
     manager.probe_timeout = 0.01

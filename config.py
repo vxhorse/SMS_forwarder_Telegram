@@ -129,40 +129,44 @@ MODEM_REGISTRATION_CHECK = os.getenv(
 ).strip().lower() not in ("0", "false", "no", "off")
 
 # The gap the heartbeat can legitimately leave between two refreshes of the
-# health snapshot. A missed probe costs its whole interval plus the deadline it
-# waits for a reply, and MODEM_PROBE_FAILURES of them in a row have to pass
-# before the probe gives up and raises. For all of that time the component is
-# working and has simply not refreshed the file. Anything that treats a gap this
+# health snapshot, written as the rounds that make it up.
+#
+# Only a round whose liveness probe went unanswered skips the refresh, and such
+# a round costs the interval before it plus the one deadline it spent waiting.
+# MODEM_PROBE_FAILURES - 1 of them can pass before the next one gives up and
+# raises. The round that does refresh costs an interval and two deadlines rather
+# than one, because an answered liveness probe is followed by the registration
+# probe, which waits the same deadline for its own answer:
+#
+#     max(0, F - 1) x (I + T)  +  (I + 2T)
+#
+# which is 110 seconds at the defaults. For all of that time the component is
+# working and has simply not refreshed the file, so anything treating a gap this
 # short as a failure is reading a slow modem as a dead one.
 #
-# This understates the true worst case, and knowingly. The heartbeat now asks a
-# second question after each answered probe, and waits the same deadline for the
-# answer, so the last round before it gives up can cost one interval plus two
-# deadlines rather than one:
+# This is an exact bound rather than an estimate, and it only became one when the
+# probe's own lock acquisition and write were brought inside its deadline. While
+# the deadline covered the reply alone there was no arithmetic to write: a modem
+# that stops accepting bytes blocks the write under serial flow control with no
+# bound and no exception, and a send stuck mid-transaction holds the AT lock the
+# probe needs, so the worst gap was unbounded rather than large.
 #
-#     (F - 1) x (I + T) + (I + 2T)     rather than     F x (I + T)
-#
-# which at the defaults is 110 seconds rather than 105. Both floors below still
-# hold with room to spare: WATCHDOG_STALL_FLOOR doubles this figure, and the
-# difference 2F(I+T) - [(F-1)(I+T) + (I+2T)] comes to F(I+T) - T, which stays
-# positive for any retry count of one or more, while a count of zero is covered
-# by the floor's other term. The formula is left alone rather than changed twice;
-# the loop's own timing is being revisited.
-#
-# The margin that did move is against HEALTH_STALE_SECONDS, which the container
-# healthcheck reads and which no floor here protects: 120 seconds against a worst
-# gap of 110 rather than 105. At the default interval and retry count the gap is
-# 90 + 4T, so it passes the window once MODEM_PROBE_TIMEOUT exceeds seven and a
-# half seconds - and that setting is neither capped nor clamped against the
-# window, so a generous reply deadline can fail the healthcheck on a process that
-# is working. MODEM_PROBE_INTERVAL is clamped for exactly this reason; the
-# deadline is not.
-WATCHDOG_REFRESH_BUDGET = MODEM_PROBE_FAILURES * (
-    MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT
+# The margin no floor here protects is the one against HEALTH_STALE_SECONDS,
+# which the container healthcheck reads: 120 seconds against a worst gap of 110.
+# At the default interval and retry count the gap is 90 + 4T, so it passes the
+# window once MODEM_PROBE_TIMEOUT exceeds seven and a half seconds - and that
+# setting is neither capped nor clamped against the window, so a generous reply
+# deadline can fail the healthcheck on a process that is working.
+# MODEM_PROBE_INTERVAL is clamped for exactly this reason; the deadline is not.
+WATCHDOG_REFRESH_BUDGET = (
+    max(0, MODEM_PROBE_FAILURES - 1) * (MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT)
+    + MODEM_PROBE_INTERVAL
+    + 2 * MODEM_PROBE_TIMEOUT
 )
 # Doubled for margin, because the probe is not the only thing the loop does
-# between refreshes. The second term keeps the floor positive if the probe is
-# configured never to retry at all.
+# between refreshes. The second term covers a configuration that has cut the
+# reply deadline and the retry count to almost nothing, where twice the budget
+# would come to barely more than a single round.
 WATCHDOG_STALL_FLOOR = max(2 * WATCHDOG_REFRESH_BUDGET, 4 * MODEM_PROBE_INTERVAL)
 
 # How long the health snapshot may go unrefreshed before the watchdog treats
