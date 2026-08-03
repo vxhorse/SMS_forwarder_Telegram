@@ -27,3 +27,9 @@ README_FA.md
 doc/
 *.pdf
 **/*.pdf
+docs/
+tests/
+pytest.ini
+requirements-dev.txt
+LICENSE
+.github/
