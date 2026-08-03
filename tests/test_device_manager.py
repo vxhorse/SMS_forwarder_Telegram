@@ -1,7 +1,9 @@
+import ast
 import asyncio
 import importlib
 import logging
 import os
+import pathlib
 import time
 from datetime import datetime, timedelta
 
@@ -2273,6 +2275,57 @@ async def test_a_notify_failure_cannot_break_the_device_path():
     manager.notify = failing_notify
     await manager.teardown()
     assert manager.writer is None
+
+
+def _dotted_name(node):
+    """Render an exception type as a dotted name, or None if it is not one."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _dotted_name(node.value)
+        return f"{parent}.{node.attr}" if parent else None
+    return None
+
+
+def test_the_write_cannot_start_swallowing_cancellations():
+    """The property in send_at_command_async that a widening edit could undo in
+    silence, guarded on the shape of the code rather than on behaviour.
+
+    The heartbeat's deadline works by cancelling the probe, and a cancelled
+    probe has to leave through this method rather than be caught in it: a
+    handler that swallowed the cancellation would turn that bound back into the
+    hang it was written to remove. The guard here is narrow only because
+    CancelledError derives from BaseException while the handler below catches
+    Exception - a distinction one word wide, and one that no behavioural test
+    can object to until the day it is edited away. Handling the cancellation
+    explicitly is what makes widening the handler visibly wrong.
+    """
+    from module import device_manager as dm_module
+
+    tree = ast.parse(pathlib.Path(dm_module.__file__).read_text())
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "send_at_command_async"
+    )
+    handlers = [
+        handler
+        for node in ast.walk(method)
+        if isinstance(node, ast.Try)
+        for handler in node.handlers
+    ]
+
+    assert handlers, "the write around which this property exists is gone"
+    first = handlers[0]
+    assert _dotted_name(first.type) in ("asyncio.CancelledError", "CancelledError"), (
+        "a cancellation must be handled before anything broader can catch it"
+    )
+    assert len(first.body) == 1 and isinstance(first.body[0], ast.Raise), (
+        "the cancellation handler must do nothing but re-raise"
+    )
+    assert first.body[0].exc is None, (
+        "the cancellation must be re-raised as it arrived"
+    )
 
 
 async def test_obsolete_methods_are_gone():
