@@ -8,6 +8,11 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The suite exercises supervision loops, backoff and a watchdog. A
+    # regression in any of them shows up as a test that never returns, and
+    # without a timeout that would burn the six-hour default budget instead of
+    # failing. Ten minutes is far above the suite's normal runtime.
+    timeout-minutes: 10
     strategy:
       matrix:
         python-version: ["3.11", "3.13"]
@@ -23,6 +28,7 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Build image
