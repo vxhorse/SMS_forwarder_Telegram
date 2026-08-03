@@ -10,6 +10,7 @@ candidates and keeps the first that answers.
 import asyncio
 import glob
 import os
+import time
 from typing import Callable, List, Optional
 
 import serial_asyncio
@@ -65,10 +66,9 @@ async def probe_port(
     try:
         writer.write(b"AT\r\n")
         await writer.drain()
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        deadline = time.monotonic() + timeout
         while True:
-            remaining = deadline - loop.time()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
             try:
@@ -104,7 +104,7 @@ async def discover_port(
     logger.info(f"Probing {len(candidates)} candidate port(s) under {dev_root}")
     for path in candidates:
         if await probe_port(path, baudrate, timeout, opener=opener):
-            logger.warning(f"Discovered modem AT port: {path}")
+            logger.info(f"Discovered modem AT port: {path}")
             return path
         logger.debug(f"No AT response from {path}")
 
