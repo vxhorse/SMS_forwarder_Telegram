@@ -430,6 +430,24 @@ async def test_a_tripped_watchdog_exits_one(monkeypatch, tmp_path):
     assert device.teardowns.count >= 1
 
 
+async def test_a_stalled_process_exits_one(monkeypatch, tmp_path):
+    """The other way the watchdog trips has to ask for a restart just as
+    plainly. A stall leaves every component reporting up, so an exit code of
+    zero here would read as a clean shutdown and the container would stay
+    stopped with nothing forwarded."""
+    device = _FakeComponent("device")
+    telegram = _FakeComponent("telegram")
+    _, supervisor, _, _, shutdown = _install(monkeypatch, tmp_path, device, telegram)
+
+    async def trip():
+        supervisor.exit_reason = "stalled"
+        shutdown.set()
+
+    monkeypatch.setattr(supervisor, "watchdog_loop", trip)
+
+    assert await asyncio.wait_for(main.run(), timeout=_FAILSAFE) == 1
+
+
 async def test_a_configuration_error_exits_two(monkeypatch, tmp_path):
     """Restarting cannot supply a token that was never configured, so this is
     the one failure that has to be told apart from every other one."""

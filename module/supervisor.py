@@ -123,7 +123,8 @@ class Supervisor:
     or in main.py:
       1. SIGTERM / SIGINT
       2. FatalConfigError, which restarting cannot fix but which must be visible
-      3. The watchdog, once a component has been down past the threshold
+      3. The watchdog, once a component has been down past the threshold or
+         the health snapshot has gone unrefreshed past its own
     """
 
     def __init__(self, health: HealthState, shutdown_event: asyncio.Event):
@@ -255,11 +256,20 @@ class Supervisor:
         self,
         threshold: float = config.WATCHDOG_DOWN_SECONDS,
         interval: float = config.WATCHDOG_CHECK_INTERVAL,
+        stall_threshold: float = config.WATCHDOG_STALL_SECONDS,
     ) -> None:
-        """Exit the process once a component has been down past the threshold.
+        """Exit the process on either of the two ways a component can be lost.
 
-        The threshold is far above any normal reconnection time, so this only
-        fires when something is genuinely stuck rather than merely flapping.
+        A component that fails loudly is caught by down_duration: it raised,
+        the supervisor marked it down, and the clock has been running since.
+
+        A component that blocks without raising is caught by the snapshot age.
+        It is still marked up, so down_duration reads zero, but nothing is
+        refreshing the file any more. Without this second check that failure
+        is invisible and the process sits there forever.
+
+        Both thresholds sit far above any normal cycle, so neither fires on a
+        component that is merely reconnecting.
         """
         while not self.shutdown_event.is_set():
             try:
@@ -276,5 +286,29 @@ class Supervisor:
                     f"container runtime can restart everything"
                 )
                 self.exit_reason = "watchdog"
+                self.shutdown_event.set()
+                return
+
+            # Only asked while nothing is reported down, which down_duration
+            # reading zero is exactly the statement of. The snapshot is written
+            # only while every component is up, so anything that is down stops
+            # it being refreshed too; acting on the age in that state would put
+            # a second, far shorter ceiling on a component that is merely
+            # reconnecting, and would report it as the wrong kind of failure.
+            # What is down is already on the clock above, with the tolerance
+            # chosen for it.
+            stalled = self.health.stall_duration() if duration == 0.0 else None
+            # None also means the system has not been fully up even once. That
+            # is a process still waiting for its dependencies, which must never
+            # be killed for waiting.
+            if stalled is not None and stalled >= stall_threshold:
+                logger.error(
+                    f"Watchdog tripped: the health snapshot has not been "
+                    f"refreshed for {stalled:.0f}s (threshold "
+                    f"{stall_threshold:.0f}s) while every component still "
+                    f"reports up, which means something is blocked rather than "
+                    f"failing; exiting so the container runtime can restart it"
+                )
+                self.exit_reason = "stalled"
                 self.shutdown_event.set()
                 return
