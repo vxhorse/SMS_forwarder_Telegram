@@ -1,11 +1,11 @@
-# Python缓存文件
+# Python cache files
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
 
-# 环境文件
+# Environment files
 .env
 .env.*
 !.env.example
@@ -13,20 +13,29 @@ venv/
 env/
 .venv/
 
-# 日志文件
+# Log files
 *.log
 logs/
 
-# Docker相关
+# Docker related
 *.tar
 *.tar.gz
 *.tgz
 docker-compose.yml
 docker-compose.yaml
+# Backups of the local compose file carry the same credentials it does.
+docker-compose.yml.bak-*
+docker-compose.yaml.bak-*
 
-# 系统文件
+# System files
 .DS_Store
 
-# 编辑器配置
+# Editor configuration
 .idea/
 .vscode/
+
+# Local workflow documents, not in repository
+docs/superpowers/
+
+# Local deployment records name specific hosts
+docs/deployments/

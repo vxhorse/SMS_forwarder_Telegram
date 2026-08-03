@@ -1,29 +1,28 @@
-# 使用Python官方轻量级镜像
+# Official slim Python image.
 FROM python:3.11-slim
 
-# 环境变量：关闭 .pyc 生成，开启无缓冲输出，便于日志实时输出
+# No .pyc files, and unbuffered output so logs appear as they are written.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# 安装必要的系统依赖
-# - tini: 作为init进程，正确处理信号和僵尸进程
-# - ca-certificates/tzdata：保证 HTTPS 及时区配置
+# System dependencies:
+# - tini: init process, so signals reach the app and zombies are reaped
+# - ca-certificates / tzdata: HTTPS trust store and time zone data
 RUN apt-get update && \
     apt-get install -y --no-install-recommends tini ca-certificates tzdata && \
     rm -rf /var/lib/apt/lists/*
 
-# 工作目录
 WORKDIR /app
 
-# 先复制依赖文件再安装，充分利用 Docker 构建缓存
+# Dependencies are copied and installed before the source, so editing the
+# source does not invalidate the cached install layer.
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 复制项目源码到容器
 COPY . .
 
-# 使用 tini 作为 init 进程，确保信号正确传递
+# tini as init, so SIGTERM is delivered to the application rather than absorbed.
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
-# 直接运行 Python 程序（不通过 shell 脚本）
+# Run the program directly, with no shell wrapper in between.
 CMD ["python", "main.py"]

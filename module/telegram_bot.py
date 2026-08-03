@@ -1,146 +1,214 @@
-# 官方文档 https://core.telegram.org/bots/api
+# Telegram Bot API reference: https://core.telegram.org/bots/api
+#
+# Note: user-facing Telegram strings stay in the operator's language;
+# only code comments and log messages are English.
+#
+# Nothing here may reproduce a message. This channel carries one-time codes and
+# bank notifications, so log lines report counts, lengths, chat identity and
+# status, never content.
 
 import aiohttp
 import asyncio
 import json
 import re
 import html
-import time
 from typing import Optional, Callable, Dict, Any
 from logger import setup_logger
+from module.supervisor import FatalConfigError
 
 logger = setup_logger(__name__)
 
+
+# What may leave this module inside an exception, and why.
+#
+# Every request built here carries the bot token in its path
+# (https://api.telegram.org/bot<TOKEN>/...), and that token grants both read and
+# write access to the chat. Several aiohttp exception types append the request
+# URL to their own str(), so any of them escaping this module puts the token
+# into whatever logs the failure - and the callers that report a failed
+# component interpolate the exception they are handed.
+#
+# So no exception built from a request is ever allowed out. Failures leave as
+# TelegramApiError, whose text this module writes itself, and any exception text
+# that is echoed has the token removed from it first.
+
+
+class TelegramApiError(Exception):
+    """An API call failed, described without any part of the request."""
+
+
+# aiohttp types that render the request URL in their own str(). These two cover
+# all eight: ContentTypeError, ClientHttpProxyError, TooManyRedirects and
+# WSServerHandshakeError derive from ClientResponseError, and the two
+# InvalidUrl* errors derive from InvalidURL.
+_URL_RENDERING_ERRORS = (aiohttp.ClientResponseError, aiohttp.InvalidURL)
+
+# What a request can fail with. aiohttp.ClientError covers every type above.
+_REQUEST_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
+
+
+def _scrub(text: str, token: str) -> str:
+    """Remove the bot token from a string.
+
+    An empty token is left alone rather than treated as absent: an empty needle
+    matches between every character, which would rewrite the whole string.
+    """
+    if not token:
+        return text
+    return text.replace(token, "<token>")
+
+
 class TelegramBot:
-    # 命令配置
+    """The Telegram component: one API session and everything on top of it.
+
+    Supervised through the ManagedService contract (connect_once / run /
+    teardown), so reconnection has exactly one owner and lives elsewhere.
+    """
+
+    # Command definitions.
     COMMANDS = {
         'start': {
             'command': '/start',
             'description': '开始使用机器人',
-            'help_text': '显示欢迎消息并初始化机器人',
-            'keyboard_text': '🏠 主菜单'
+            'help_text': '显示欢迎消息并初始化机器人'
         },
         'help': {
             'command': '/help',
             'description': '显示帮助信息',
-            'help_text': '显示所有可用的命令和使用说明',
-            'keyboard_text': '💁 帮助'
+            'help_text': '显示所有可用的命令和使用说明'
         },
         'sendsms': {
             'command': '/sendsms',
             'description': '发送短信',
-            'help_text': '开始发送短信的流程',
-            'keyboard_text': '📲 发送短信'
+            'help_text': '开始发送短信的流程'
         }
     }
 
-    # 默认键盘配置
+    # Inline keyboard layouts.
     KEYBOARD_LAYOUTS = {
-        # 'main_menu': [
-        #     [
-        #         {'text': COMMANDS['sendsms']['keyboard_text'], 
-        #          'callback_data': 'sendsms'}
-        #     ],
-        #     [
-        #         {'text': COMMANDS['help']['keyboard_text'], 
-        #          'callback_data': 'help'}
-        #     ]
-        # ],
         'cancel': [
             [{'text': '✖️ 取消操作', 'callback_data': 'cancel_sms'}]
         ],
         'sms_reply': [
             [
                 {'text': '↩️ 回复', 'callback_data': 'reply_{}'},
-                # {'text': '🚫 屏蔽', 'callback_data': 'block_{}'}
             ]
         ]
     }
 
-    def __init__(self, send_sms_callback: Callable, bot_token: str, chat_id: str, proxy_url: Optional[str]):
+    def __init__(self, send_sms_callback: Callable, bot_token: str, chat_id: str,
+                 proxy_url: Optional[str], health=None):
         """
-        初始化 Telegram Bot 实例
-        
-        Args:
-            send_sms_callback: 用于发送短信的回调函数
-            bot_token: Telegram Bot API token
-            chat_id: 目标聊天 ID
-            proxy_url: 代理服务器地址(可选)
+        Set up the Telegram component.
+
+        :param send_sms_callback: called to send a message through the modem
+        :param bot_token: Telegram Bot API token
+        :param chat_id: the chat this bot talks to
+        :param proxy_url: outbound proxy, or None
+        :param health: HealthState whose snapshot file this keeps fresh
         """
-        # 基础配置
         self.send_sms_callback = send_sms_callback
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.proxy_url = proxy_url
         self.base_url = f'https://api.telegram.org/bot{self.bot_token}/'
 
-        # 连接参数
+        # Connection parameters.
         self.max_retries = 3
         self.retry_delay = 5
         self.timeout = aiohttp.ClientTimeout(total=60)
 
-        # 运行状态
+        # Running state.
         self.is_running = False
-        self.last_activity = time.time()
-        self.exit_event = asyncio.Event()
-        self.polling_task: Optional[asyncio.Task] = None
 
-        # 启动就绪事件（供 main.py 等待）
-        self.priming_event = asyncio.Event()
-
-        # 会话管理
+        # Session management.
         self.session: Optional[aiohttp.ClientSession] = None
         self.session_lock = asyncio.Lock()
         self.offset = 0
         self.user_state: Dict[str, Dict[str, Any]] = {}
 
-    async def connect(self) -> None:
-        """连接到 Telegram API 并初始化机器人"""
-        logger.info("正在连接到 Telegram API...")
-        try:
-            async with self.session_lock:
-                self.session = aiohttp.ClientSession(timeout=self.timeout)
+        self.name = "telegram"
+        self.health = health
 
-            if await self.verify_connection():
-                await self.setup_commands()
-                self.is_running = True
-                self.priming_event.set()
-                self.polling_task = asyncio.create_task(self.polling_loop())
-                logger.info("成功连接到 Telegram API")
-                # 欢迎消息在就绪之后发送，失败不影响服务启动
-                try:
-                    await self.send_welcome_message()
-                except Exception as e:
-                    logger.warning(f"发送欢迎消息失败（不影响服务运行）: {e}")
-            else:
-                raise ConnectionError("无法连接到 Telegram API")
-        except Exception as e:
-            logger.error(f"连接时发生错误: {e}")
-            # 确保is_running标志被设置为False
-            self.is_running = False
-            self.priming_event.set()  # 即使失败也要通知，避免 main.py 永久等待
-            # 标记为未连接状态，让start()方法抛出异常
-            raise
+    def _describe_error(self, exc: BaseException) -> str:
+        """Describe a failure without reproducing any part of the request.
 
-    async def reconnect(self) -> bool:
-        """重新连接到 Telegram API
+        For a type that renders the URL, only the class name and the status are
+        echoed; both come from aiohttp's own vocabulary rather than from the
+        request, which is what makes them safe. Every other exception keeps its
+        message, because that is where the useful detail lives - a refused proxy
+        names the address it could not reach - with the token removed in case
+        one ever carries it. The allow-list decides what may be quoted; the
+        scrub is a second guard for types not anticipated here.
         """
-        logger.info("尝试重新连接到 Telegram API...")
-        try:
-            async with self.session_lock:
-                # 确保旧的session已关闭
-                if self.session is not None and not self.session.closed:
-                    await self.session.close()
+        detail = type(exc).__name__
+        status = getattr(exc, "status", None)
+        if isinstance(status, int):
+            detail = f"{detail} (HTTP {status})"
+        if not isinstance(exc, _URL_RENDERING_ERRORS):
+            text = _scrub(str(exc), self.bot_token)
+            if text:
+                detail = f"{detail}: {text}"
+        return detail
 
-                # 创建新的session
-                self.session = aiohttp.ClientSession(timeout=self.timeout)
-            return await self.verify_connection()
-        except Exception as e:
-            logger.error(f"重新连接时发生错误: {e}")
-            return False
+    def validate_config(self) -> None:
+        """Reject placeholder or missing credentials.
+
+        This raises FatalConfigError rather than a retryable error because no
+        amount of restarting will supply a token that was never configured.
+        """
+        if not self.bot_token or self.bot_token == "your_telegram_bot_token":
+            raise FatalConfigError("BOT_TOKEN is not configured")
+        if not self.chat_id or self.chat_id == "your_telegram_chat_id":
+            raise FatalConfigError("CHAT_ID is not configured")
+
+    async def connect_once(self) -> None:
+        """Establish one session. Failure raises; the supervisor backs off.
+
+        An outbound proxy may well come up after this process does, so an
+        unreachable API is a dependency that is not ready yet, not a reason to
+        terminate. The configuration check runs first, before anything is
+        opened, so the one path that does terminate holds no resources.
+        """
+        self.validate_config()
+        async with self.session_lock:
+            if self.session is not None and not self.session.closed:
+                await self.session.close()
+            self.session = aiohttp.ClientSession(timeout=self.timeout)
+
+        if not await self.verify_connection():
+            raise ConnectionError("Telegram API is not reachable")
+
+        await self.setup_commands()
+        self.is_running = True
+        logger.info("Connected to the Telegram API")
+
+    async def run(self) -> None:
+        """Long polling. Errors propagate so the supervisor reconnects."""
+        await self.polling_loop()
+
+    async def teardown(self) -> None:
+        """Release the session. Idempotent, never raises."""
+        self.is_running = False
+        try:
+            if self.session is not None and not self.session.closed:
+                await self.session.close()
+        except Exception as exc:
+            logger.warning(f"Error closing the Telegram session: {self._describe_error(exc)}")
+        self.session = None
+
+    async def notify(self, text: str) -> None:
+        """Report component state outward. Silent when the channel is down."""
+        if self.session is None or self.session.closed:
+            logger.debug("Telegram session unavailable, dropping notification")
+            return
+        try:
+            await self.send_message(text)
+        except Exception as exc:
+            logger.warning(f"Could not send notification: {self._describe_error(exc)}")
 
     async def setup_commands(self) -> None:
-        """设置机器人的命令列表"""
+        """Publish the bot's command list."""
         commands = [
             {
                 "command": cmd_info['command'].strip('/'),
@@ -153,153 +221,98 @@ class TelegramBot:
         try:
             async with self.session.post(url, json={'commands': commands}, proxy=self.proxy_url) as response:
                 if response.status == 200:
-                    logger.info("已成功设置机器人命令列表")
+                    logger.info("Command list published")
                 else:
-                    logger.error(f"设置命令列表失败: {response.status}")
+                    logger.error(f"Could not publish the command list: HTTP {response.status}")
         except Exception as e:
-            logger.error(f"设置命令列表时发生错误: {e}")
+            # Not fatal to the session: a bot whose command menu is stale still
+            # forwards messages.
+            logger.error(f"Error publishing the command list: {self._describe_error(e)}")
 
     async def verify_connection(self) -> bool:
-        """验证与 Telegram API 的连接
-        """
+        """Confirm the API answers for this token."""
         url = f'{self.base_url}getMe'
 
-        async with self.session.get(url, proxy=self.proxy_url) as response:
-            if response.status == 200:
-                data = await response.json()
-                if data.get('ok'):
-                    logger.debug(f"成功连接到 Telegram Bot: {data['result']['username']}")
-                    return True
-        logger.error(f"检查连接失败，状态码: {response.status if response.status else 'empty'}")
+        try:
+            async with self.session.get(url, proxy=self.proxy_url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('ok'):
+                        # The bot's own identity, not anyone's message.
+                        username = data.get('result', {}).get('username')
+                        logger.debug(f"Connected to Telegram bot: {username}")
+                        return True
+                logger.error(f"Connection check failed: HTTP {response.status}")
+        except _REQUEST_ERRORS as exc:
+            # Detached from the original with "from None" so no traceback or
+            # chained context can carry the URL onward either. The response body
+            # is decoded inside this block on purpose: a proxy answering with an
+            # HTML error page makes json() raise ContentTypeError, which renders
+            # the URL.
+            raise TelegramApiError(
+                f"getMe failed: {self._describe_error(exc)}"
+            ) from None
         return False
 
-    async def start(self) -> None:
-        """
-        启动 Telegram Bot 服务。
-        """
-        try:
-            # 连接到 Telegram API
-            await self.connect()
-            # 等待退出事件
-            await self.exit_event.wait()
-        except Exception as e:
-            logger.error(f"Telegram Bot 启动失败: {e}")
-            self.priming_event.set()  # 确保 main.py 不会永久等待
-            raise
-
-    async def close(self) -> None:
-        """关闭 Telegram Bot 连接"""
-        logger.info("正在关闭 Telegram Bot 连接...")
-
-        self.is_running = False
-        try:
-            # 取消轮询任务
-            if self.polling_task and not self.polling_task.done():
-                self.polling_task.cancel()
-                try:
-                    await self.polling_task
-                except (asyncio.CancelledError, Exception) as e:
-                    logger.warning(f"轮调任务取消: {e}")
-                self.polling_task = None
-            
-            # 关闭会话
-            if self.session and not self.session.closed:
-                await self.session.close()
-            
-            # 设置退出事件
-            self.exit_event.set()
-        except Exception as e:
-            logger.error(f"关闭连接时出现错误: {e}")
-        finally:
-            self.is_running = False
-            logger.info("Telegram Bot 连接已关闭")
-
     async def polling_loop(self) -> None:
-        """
-        长轮调循环，持续检查新的更新
-        """
-        if self.is_running:
-            logger.warning("长轮询循环polling_loop已启动")
+        """Long polling loop. Any error propagates to the supervisor.
 
-        max_consecutive_errors = 5  # 最大连续错误次数
-        consecutive_errors = 0  # 当前连续错误次数
+        Nothing is retried here. Counting errors and backing off is the
+        supervisor's job, and a second copy of that policy inside this loop
+        would compound with it: two delays multiplied together can stall the
+        bot for far longer than either was meant to allow.
+        """
+        logger.info("Long polling started")
+        self.is_running = True
 
         while self.is_running:
-            try:
-                # 获取更新
-                updates = await self.get_updates()
+            updates = await self.get_updates()
+            for update in updates:
+                await self.process_update(update)
+            # Refreshing only, never mark_up(): see Supervisor._serve_session
+            # for why that decision cannot be made from inside a component's
+            # own loop.
+            if self.health is not None:
+                self.health.refresh_file()
+            if not updates:
+                # The one path that can finish an iteration having done no
+                # work. Without this wait an API that answers instantly turns
+                # the loop into a full-speed one that never yields.
+                await asyncio.sleep(2)
 
-                if not updates:
-                    # 如果没有更新，则稍作等待以避免频繁请求
-                    await asyncio.sleep(2)
-                for update in updates:
-                    await self.process_update(update)
-
-                # 更新最后活动时间，重置错误计数
-                self.last_activity = time.time()
-                consecutive_errors = 0
-            except (asyncio.TimeoutError,
-                    aiohttp.ClientConnectionError,
-                    aiohttp.ClientResponseError) as e:
-                consecutive_errors += 1
-                logger.error(f"轮调过程中出现网络错误: {type(e).__name__}")
-
-                # 如果连续错误次数超过阈值，停止服务
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.error(f"连续网络错误达到 {consecutive_errors} 次，停止服务")
-                    self.is_running = False
-                    # 确保抛出异常让上层知道服务已停止
-                    raise RuntimeError(f"Telegram API 连接失败: {type(e).__name__}")
-                
-                # 否则尝试等待并重新连接
-                retry_delay = min(30, consecutive_errors * 5)
-                logger.debug(f"将在 {retry_delay} 分钟后重试连接")
-                await asyncio.sleep(retry_delay * 60)
-                
-                if not await self.reconnect():
-                    logger.error("重连失败，停止服务")
-                    self.is_running = False
-                    # 确保抛出异常让上层知道服务已停止
-                    raise RuntimeError("Telegram API 重连失败")
-            except asyncio.CancelledError:
-                logger.warning("轮调任务被取消")
-                break
-            except Exception as e:
-                consecutive_errors += 1
-                logger.error(f"轮调过程中出现未知错误: {e}")
-                
-                # 如果连续错误次数超过阈值，停止服务
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.error(f"连续未知错误达到 {consecutive_errors} 次，停止服务")
-                    self.is_running = False
-                    raise RuntimeError(f"Telegram Bot 服务出错: {e}")
-                    
-                await asyncio.sleep(10)
-
-        logger.warning("长轮询循环polling_loop已关闭")
+        logger.info("Long polling stopped")
 
     async def get_updates(self) -> list:
-        """
-        从 Telegram API 获取更新
-        """
+        """Fetch pending updates from the API."""
         url = f'{self.base_url}getUpdates'
         params = {'offset': self.offset, 'timeout': 50}
-        async with self.session.get(url, params=params, proxy=self.proxy_url) as response:
-            if response.status == 200:
-                data = await response.json()
-                return data.get('result', [])
-            else:
+        try:
+            async with self.session.get(url, params=params, proxy=self.proxy_url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get('result', [])
+                # The body is not quoted: an error reply is an unbounded
+                # server-controlled string, and its size is enough to tell an
+                # empty answer from a real one. Raising this rather than letting
+                # aiohttp raise for status matters just as much: a
+                # ClientResponseError carries the request it came from and
+                # prints the URL, so a routine 409 or 401 would publish the
+                # token on every attempt.
                 error_text = await response.text()
-                # 对于非 200 状态码，使用 ClientResponseError 更合适
-                raise aiohttp.ClientResponseError(
-                    request_info=response.request_info,
-                    history=response.history,
-                    status=response.status,
-                    message=f"无法获取更新，状态码: {response.status}, 响应: {error_text}"
+                raise TelegramApiError(
+                    f"Could not fetch updates: HTTP {response.status}, "
+                    f"{len(error_text)} byte reply"
                 )
+        except _REQUEST_ERRORS as exc:
+            raise TelegramApiError(
+                f"Could not fetch updates: {self._describe_error(exc)}"
+            ) from None
 
     async def process_update(self, update: dict) -> None:
-        """处理单个更新
+        """Route one update, once it is known to come from the configured chat.
+
+        Authorisation lives here, at the routing point, so every branch that can
+        reach a handler is guarded by the same check in one readable place.
         """
         self.offset = max(self.offset, update['update_id'] + 1)
 
@@ -309,42 +322,33 @@ class TelegramBot:
             if chat_id == self.chat_id:
                 await self.handle_message(message['text'], chat_id)
             else:
-                logger.warning(f"收到来自未授权用户的消息: chat_id {chat_id}")
+                logger.warning(f"Message from an unauthorised chat: {chat_id}")
         elif 'callback_query' in update:
-            await self.process_callback_query(update['callback_query'])
+            callback_query = update['callback_query']
+            # A button press is as unauthenticated as a message: anyone who can
+            # reach the bot can send one, and the handler writes to user_state
+            # under the presser's own chat id. Navigated with get() because a
+            # callback need not carry a message at all.
+            chat_id = str(callback_query.get('message', {}).get('chat', {}).get('id'))
+            if chat_id == self.chat_id:
+                await self.process_callback_query(callback_query)
+            else:
+                logger.warning(f"Callback from an unauthorised chat: {chat_id}")
         else:
-            logger.warning(f"收到未知类型的更新: {update.keys()}")
-
-    async def handle_blocking(self) -> None:
-        """关闭连接并尝试重新创建长轮询携程"""
-        logger.warning("尝试重新创建长轮询携程...")
-
-        # 尝试取消当前的轮询任务
-        if self.polling_task and not self.polling_task.done():
-            self.polling_task.cancel()
-            try:
-                await self.polling_task
-            except asyncio.CancelledError:
-                logger.warning("卡住的轮询任务已成功取消")
-
-        # 重新连接
-        if await self.reconnect():
-            # 如果成功重建连接，重新启动轮询
-            logger.info("重新连接成功，重新启动轮询任务")
-            self.polling_task = asyncio.create_task(self.polling_loop())
-        else:
-            logger.error("重新连接失败，关闭 Telegram Bot")
-            await self.close()
+            # Field names only. Their values may hold a message body.
+            logger.warning(f"Update of an unhandled kind: {sorted(update.keys())}")
 
     async def handle_message(self, text: str, chat_id: str) -> None:
         """
-        处理收到的消息
-        
-        Args:
-            text: 消息文本
-            chat_id: 聊天ID
+        Handle one inbound message.
+
+        :param text: the message text
+        :param chat_id: the chat it came from
         """
-        logger.info(f"收到来自 {chat_id} 的消息: {text}")
+        # The text itself never reaches the log: an inbound message may be a
+        # forwarded code being replied to, or anything else a person typed.
+        # Chat identity and length are enough to follow the flow.
+        logger.info(f"Message received from {chat_id}: {len(text)} character(s)")
 
         if text.startswith('/'):
             await self.handle_command(text, chat_id)
@@ -353,11 +357,10 @@ class TelegramBot:
 
     async def handle_command(self, text: str, chat_id: str) -> None:
         """
-        处理命令消息
-        
-        Args:
-            text: 命令文本
-            chat_id: 聊天ID
+        Handle a slash command.
+
+        :param text: the command text
+        :param chat_id: the chat it came from
         """
         command = text.split()[0].lower().lstrip('/')
 
@@ -372,8 +375,7 @@ class TelegramBot:
             await self.send_message("🤔 未知命令。请使用 /help 查看可用命令。")
 
     async def handle_sms_input(self, text: str, chat_id: str) -> None:
-        """处理短信输入流程
-        """
+        """Advance the guided send flow with whatever the user typed."""
         state = self.user_state.get(chat_id, {}).get('state')
         if state == 'awaiting_number':
             await self.handle_phone_number_input(text, chat_id)
@@ -383,7 +385,7 @@ class TelegramBot:
             await self.send_message("请使用 /sendsms 命令开始发送短信。")
 
     async def handle_phone_number_input(self, text: str, chat_id: str) -> None:
-        """处理电话号码输入"""
+        """Accept a destination number, or ask for it again."""
         if not re.match(r'^\+?[0-9]+$', text):
             await self.send_message(
                 "🔃 无效的电话号码。请输入正确的电话号码，仅包含数字和可选的前导加号。请重新输入：",
@@ -398,7 +400,7 @@ class TelegramBot:
         )
 
     async def handle_sms_content_input(self, text: str, chat_id: str) -> None:
-        """处理短信内容输入"""
+        """Send what the user typed through the modem."""
         number = self.user_state[chat_id]['number']
         success = await self.send_sms_callback(number, text)
         result_message = "✅ 短信已成功发送" if success else "❌ 发送短信失败"
@@ -409,18 +411,14 @@ class TelegramBot:
         )
         self.user_state.pop(chat_id, None)
 
-    # 判断广告和回复T
     async def handle_forwarding_sms(self, phone_number: str, timestamp: str, content: str) -> bool:
         """
-        处理接收到的短信并转发到 Telegram
-        
-        Args:
-            phone_number: 发送者号码
-            timestamp: 发送时间戳
-            content: 短信内容
-            
-        Returns:
-            bool: 转发是否成功
+        Forward one received message to Telegram.
+
+        :param phone_number: sender number
+        :param timestamp: the carrier's timestamp
+        :param content: the message text
+        :return: whether the forward succeeded
         """
         safe_phone_number = html.escape(phone_number)
 
@@ -437,11 +435,11 @@ class TelegramBot:
             message,
             parse_mode='HTML',
             reply_markup=reply_markup,
-            disable_notification=False  # 收到短信时启用通知提示音
+            disable_notification=False  # a received message should make a sound
         )
 
     async def process_callback_query(self, callback_query: dict) -> None:
-        """处理回调查询"""
+        """Handle a button press."""
         query_id = str(callback_query['id'])
         chat_id = str(callback_query['message']['chat']['id'])
         data = callback_query['data']
@@ -458,29 +456,38 @@ class TelegramBot:
                 reply_markup=self.get_keyboard('cancel')
             )
         else:
-            logger.warning(f"回调查询出现意外参数: {data}")
+            # Callback data is written by this file and capped at 64 bytes by
+            # the API, so it can never carry a message body.
+            logger.warning(f"Unexpected callback data: {data}")
 
     async def cancel_operation(self, chat_id: str) -> None:
-        """取消当前操作
-        """
+        """Drop any in-progress send flow for one chat."""
         assert isinstance(chat_id, str)
         if chat_id in self.user_state:
             del self.user_state[chat_id]
         await self.send_message("❎️ 已取消操作。")
 
     async def answer_callback_query(self, callback_query_id: str, text: str) -> None:
-        """回答回调查询"""
+        """Acknowledge a button press so the client stops showing a spinner."""
         url = f'{self.base_url}answerCallbackQuery'
         data = {
             'callback_query_id': callback_query_id,
             'text': text
         }
-        async with self.session.post(url, json=data, proxy=self.proxy_url) as response:
-            if response.status != 200:
-                logger.warning(f'回答回调查询失败，状态码: {response.status}')
+        try:
+            async with self.session.post(url, json=data, proxy=self.proxy_url) as response:
+                if response.status != 200:
+                    logger.warning(f'Could not answer a callback query: HTTP {response.status}')
+        except _REQUEST_ERRORS as exc:
+            # Propagates on purpose: this runs inside the polling loop, so a
+            # session broken here has to reach the supervisor rather than being
+            # swallowed by a button press.
+            raise TelegramApiError(
+                f"Could not answer a callback query: {self._describe_error(exc)}"
+            ) from None
 
     async def send_welcome_message(self) -> None:
-        """发送欢迎消息"""
+        """Send the welcome text."""
         welcome_message = (
             "👋 <b>欢迎使用 SMS 转发 Bot！</b>\n\n"
             "这个机器人可以帮助你发送短信和接收转发的短信。\n"
@@ -492,7 +499,7 @@ class TelegramBot:
         )
 
     async def send_help_message(self) -> None:
-        """发送帮助消息"""
+        """Send the command reference."""
         help_sections = []
         for cmd_info in self.COMMANDS.values():
             help_sections.append(
@@ -513,10 +520,9 @@ class TelegramBot:
 
     async def send_number_reception(self, chat_id: str) -> None:
         """
-        开始发送短信流程
-        
-        Args:
-            chat_id: 聊天ID
+        Start the guided send flow by asking for a destination number.
+
+        :param chat_id: the chat to prompt
         """
         self.user_state[chat_id] = {'state': 'awaiting_number'}
         await self.send_message(
@@ -532,17 +538,14 @@ class TelegramBot:
                            disable_notification: bool = False,
                            protect_content: bool = False) -> bool:
         """
-        发送消息到 Telegram
-        
-        Args:
-            message: 消息内容
-            parse_mode: 解析模式(HTML/Markdown)
-            reply_markup: 回复键盘标记
-            disable_notification: 是否禁用通知声音
-            protect_content: 是否禁止转发
-            
-        Returns:
-            bool: 消息是否发送成功
+        Send one message to the configured chat.
+
+        :param message: the text to send
+        :param parse_mode: HTML or Markdown, or None for plain text
+        :param reply_markup: inline keyboard to attach
+        :param disable_notification: deliver without a sound
+        :param protect_content: forbid forwarding and saving
+        :return: whether the message was accepted
         """
         url = f'{self.base_url}sendMessage'
         data = {
@@ -561,40 +564,49 @@ class TelegramBot:
             try:
                 async with self.session.post(url, json=data, proxy=self.proxy_url) as response:
                     if response.status == 200:
-                        logger.debug(f'消息发送成功, 长度: {len(message)} 字符')
+                        logger.debug(f'Message sent, {len(message)} character(s)')
                         return True
 
-                    logger.warning(f'发送消息失败 (尝试 {attempt + 1}/{self.max_retries}): HTTP {response.status}')
-                    response_text = await response.text()
-                    logger.debug(f'API响应: {response_text}')
+                    logger.warning(
+                        f'Send failed (attempt {attempt + 1}/{self.max_retries}): '
+                        f'HTTP {response.status}'
+                    )
+                    # Read but never quoted. A successful reply echoes the whole
+                    # message that was just sent, and an error reply is an
+                    # unbounded server-controlled string; the size is enough to
+                    # tell an empty answer from a real one. Draining it also
+                    # lets the connection be reused.
+                    body = await response.text()
+                    logger.debug(f'Error reply: {len(body)} byte(s)')
 
             except Exception as e:
-                logger.error(f'发送消息时发生错误 (尝试 {attempt + 1}/{self.max_retries}): {str(e)}')
+                logger.error(
+                    f'Error sending a message '
+                    f'(attempt {attempt + 1}/{self.max_retries}): '
+                    f'{self._describe_error(e)}'
+                )
 
             if attempt < self.max_retries - 1:
                 await asyncio.sleep(self.retry_delay)
 
-        logger.error(f'发送消息最终失败, 已重试 {self.max_retries} 次')
+        logger.error(f'Send failed after {self.max_retries} attempt(s)')
         return False
 
     def get_keyboard(self, keyboard_type: str, **kwargs) -> dict:
         """
-        获取指定类型的键盘布局
-        
-        Args:
-            keyboard_type: 键盘类型
-            **kwargs: 用于格式化按钮文本的参数
-            
-        Returns:
-            dict: 键盘配置
+        Build one of the keyboard layouts.
+
+        :param keyboard_type: key into KEYBOARD_LAYOUTS
+        :param kwargs: values substituted into button callback data
+        :return: the inline keyboard, or an empty dict on failure
         """
         try:
             keyboard = self.KEYBOARD_LAYOUTS.get(keyboard_type, [])
             if not keyboard:
-                logger.warning(f"未找到键盘类型: {keyboard_type}")
+                logger.warning(f"No such keyboard layout: {keyboard_type}")
                 return {}
 
-            # 处理需要格式化的按钮
+            # Fill in the buttons that carry a placeholder.
             formatted_keyboard = []
             for row in keyboard:
                 formatted_row = []
@@ -607,19 +619,5 @@ class TelegramBot:
 
             return {'inline_keyboard': formatted_keyboard}
         except Exception as e:
-            logger.error(f"创建键盘布局时发生错误: {e}")
+            logger.error(f"Error building a keyboard layout: {self._describe_error(e)}")
             return {}
-
-    @staticmethod
-    def create_inline_keyboard(buttons: list[list[str]], callback_data: list[list[str]]) -> dict:
-        """创建内联键盘，确保按钮与回调数据匹配
-        """
-        if len(buttons) != len(callback_data):
-            raise ValueError("按钮和回调数据的行数不一致，请确保它们的数量相同。")
-
-        inline_keyboard = [
-            [{'text': text, 'callback_data': data} for text, data in zip(row_buttons, row_data)]
-            for row_buttons, row_data in zip(buttons, callback_data)
-        ]
-
-        return {'inline_keyboard': inline_keyboard}

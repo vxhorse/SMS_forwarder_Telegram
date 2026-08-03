@@ -6,15 +6,30 @@ services:
     network_mode: "host"
     stop_signal: SIGTERM
     stop_grace_period: 30s
-    devices:
-      - ${SMS_PORT:-/dev/ttyUSB2}:${SMS_PORT:-/dev/ttyUSB2}
     volumes:
+      # A bind mount rather than devices:, so that container creation does not
+      # depend on the modem already being there. Mounted at /hostdev instead of
+      # over /dev so the container keeps its own pts, shm and null.
+      # See "Why not devices:" in README.md.
+      - /dev:/hostdev
       - /etc/localtime:/etc/localtime:ro
+    device_cgroup_rules:
+      - 'c 188:* rmw'      # USB serial adapters (ttyUSB*)
+      - 'c 166:* rmw'      # CDC-ACM devices (ttyACM*)
     env_file:
+      # Copy .env.example to .env first; without it the container starts with
+      # no credentials configured.
       - .env
+    environment:
+      # Overrides whatever .env says, because it describes this compose file's
+      # own layout rather than the operator's preference.
+      - SMS_DEV_ROOT=/hostdev
     healthcheck:
-      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/tmp/healthy') else 1)"]
+      test: ["CMD", "python", "/app/healthcheck.py"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      # Must exceed SERVICE_STABLE_SECONDS plus the time the modem needs to
+      # enumerate; raise it if yours is slower. See "Reading the health check"
+      # in README.md.
+      start_period: 180s
