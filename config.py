@@ -22,5 +22,11 @@ WATCHDOG_DOWN_SECONDS = int(os.getenv("WATCHDOG_DOWN_SECONDS", "3600"))
 # Exponential backoff bounds for component reconnection, in seconds.
 RECONNECT_BACKOFF_MIN = float(os.getenv("RECONNECT_BACKOFF_MIN", "1.0"))
 RECONNECT_BACKOFF_MAX = float(os.getenv("RECONNECT_BACKOFF_MAX", "30.0"))
-# How often the watchdog inspects component health, in seconds.
-WATCHDOG_CHECK_INTERVAL = float(os.getenv("WATCHDOG_CHECK_INTERVAL", "30.0"))
+# How long a connected session must last before it counts as a recovery.
+# A component that connects and then fails immediately, over and over, is still
+# broken; treating the connection itself as success would reset the backoff and
+# the health timestamp every cycle, hiding the fault from the watchdog.
+SERVICE_STABLE_SECONDS = float(os.getenv("SERVICE_STABLE_SECONDS", "60.0"))
+# How often the watchdog inspects component health, in seconds. Floored because
+# a value of zero would turn the watchdog into a busy loop.
+WATCHDOG_CHECK_INTERVAL = max(1.0, float(os.getenv("WATCHDOG_CHECK_INTERVAL", "30.0")))

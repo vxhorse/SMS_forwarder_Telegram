@@ -62,11 +62,22 @@ class ManagedService(Protocol):
         ...
 
     async def run(self) -> None:
-        """Long-running body. Never returns under normal operation."""
+        """Long-running body. Never returns under normal operation.
+
+        Returning at all counts as a failure, so a component that has to
+        re-establish something periodically must loop inside this body rather
+        than returning to be called again. The supervisor stops a healthy body
+        by cancelling it, which is the only way to interrupt one, so this must
+        let CancelledError propagate; teardown() then releases the resources.
+        """
         ...
 
     async def teardown(self) -> None:
-        """Release resources. Must be idempotent and must not raise."""
+        """Release resources. Must be idempotent and must not raise.
+
+        Called after every failed attempt, including attempts where
+        connect_once() never succeeded, and once more when supervision ends.
+        """
         ...
 
 
@@ -81,7 +92,10 @@ class _LogThrottle:
         self._verbose_count = verbose_count
         self._interval = interval
         self._count = 0
-        self._last_logged = 0.0
+        # Seeded with the current reading rather than zero: comparing against
+        # zero would let the first throttled message straight through on any
+        # process that has already been up longer than the interval.
+        self._last_logged = time.monotonic()
 
     def should_log(self) -> bool:
         self._count += 1
@@ -99,7 +113,7 @@ class _LogThrottle:
 
     def reset(self) -> None:
         self._count = 0
-        self._last_logged = 0.0
+        self._last_logged = time.monotonic()
 
 
 class Supervisor:
@@ -126,41 +140,109 @@ class Supervisor:
         backoff = self.backoff_factory()
         throttle = _LogThrottle()
 
-        while not self.shutdown_event.is_set():
-            try:
-                await service.connect_once()
+        try:
+            while not self.shutdown_event.is_set():
+                try:
+                    await service.connect_once()
+                    await self._serve_session(service, backoff, throttle)
+                except FatalConfigError:
+                    self.exit_reason = "fatal_config"
+                    raise
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.health.mark_down(service.name, exc)
+                    if throttle.should_log():
+                        logger.warning(
+                            f"Component {service.name} failed "
+                            f"(attempt {throttle.count}): {exc}; reconnecting"
+                        )
+                    await self._safe_teardown(service)
+
+                    delay = backoff.next_delay()
+                    # Waiting on the shutdown event rather than sleeping keeps a
+                    # long backoff from holding the process past the container
+                    # runtime's stop grace period.
+                    try:
+                        await asyncio.wait_for(self.shutdown_event.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        pass  # Backoff elapsed normally; try again.
+
+            logger.info(f"Supervision loop for {service.name} has stopped")
+        finally:
+            # Also reached on a fatal configuration error and on cancellation.
+            # A component stopped while healthy would otherwise keep whatever
+            # handle it holds, and the next attempt to open it would fail.
+            await self._safe_teardown(service)
+
+    async def _serve_session(
+        self, service: ManagedService, backoff: Backoff, throttle: _LogThrottle
+    ) -> None:
+        """Run one connected session, returning only once shutdown is requested.
+
+        Connecting is not the same as recovering. The component is reported up,
+        and the backoff and log throttle are reset, only once the session has
+        lasted config.SERVICE_STABLE_SECONDS. A component that connects and
+        then fails immediately, over and over, would otherwise reset all three
+        on every cycle: the backoff would never grow past its minimum, the
+        throttle would never engage, and HealthState would re-stamp its down
+        timestamp each time, so down_duration() could never reach the watchdog
+        threshold and a permanently broken component would look merely busy.
+
+        Anything that ends the session is raised to the supervision loop, which
+        treats it as a failed attempt.
+        """
+        run_task = asyncio.ensure_future(service.run())
+        shutdown_task = asyncio.ensure_future(self.shutdown_event.wait())
+        stable = False
+        try:
+            while True:
+                await asyncio.wait(
+                    (run_task, shutdown_task),
+                    timeout=None if stable else config.SERVICE_STABLE_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if run_task.done():
+                    # Re-raises whatever ended the session, if anything did.
+                    run_task.result()
+                    raise RuntimeError("run body returned unexpectedly")
+                if shutdown_task.done():
+                    return
+                # Neither happened inside the window: the session has held.
+                stable = True
                 self.health.mark_up(service.name)
                 backoff.reset()
                 throttle.reset()
-                await service.run()
-                # A run body that returns has ended unexpectedly; reconnect.
-                raise RuntimeError("run body returned unexpectedly")
-            except FatalConfigError:
-                self.exit_reason = "fatal_config"
-                raise
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.health.mark_down(service.name, exc)
-                if throttle.should_log():
-                    logger.warning(
-                        f"Component {service.name} failed "
-                        f"(attempt {throttle.count}): {exc}; reconnecting"
-                    )
-                try:
-                    await service.teardown()
-                except Exception as teardown_exc:
-                    logger.warning(
-                        f"Component {service.name} teardown error: {teardown_exc}"
-                    )
+        finally:
+            for task in (run_task, shutdown_task):
+                task.cancel()
+            # Let the body finish unwinding before the caller tears it down.
+            await asyncio.gather(run_task, shutdown_task, return_exceptions=True)
 
-                delay = backoff.next_delay()
-                try:
-                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=delay)
-                except asyncio.TimeoutError:
-                    pass  # Backoff elapsed normally; try again.
+    async def _safe_teardown(self, service: ManagedService) -> None:
+        """Release a component's resources without letting it break the loop.
 
-        logger.info(f"Supervision loop for {service.name} has stopped")
+        The teardown runs as a shielded task so a cancellation arriving while
+        it is in flight cannot truncate it half-way: releasing the handle is
+        what lets the next attempt take it. Any cancellation seen along the way
+        is re-raised once the teardown has finished, so cancellation still
+        propagates.
+        """
+        task = asyncio.ensure_future(service.teardown())
+        cancelled: Optional[asyncio.CancelledError] = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+            except Exception:
+                break  # Reported below, from the task's own result.
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                logger.warning(f"Component {service.name} teardown error: {error}")
+        if cancelled is not None:
+            raise cancelled
 
     async def watchdog_loop(
         self,
