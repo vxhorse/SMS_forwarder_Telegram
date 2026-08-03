@@ -18,6 +18,7 @@ import config
 import main
 from module.health import HealthState
 from module.supervisor import FatalConfigError, Supervisor
+from tests.ast_helpers import dotted_name
 
 # Failsafe only. Every test below finishes on an explicit signal raised by the
 # code under test, so this bound just turns a hang caused by a regression into
@@ -203,16 +204,6 @@ def test_the_notify_deadline_is_clamped_at_both_ends(monkeypatch):
         importlib.reload(config)
 
 
-def _dotted_name(node):
-    """Render a call target as a dotted name, or None if it is not one."""
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        parent = _dotted_name(node.value)
-        return f"{parent}.{node.attr}" if parent else None
-    return None
-
-
 def test_the_supervisory_wait_carries_no_deadline():
     """The regression this whole design exists to prevent, guarded structurally.
 
@@ -236,7 +227,7 @@ def test_the_supervisory_wait_carries_no_deadline():
     for node in ast.walk(run):
         if not isinstance(node, ast.Call):
             continue
-        target = _dotted_name(node.func)
+        target = dotted_name(node.func)
         assert target not in ("asyncio.wait_for", "wait_for"), (
             "run() must not put a deadline on waiting for a dependency"
         )
