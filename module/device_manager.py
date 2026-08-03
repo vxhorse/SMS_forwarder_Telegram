@@ -263,22 +263,24 @@ class DeviceManager:
 
     def __init__(self, receive_sms_callback: Callable, health=None,
                  notify: Optional[Callable] = None, port: Optional[str] = None,
-                 baudrate: Optional[int] = None, timeout: int = 2):
+                 baudrate: Optional[int] = None):
         """
         Set up the modem component.
+
+        Read deadlines are not settable here: they come from config, because
+        each one bounds a different thing. See AT_COMMAND_TIMEOUT,
+        AT_SLOW_COMMAND_TIMEOUT and MODEM_PROBE_TIMEOUT.
 
         :param receive_sms_callback: called with each received message
         :param health: HealthState to report signal strength and freshness to
         :param notify: coroutine used to report device state changes outward
         :param port: serial device path; empty means discover it
         :param baudrate: serial speed
-        :param timeout: serial read timeout, in seconds
         """
 
         self.receive_sms_callback = receive_sms_callback
         self.port = port or SMS_PORT
         self.baudrate = baudrate or SMS_BAUDRATE
-        self.timeout = timeout
 
         self.max_retries = 3  # consecutive errors a loop tolerates
         self.retry_delay = 5  # seconds between retries
