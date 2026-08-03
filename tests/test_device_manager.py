@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import logging
 import os
 import time
@@ -2107,6 +2108,124 @@ async def test_teardown_without_a_connection_does_nothing():
     manager = DeviceManager(_noop_callback, port="/hostdev/ttyUSB2")
     await manager.teardown()
     assert manager.writer is None
+
+
+class UnflushableWriter(FakeWriter):
+    """A port whose close can never complete.
+
+    serial_asyncio finishes a close only once the transport's write buffer has
+    drained, and leaves it to the write path to report that it has. A port that
+    has stopped accepting bytes never reports it and raises nothing: the bytes
+    are merely queued behind flow control. abort() is the way out, because it
+    discards the buffer and forces the close through.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.aborted = False
+        # A StreamWriter exposes the transport this reaches for.
+        self.transport = self
+
+    async def wait_closed(self):
+        await asyncio.Event().wait()
+
+    def abort(self):
+        self.aborted = True
+
+
+async def _teardown_must_return(manager) -> None:
+    """Tear the connection down, and fail rather than hang if it will not end.
+
+    The deadline protects the suite rather than the component: without it a
+    regression here does not fail, it stops the run, and a stuck run says
+    nothing about which test stuck it.
+    """
+    try:
+        await asyncio.wait_for(manager.teardown(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail(
+            "teardown never returned: closing a port that has stopped "
+            "accepting bytes is unbounded"
+        )
+
+
+async def test_teardown_gives_up_on_a_port_that_will_not_close(monkeypatch):
+    """The heartbeat detects a wedged modem in a minute or two and ends the
+    session, and then the teardown that follows waits for a close that can
+    never complete. Nothing raises, so the guard around it never fires, and by
+    then the component is marked down - which is the one state the stall
+    criterion deliberately keeps off. Detection would lead to a process parked
+    in teardown until the down tolerance ran out, an hour later.
+
+    The bound belongs here rather than in the supervisor, which cannot tell a
+    slow teardown from a slow session body and holds no transport to abort.
+    """
+    monkeypatch.setattr(config, "SERIAL_CLOSE_TIMEOUT", 0.01)
+    manager = _make()
+    writer = UnflushableWriter()
+    manager.writer = writer
+    # What makes _flushed() false at close in the first place: the probe that
+    # noticed the modem had gone quiet left its command in the buffer.
+    writer.written.append(b"AT+CSQ\r\n")
+
+    await _teardown_must_return(manager)
+
+    assert writer.aborted is True
+    assert manager.writer is None
+
+
+async def test_the_port_can_be_reopened_after_a_close_that_never_completed(monkeypatch):
+    """Returning is only half of it. The supervisor reconnects straight after a
+    teardown, so the point of aborting is that the next attempt finds a
+    component with nothing held and can open the port again."""
+    from module import device_manager as dm_module
+
+    monkeypatch.setattr(config, "SERIAL_CLOSE_TIMEOUT", 0.01)
+    manager = _make()
+    manager.writer = UnflushableWriter()
+    await _teardown_must_return(manager)
+
+    reopened = FakeWriter()
+
+    async def fake_open(url, baudrate):
+        return FakeReader([b"OK\r\n"]), reopened
+
+    monkeypatch.setattr(
+        dm_module.serial_asyncio, "open_serial_connection", fake_open
+    )
+    manager._port_exists = lambda path: True
+    manager.setup_sms = _noop_callback
+
+    await asyncio.wait_for(manager.connect_once(), timeout=2.0)
+    assert manager.writer is reopened
+
+
+async def test_a_port_that_closes_normally_is_not_aborted():
+    """Aborting discards whatever the transport still holds, so it must be the
+    escalation and never the ordinary path."""
+    manager = _make()
+    writer = UnflushableWriter()
+
+    async def closes_cleanly():
+        return None
+
+    writer.wait_closed = closes_cleanly
+    manager.writer = writer
+
+    await _teardown_must_return(manager)
+    assert writer.closed is True
+    assert writer.aborted is False
+
+
+def test_the_serial_close_deadline_has_a_floor(monkeypatch):
+    """Zero would abort every ordinary disconnect before the transport had a
+    chance to flush, which is the opposite of what the deadline is for."""
+    monkeypatch.setenv("SERIAL_CLOSE_TIMEOUT", "0")
+    try:
+        assert importlib.reload(config).SERIAL_CLOSE_TIMEOUT >= 1.0
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
 
 
 async def test_teardown_does_not_raise_when_closing_fails():
