@@ -10,8 +10,12 @@ import config
 from module.device_manager import DeviceManager
 from module.health import HealthState
 
+# A reserved test number, not anyone's. Long enough that a masked form and the
+# full form are clearly different strings.
+NUMBER = "+8613800138000"
+
 # Self-generated PDU with meaningless body text. Never use real message content.
-STORED_PDU = encodeSmsSubmitPdu("+8613800138000", "TESTMSG")[0].data.hex().upper()
+STORED_PDU = encodeSmsSubmitPdu(NUMBER, "TESTMSG")[0].data.hex().upper()
 
 # A DELIVER PDU carrying a service-centre timestamp of 2024-11-02 13:15:51 +08.
 # Unlike a SUBMIT PDU this one actually has a carrier timestamp, which is what
@@ -1216,17 +1220,18 @@ async def test_no_log_line_carries_a_message_body():
 
     with _LogCapture(dm_module) as captured:
         manager = _make()
-        await manager._handle_concat_sms_part(
-            "+8613800138000", when, marker[:4], 7, 2, 1
-        )
-        await manager._handle_concat_sms_part(
-            "+8613800138000", when, marker[4:], 7, 2, 2
-        )
+        await manager._handle_concat_sms_part(NUMBER, when, marker[:4], 7, 2, 1)
+        await manager._handle_concat_sms_part(NUMBER, when, marker[4:], 7, 2, 2)
 
     assert marker not in captured.text
     assert marker[:4] not in captured.text
     assert marker[4:] not in captured.text
-    # The diagnostics that replaced it must still be there.
+    # The sender is disclosure of the same kind: correlated with the timestamp
+    # on the same line it records who messages this SIM and when.
+    assert NUMBER not in captured.text
+    assert NUMBER[:-4] not in captured.text
+    # The diagnostics that replaced them must still be there.
+    assert NUMBER[-4:] in captured.text
     assert "ref=7" in captured.text
     assert "2/2 received" in captured.text
     assert f"{len(marker)} character(s)" in captured.text
@@ -1238,9 +1243,9 @@ async def test_an_expired_concat_buffer_is_logged_without_its_payload():
     marker = "QQZZWWXX"
     manager = _make()
     await manager._handle_concat_sms_part(
-        "+8613800138000", datetime(2024, 11, 2, 13, 15, 51), marker, 7, 2, 1
+        NUMBER, datetime(2024, 11, 2, 13, 15, 51), marker, 7, 2, 1
     )
-    buffer = manager.concat_sms_cache[("+8613800138000", 7)]
+    buffer = manager.concat_sms_cache[(NUMBER, 7)]
     buffer.first_received -= DeviceManager.CONCAT_SMS_TIMEOUT + 1
 
     with _LogCapture(dm_module) as captured:
@@ -1248,3 +1253,93 @@ async def test_an_expired_concat_buffer_is_logged_without_its_payload():
 
     assert manager.concat_sms_cache == {}
     assert marker not in captured.text
+    assert NUMBER not in captured.text
+    assert NUMBER[:-4] not in captured.text
+
+
+async def test_a_decoded_message_is_logged_without_its_sender():
+    """The sender of a decoded message reaches the log at INFO on every single
+    message. Only the suffix is needed to tell one conversation from another."""
+    from module import device_manager as dm_module
+
+    seen = {}
+
+    async def collect(sender, timestamp, content):
+        seen["sender"] = sender
+        return True
+
+    manager = DeviceManager(collect, port="/hostdev/ttyUSB2")
+    with _LogCapture(dm_module) as captured:
+        assert await manager._forward_pdu(DELIVER_PDU) is True
+
+    sender = seen["sender"]
+    assert len(sender) > 6
+    assert sender not in captured.text
+    assert sender[:-4] not in captured.text
+    assert sender[-4:] in captured.text
+
+
+async def test_the_send_path_logs_no_full_destination_number():
+    from module import device_manager as dm_module
+
+    manager = _make()
+    manager._sleep = _no_delay
+
+    async def confirming_send(command):
+        manager.sms_sent_event.set()
+
+    manager.send_at_command_async = confirming_send
+
+    with _LogCapture(dm_module) as captured:
+        assert await manager.handle_send_sms(NUMBER, "TESTMSG") is True
+
+    assert NUMBER not in captured.text
+    assert NUMBER[:-4] not in captured.text
+    assert NUMBER[-4:] in captured.text
+
+
+async def test_a_failed_send_logs_no_full_destination_number():
+    from module import device_manager as dm_module
+
+    manager = _make()
+    manager._sleep = _no_delay
+
+    async def failing_send(command):
+        raise RuntimeError("serial write refused")
+
+    manager.send_at_command_async = failing_send
+
+    with _LogCapture(dm_module) as captured:
+        assert await manager.handle_send_sms(NUMBER, "TESTMSG") is False
+
+    assert NUMBER not in captured.text
+    assert NUMBER[:-4] not in captured.text
+
+
+async def test_a_timed_out_send_logs_no_full_destination_number():
+    from module import device_manager as dm_module
+
+    class _NeverConfirms:
+        """Stands in for the confirmation event so the send deadline is reached
+        without spending it."""
+
+        def clear(self):
+            pass
+
+        async def wait(self):
+            raise asyncio.TimeoutError
+
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.sms_sent_event = _NeverConfirms()
+
+    async def silent_send(command):
+        pass
+
+    manager.send_at_command_async = silent_send
+
+    with _LogCapture(dm_module) as captured:
+        assert await manager.handle_send_sms(NUMBER, "TESTMSG") is False
+
+    assert NUMBER not in captured.text
+    assert NUMBER[:-4] not in captured.text
