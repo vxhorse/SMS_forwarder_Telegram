@@ -4,7 +4,7 @@ import asyncio
 import os
 import time
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Callable, Dict, Any
 import config
 from config import SMS_PORT, SMS_BAUDRATE
@@ -50,6 +50,51 @@ class DeviceManager:
     
     # 长短信缓存超时时间（秒）
     CONCAT_SMS_TIMEOUT = 60
+
+    # Placeholder in the setup sequence. It is not an AT command: reaching it
+    # runs _drain_stored_sms() instead.
+    DRAIN_MARKER = "<DRAIN_STORED_SMS>"
+
+    # Modem initialisation sequence.
+    # One ordering constraint is load-bearing: DRAIN_MARKER must come after
+    # AT+CMGF=0 and AT+CPMS (PDU mode and storage area must be selected before
+    # the store can be read) and before AT+CMGD=1,4 (which erases it).
+    SETUP_COMMANDS = [
+        r'AT&F',                    # restore factory defaults
+        r'ATE0',                    # disable echo
+        r'AT+CFUN=1',               # full functionality
+        r'AT+CMGF=0',               # PDU mode
+        r'AT+CSCS="UCS2"',          # character set
+        r'AT+CSMS=1',               # SMS service phase 2+
+        r'AT+CREG=2',               # network registration URCs with location
+        r'AT+CTZU=3',               # update clock and time zone from the network
+        r'AT+CTZR=0',               # no time zone change reporting
+        r'AT+QCFG="urc/cache",0',   # vendor specific (Quectel): no URC caching
+        r'AT+QURCCFG="urcport","usbmodem"',  # vendor specific (Quectel): URC port
+        r'AT+CPMS="ME","ME","ME"',  # message storage area
+        DRAIN_MARKER,               # read out anything already stored, then continue
+        r'AT+CMGD=1,4',             # erase all stored messages
+        r'AT+CNMI=2,2,0,0,0',       # deliver new messages straight to us
+        r'AT+CSMP=17,167,0,8',      # text mode parameters, long message support
+        r'AT+CSDH=1',               # verbose message headers
+        r'AT+CMMS=2',               # keep the link up between messages
+        r'AT&W',                    # persist settings
+    ]
+
+    # Commands the modem processes slowly enough to need a longer deadline.
+    SLOW_COMMANDS = {r'AT&F', r'AT+CFUN=1', r'AT&W'}
+
+    # Commands without which the modem cannot do this job at all: PDU mode is
+    # what makes a message decodable, the storage area has to be selected
+    # before the store can be read or erased, and new-message routing is what
+    # hands live messages to us in the first place. Anything else may be
+    # refused by a module that does not implement it without costing us a
+    # message, so only these three abort initialisation.
+    REQUIRED_COMMANDS = {
+        r'AT+CMGF=0',
+        r'AT+CPMS="ME","ME","ME"',
+        r'AT+CNMI=2,2,0,0,0',
+    }
 
     def __init__(self, receive_sms_callback: Callable, port: Optional[str] = None, baudrate: Optional[int] = None, timeout: int = 2):
         """
@@ -281,41 +326,35 @@ class DeviceManager:
         logger.info(f"设备 {self.port} 重新连接成功")
     
     async def setup_sms(self) -> None:
+        """Run the initialisation sequence, waiting for each response.
+
+        Read ownership matters here: this method owns the reader, and
+        read_loop must only be created after it returns. Two readers on the
+        same stream would race for the modem's replies.
         """
-        配置SMS相关设置，包括文本模式、字符集等。
-        """
-        
-        # 计算时间
-        current_time = datetime.now()
-        modified_time = current_time - timedelta(hours=2)
-        modified_time += timedelta(seconds=2 * 9)
-        formatted_time = modified_time.strftime(r'AT+CCLK="%y/%m/%d,%H:%M:%S+08"')
-        
-        commands = [
-            r'AT&F',                    # 恢复出厂设置
-            r'ATE0',                    # 关闭回显
-            r'AT+CFUN=1',               # 设置为全功能模式
-            r'AT+CMGF=0',               # 设置短信格式为PDU模式
-            r'AT+CSCS="UCS2"',          # 设置字符集
-            r'AT+CSMS=1',               # 设置短信服务为Phase 2+
-            r'AT+CREG=2',               # 启用网络注册和位置信息URC
-            r'AT+CTZU=3',               # 启用通过NITZ自动更新时区和本地时间到RTC
-            r'AT+CTZR=0',               # 禁用时区变更报告
-            formatted_time,             # 设置模块时间
-            r'AT+QCFG="urc/cache",0',   # 关闭 URC 缓存
-            r'AT+QURCCFG="urcport","usbmodem"',
-            r'AT+CPMS="ME","ME","ME"',  # 设置短信存储位置
-            r'AT+CMGD=1,4',             # 删除所有短信
-            r'AT+CNMI=2,2,0,0,0',       # 设置新消息指示
-            r'AT+CSMP=17,167,0,8',      # 设置短信文本模式参数，支持长短信
-            r'AT+CSDH=1',               # 显示详细的短信头信息
-            r'AT+CMMS=2',               # 支持更多信息
-            r'AT&W',                    # 保存设置
-        ]
-        for command in commands:
-            await asyncio.sleep(2)
-            await self.send_at_command_async(command)
-    
+        for command in self.SETUP_COMMANDS:
+            if command == self.DRAIN_MARKER:
+                await self._drain_stored_sms()
+                continue
+
+            timeout = (
+                config.AT_SLOW_COMMAND_TIMEOUT if command in self.SLOW_COMMANDS
+                else config.AT_COMMAND_TIMEOUT
+            )
+            lines = await self._send_and_wait(command, timeout=timeout)
+            if b"OK" in lines:
+                continue
+
+            if command in self.REQUIRED_COMMANDS:
+                # _send_and_wait reports a timeout as an empty list, so letting
+                # this pass would mean a modem that has stopped answering still
+                # completes initialisation: the process would then look healthy
+                # while being unable to receive anything. Raising hands the
+                # decision to the caller, which reconnects and retries.
+                raise RuntimeError(f"Modem did not acknowledge {command}")
+
+            logger.warning(f"{command} was not acknowledged; continuing setup")
+
     async def start(self) -> None:
         """
         启动设备管理器，连接到设备并开始读取数据。
@@ -517,78 +556,123 @@ class DeviceManager:
         else:
             logger.warning(f"无法从消息头中解析 PDU 长度: {message}")
 
-    async def handle_incoming_sms_pdu(self, pdu_part: bytes = b'', force_process: bool = False) -> None:
-        """
-        处理接收到的短信PDU数据，支持长短信分片合并。
+    async def _forward_pdu(self, pdu_hex: str, force_process: bool = False) -> bool:
+        """Decode one PDU and forward it, merging concatenated parts.
 
-        :param pdu_part: 接收到的部分PDU数据
-        :param force_process: 是否强制处理当前已接收的数据,即使数据不完整
+        Both the live push path and the startup drain go through here so the
+        two cannot drift apart.
+        """
+        try:
+            decoded = decodeSmsPdu(pdu_hex)
+
+            sender = decoded.get('number', 'Unknown')
+            # The library exposes the service centre timestamp as 'time'. Using
+            # any other key silently falls back to the local clock, which is
+            # wrong by seconds in normal operation and wrong by years on a
+            # machine that boots without a valid RTC. It would also defeat the
+            # point of draining stored messages, since every recovered message
+            # would be stamped with the moment it was recovered.
+            timestamp = decoded.get('time') or datetime.now()
+            timestamp_str = (
+                timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                if isinstance(timestamp, datetime) else str(timestamp)
+            )
+            content = decoded.get('text', '')
+
+            concat_info = None
+            for header in decoded.get('udh', []):
+                if isinstance(header, Concatenation):
+                    concat_info = {
+                        'ref': header.reference,
+                        'max': header.parts,
+                        'seq': header.number,
+                    }
+                    break
+
+            if concat_info:
+                logger.debug(
+                    f"Concatenated message part ref={concat_info['ref']} "
+                    f"seq={concat_info['seq']}/{concat_info['max']}"
+                )
+                await self._handle_concat_sms_part(
+                    sender, timestamp, content,
+                    concat_info['ref'], concat_info['max'], concat_info['seq']
+                )
+            else:
+                logger.info(
+                    f"Decoded message from {sender} at {timestamp_str}"
+                    + (" (forced, may be incomplete)" if force_process else "")
+                )
+                await self.receive_sms_callback(sender, timestamp_str, content)
+            return True
+
+        except Exception as exc:
+            # The message body must never reach the log.
+            logger.error(f"Could not decode PDU: {exc}")
+            return False
+
+    async def _drain_stored_sms(self) -> int:
+        """Read messages already in the modem's store and forward them.
+
+        Anything that arrives while the process is not running lands in the
+        modem's storage. Erasing the store during startup without reading it
+        first means the process silently destroys those messages, which is
+        exactly the window a restart is supposed to recover from.
+        """
+        lines = await self._send_and_wait(
+            'AT+CMGL=4', timeout=config.AT_SLOW_COMMAND_TIMEOUT
+        )
+
+        if not lines:
+            # No terminating response at all: the modem did not answer, so the
+            # store is unread rather than empty. The next command in the
+            # sequence erases it, and going ahead on that assumption is the
+            # exact loss this method exists to prevent. An explicit error is
+            # different - the modem is alive and told us something - so only
+            # silence stops the sequence here.
+            raise RuntimeError("Modem did not answer AT+CMGL=4; store left unread")
+
+        forwarded = 0
+        index = 0
+        while index < len(lines):
+            if lines[index].startswith(b'+CMGL:') and index + 1 < len(lines):
+                pdu_hex = lines[index + 1].decode('ascii', errors='ignore').strip()
+                # One unreadable entry must not cost us the rest of the store.
+                if await self._forward_pdu(pdu_hex):
+                    forwarded += 1
+                index += 2
+            else:
+                index += 1
+
+        if forwarded:
+            logger.warning(f"Recovered {forwarded} message(s) from modem storage")
+        else:
+            logger.info("Modem storage held no pending messages")
+        return forwarded
+
+    async def handle_incoming_sms_pdu(self, pdu_part: bytes = b'', force_process: bool = False) -> None:
+        """Accumulate a pushed PDU and forward it once it is complete.
+
+        :param pdu_part: newly received slice of PDU data
+        :param force_process: decode what has arrived even if it looks short
         """
         if self.pending_sms["pdu"] is None:
             return
 
-        # 将新接收的PDU部分添加到已有数据中
         self.pending_sms["pdu"] += pdu_part
 
-        # 检查是否已接收到足够的PDU数据或者是否强制处理
         if len(self.pending_sms["pdu"]) >= self.pending_sms["expected_length"] * 2 or force_process:
-            decoded_pdu = None
+            pdu_hex = self.pending_sms["pdu"].decode('ascii', errors='ignore').strip()
             try:
-                # 将字节数据转换为十六进制字符串
-                pdu_hex = self.pending_sms["pdu"].decode('ascii', errors='ignore').strip()
-
-                # 解码PDU数据
-                decoded_pdu = decodeSmsPdu(pdu_hex)
-
-                # 提取短信信息
-                sender = decoded_pdu.get('number', 'Unknown')
-                timestamp = decoded_pdu.get('date', datetime.now())
-                timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S") if isinstance(timestamp, datetime) else str(timestamp)
-                content = decoded_pdu.get('text', '')
-                
-                # 检查是否是长短信分片（检查UDH中的concatenation信息）
-                udh = decoded_pdu.get('udh', [])
-                concat_info = None
-                
-                # 遍历UDH查找concatenation信息
-                for header in udh:
-                    if isinstance(header, Concatenation):
-                        concat_info = {
-                            'ref': header.reference,
-                            'max': header.parts,
-                            'seq': header.number
-                        }
-                        break
-                
-                if concat_info:
-                    # 这是长短信的一个分片
-                    logger.debug(
-                        f"检测到长短信UDH - ref={concat_info['ref']}, "
-                        f"seq={concat_info['seq']}/{concat_info['max']}"
-                    )
-                    await self._handle_concat_sms_part(
-                        sender, timestamp, content,
-                        concat_info['ref'], concat_info['max'], concat_info['seq']
-                    )
-                else:
-                    # 这是普通短信，直接转发
-                    logger.debug(f"普通短信（无UDH拼接信息），UDH元素: {udh}")
-                    logger.info(
-                        f"{'成功解码短信' if not force_process else '强制解码可能不完整的短信'} - "
-                        f"发送者: {sender}, 时间: {timestamp_str}, 内容: {content}"
-                    )
-                    await self.receive_sms_callback(sender, timestamp_str, content)
-
-            except Exception as e:
-                logger.error(f"解析PDU时出错: {e}")
-                logger.error(f"PDU内容: {self.pending_sms['pdu']}")
-                logger.error(f"decoded_pdu: {decoded_pdu}")
+                await self._forward_pdu(pdu_hex, force_process=force_process)
             finally:
-                # 重置pending_sms，准备接收下一条短信
+                # Always reset, so one bad message cannot wedge the next one.
                 self.pending_sms = {"pdu": None, "expected_length": None}
         else:
-            logger.debug(f"PDU数据不完整,已接收 {len(self.pending_sms['pdu'])} 字节,"
-                         f"预期 {self.pending_sms['expected_length'] * 2} 字节")
+            logger.debug(
+                f"PDU incomplete: {len(self.pending_sms['pdu'])} of "
+                f"{self.pending_sms['expected_length'] * 2} bytes received"
+            )
     
     async def _handle_concat_sms_part(
         self, sender: str, timestamp: datetime, content: str,
