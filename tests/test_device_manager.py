@@ -7,7 +7,7 @@ import pytest
 from gsmmodem.pdu import encodeSmsSubmitPdu
 
 import config
-from module.device_manager import DeviceManager
+from module.device_manager import DeviceManager, ForwardOutcome
 from module.health import HealthState
 
 # A reserved test number, not anyone's. Long enough that a masked form and the
@@ -16,6 +16,10 @@ NUMBER = "+8613800138000"
 
 # Self-generated PDU with meaningless body text. Never use real message content.
 STORED_PDU = encodeSmsSubmitPdu(NUMBER, "TESTMSG")[0].data.hex().upper()
+
+# Not a PDU at all. Decoding it fails the same way on every attempt, which is
+# what makes an entry permanently unrecoverable rather than merely undelivered.
+CORRUPT_PDU = b"not a valid pdu"
 
 # A DELIVER PDU carrying a service-centre timestamp of 2024-11-02 13:15:51 +08.
 # Unlike a SUBMIT PDU this one actually has a carrier timestamp, which is what
@@ -320,7 +324,7 @@ async def test_drain_parses_cmgl_and_forwards_each_message():
     manager.writer = FakeWriter()
 
     result = await manager._drain_stored_sms()
-    assert (result.entries, result.forwarded) == (2, 2)
+    assert (result.entries, result.delivered, result.undecodable) == (2, 2, 0)
     assert result.complete is True
     assert len(forwarded) == 2
 
@@ -328,14 +332,18 @@ async def test_drain_parses_cmgl_and_forwards_each_message():
 async def test_drain_returns_zero_when_store_is_empty():
     manager = _make([b"OK\r\n"])
     result = await manager._drain_stored_sms()
-    assert (result.entries, result.forwarded) == (0, 0)
+    assert (result.entries, result.delivered, result.undecodable) == (0, 0, 0)
     assert result.complete is True
 
 
 async def test_drain_survives_a_corrupt_pdu():
-    manager = _make([b"+CMGL: 0,1,,26\r\n", b"not a valid pdu\r\n", b"OK\r\n"])
+    """An entry nothing can read counts as undecodable, not as undelivered, so
+    it never becomes a reason to keep the store."""
+    manager = _make([b"+CMGL: 0,1,,26\r\n", CORRUPT_PDU + b"\r\n", b"OK\r\n"])
     result = await manager._drain_stored_sms()
-    assert (result.entries, result.forwarded) == (1, 0)
+    assert (result.entries, result.delivered, result.undecodable) == (1, 0, 1)
+    assert result.deliverable == 0
+    assert result.complete is True
 
 
 async def test_drain_survives_a_trailing_header_without_a_pdu():
@@ -344,7 +352,8 @@ async def test_drain_survives_a_trailing_header_without_a_pdu():
     forwarded and the drain does not raise."""
     manager = _make([b"+CMGL: 0,1,,26\r\n", b"OK\r\n"])
     result = await manager._drain_stored_sms()
-    assert result.forwarded == 0
+    assert (result.delivered, result.undecodable) == (0, 1)
+    assert result.complete is True
 
 
 async def test_drain_keeps_going_after_an_undecodable_entry():
@@ -358,7 +367,7 @@ async def test_drain_keeps_going_after_an_undecodable_entry():
     manager = DeviceManager(collect, port="/hostdev/ttyUSB2")
     manager.reader = FakeReader([
         b"+CMGL: 0,1,,26\r\n",
-        b"not a valid pdu\r\n",
+        CORRUPT_PDU + b"\r\n",
         b"+CMGL: 1,1,,26\r\n",
         f"{STORED_PDU}\r\n".encode(),
         b"OK\r\n",
@@ -366,7 +375,8 @@ async def test_drain_keeps_going_after_an_undecodable_entry():
     manager.writer = FakeWriter()
 
     result = await manager._drain_stored_sms()
-    assert (result.entries, result.forwarded) == (2, 1)
+    assert (result.entries, result.delivered, result.undecodable) == (2, 1, 1)
+    assert result.complete is True
     assert len(forwarded) == 1
 
 
@@ -391,7 +401,7 @@ async def test_drain_forwards_a_stored_message_with_its_carrier_timestamp():
     ])
     manager.writer = FakeWriter()
 
-    assert (await manager._drain_stored_sms()).forwarded == 1
+    assert (await manager._drain_stored_sms()).delivered == 1
     assert captured[0].startswith("2024-11-02 13:15:51")
     assert not captured[0].startswith(str(datetime.now().year))
 
@@ -409,7 +419,7 @@ async def test_forward_uses_the_operator_timestamp_not_local_time():
     manager = DeviceManager(collect, port="/hostdev/ttyUSB2")
     # A DELIVER PDU carrying a service-centre timestamp of 2024-11-02 13:15:51 +08.
     deliver = "0791683108200155040D91683103943254F60008421120315115238A02597D"
-    assert await manager._forward_pdu(deliver) is True
+    assert await manager._forward_pdu(deliver) is ForwardOutcome.DELIVERED
     assert captured["timestamp"].startswith("2024-11-02 13:15:51")
     assert not captured["timestamp"].startswith(str(datetime.now().year))
 
@@ -422,7 +432,29 @@ async def test_forward_reports_a_delivery_the_callback_refused():
         return False
 
     manager = DeviceManager(refuse, port="/hostdev/ttyUSB2")
-    assert await manager._forward_pdu(DELIVER_PDU) is False
+    assert await manager._forward_pdu(DELIVER_PDU) is ForwardOutcome.UNDELIVERED
+
+
+async def test_forward_separates_an_undecodable_pdu_from_an_undelivered_one():
+    """The two failures have opposite futures. A message that decoded may be
+    delivered on the next attempt, so it is worth keeping the store for. A PDU
+    that will not decode fails identically every time, and holding the store
+    against it would replay everything beside it forever."""
+    manager = _make()
+    outcome = await manager._forward_pdu(CORRUPT_PDU.decode())
+    assert outcome is ForwardOutcome.UNDECODABLE
+
+
+async def test_forward_treats_a_raising_callback_as_retryable():
+    """The decode and the forward are guarded separately for this case. A
+    failure thrown on the way out says nothing about the PDU, which decoded
+    perfectly well; reporting it as undecodable would let the store be erased
+    while the message was still recoverable."""
+    async def explode(sender, timestamp, content):
+        raise RuntimeError("downstream unavailable")
+
+    manager = DeviceManager(explode, port="/hostdev/ttyUSB2")
+    assert await manager._forward_pdu(DELIVER_PDU) is ForwardOutcome.UNDELIVERED
 
 
 async def test_a_held_concatenated_part_counts_as_progress():
@@ -551,12 +583,15 @@ async def test_setup_does_not_erase_a_store_that_refused_to_be_listed():
     assert "AT+CMGD=1,4" not in commands
 
 
-def _listing_responder(entries):
-    """Answer AT+CMGL=4 with `entries` stored messages, and OK to everything else."""
+GOOD_PDU = STORED_PDU.encode()
+
+
+def _listing_responder(*pdus):
+    """Answer AT+CMGL=4 with one stored entry per PDU given, OK to the rest."""
     listing = []
-    for index in range(entries):
+    for index, pdu in enumerate(pdus):
         listing.append(f"+CMGL: {index},1,,26".encode())
-        listing.append(STORED_PDU.encode())
+        listing.append(pdu)
     listing.append(b"OK")
 
     def responder(command):
@@ -576,7 +611,7 @@ async def test_setup_does_not_erase_a_store_it_could_not_deliver():
         attempts.append(timestamp)
         return False
 
-    manager, sent = _recording_manager(refuse, _listing_responder(1))
+    manager, sent = _recording_manager(refuse, _listing_responder(GOOD_PDU))
     await manager.setup_sms()
 
     commands = [command for command, _ in sent]
@@ -596,7 +631,7 @@ async def test_setup_erases_the_store_once_every_message_is_delivered():
         delivered.append(timestamp)
         return True
 
-    manager, sent = _recording_manager(accept, _listing_responder(2))
+    manager, sent = _recording_manager(accept, _listing_responder(GOOD_PDU, GOOD_PDU))
     await manager.setup_sms()
 
     commands = [command for command, _ in sent]
@@ -615,12 +650,117 @@ async def test_setup_does_not_erase_when_only_some_messages_were_delivered():
         attempted.append(result)
         return result
 
-    manager, sent = _recording_manager(flaky, _listing_responder(2))
+    manager, sent = _recording_manager(flaky, _listing_responder(GOOD_PDU, GOOD_PDU))
     await manager.setup_sms()
 
     commands = [command for command, _ in sent]
     assert attempted == [True, False]
     assert "AT+CMGD=1,4" not in commands
+
+
+async def test_setup_erases_a_store_whose_only_failure_cannot_be_decoded():
+    """The case a gate counting every entry gets wrong. An entry that will not
+    decode will not decode next time either, so holding the store against it
+    never ends: every reconnect would re-deliver everything beside it, and the
+    storage area would fill until the modem stopped accepting new messages.
+    The readable entry was delivered, so the erase proceeds."""
+    delivered = []
+
+    async def accept(sender, timestamp, content):
+        delivered.append(timestamp)
+        return True
+
+    manager, sent = _recording_manager(
+        accept, _listing_responder(CORRUPT_PDU, GOOD_PDU)
+    )
+    await manager.setup_sms()
+
+    commands = [command for command, _ in sent]
+    assert len(delivered) == 1
+    assert "AT+CMGD=1,4" in commands
+
+
+async def test_setup_erases_a_store_in_which_nothing_could_be_decoded():
+    """Nothing in this store can ever be recovered, so keeping it buys no
+    message back and costs the storage area permanently."""
+    delivered = []
+
+    async def accept(sender, timestamp, content):
+        delivered.append(timestamp)
+        return True
+
+    manager, sent = _recording_manager(
+        accept, _listing_responder(CORRUPT_PDU, CORRUPT_PDU)
+    )
+    await manager.setup_sms()
+
+    commands = [command for command, _ in sent]
+    assert delivered == []
+    assert "AT+CMGD=1,4" in commands
+
+
+async def test_setup_does_not_erase_when_a_readable_entry_went_undelivered():
+    """The other side of the same store: the undecodable entry does not hold
+    it, but the one that decoded and never reached anyone does."""
+    attempts = []
+
+    async def refuse(sender, timestamp, content):
+        attempts.append(timestamp)
+        return False
+
+    manager, sent = _recording_manager(
+        refuse, _listing_responder(CORRUPT_PDU, GOOD_PDU)
+    )
+    await manager.setup_sms()
+
+    commands = [command for command, _ in sent]
+    assert len(attempts) == 1
+    assert "AT+CMGD=1,4" not in commands
+
+
+async def test_the_two_drain_failures_are_reported_apart():
+    """An operator seeing repeats has to be able to tell which happened. A link
+    that was down explains the repeats and stops on its own; a corrupt entry
+    never will, and is the one that may need clearing by hand."""
+    from module import device_manager as dm_module
+
+    async def refuse(sender, timestamp, content):
+        return False
+
+    manager = DeviceManager(refuse, port="/hostdev/ttyUSB2")
+    manager.reader = FakeReader([
+        b"+CMGL: 0,1,,26\r\n",
+        CORRUPT_PDU + b"\r\n",
+        b"+CMGL: 1,1,,26\r\n",
+        f"{STORED_PDU}\r\n".encode(),
+        b"OK\r\n",
+    ])
+    manager.writer = FakeWriter()
+
+    with _LogCapture(dm_module) as captured:
+        result = await manager._drain_stored_sms()
+
+    assert (result.entries, result.delivered, result.undecodable) == (2, 0, 1)
+    errors = [
+        record.getMessage() for record in captured.records
+        if record.levelno >= logging.ERROR
+    ]
+    # Two separate records, each naming its own cause and its own count. One
+    # record covering both would leave the operator unable to tell which of the
+    # two happened, which is the whole point of reporting them apart.
+    decode_errors = [message for message in errors if "decoded" in message]
+    delivery_errors = [message for message in errors if "not delivered" in message]
+    assert len(decode_errors) == 1, errors
+    assert len(delivery_errors) == 1, errors
+    assert decode_errors[0] != delivery_errors[0], errors
+    # One of the two listed entries could not be decoded; of the one that
+    # remained readable, one was not delivered.
+    assert "1 of 2" in decode_errors[0], decode_errors
+    assert "1 of 1" in delivery_errors[0], delivery_errors
+    # Counts only: neither the raw entry nor any decoded fragment of it.
+    assert CORRUPT_PDU.decode() not in captured.text
+    assert STORED_PDU not in captured.text
+    assert STORED_PDU[:16] not in captured.text
 
 
 async def test_a_skipped_erase_says_why_the_messages_will_arrive_again():
@@ -631,7 +771,7 @@ async def test_a_skipped_erase_says_why_the_messages_will_arrive_again():
     async def refuse(sender, timestamp, content):
         return False
 
-    manager, _sent = _recording_manager(refuse, _listing_responder(1))
+    manager, _sent = _recording_manager(refuse, _listing_responder(GOOD_PDU))
     with _LogCapture(dm_module) as captured:
         await manager.setup_sms()
 
@@ -1270,7 +1410,7 @@ async def test_a_decoded_message_is_logged_without_its_sender():
 
     manager = DeviceManager(collect, port="/hostdev/ttyUSB2")
     with _LogCapture(dm_module) as captured:
-        assert await manager._forward_pdu(DELIVER_PDU) is True
+        assert await manager._forward_pdu(DELIVER_PDU) is ForwardOutcome.DELIVERED
 
     sender = seen["sender"]
     assert len(sender) > 6

@@ -4,6 +4,7 @@ import os
 import time
 import re
 from datetime import datetime
+from enum import Enum
 from typing import Optional, Callable, Dict, Any, NamedTuple
 import config
 from config import SMS_PORT, SMS_BAUDRATE
@@ -81,21 +82,52 @@ def _mask_number(number: Any) -> str:
     return f"…{text[-_NUMBER_SUFFIX_LENGTH:]}"
 
 
+class ForwardOutcome(Enum):
+    """What became of one PDU handed to _forward_pdu.
+
+    The two failures are kept apart because they have opposite futures. A PDU
+    that decoded and could not be delivered is retryable: the outbound link may
+    be up next time, so the message is still recoverable and the store that
+    holds it must be kept. A PDU that will not decode is not retryable at all -
+    decoding is a pure function of the same bytes, so every future attempt
+    produces the same failure - and treating it as retryable would keep the
+    store forever, replay every message beside it on each reconnect, and fill
+    the storage area until the modem stopped accepting new messages.
+    """
+
+    DELIVERED = "delivered"
+    UNDELIVERED = "undelivered"  # decoded, not delivered; a later attempt may
+    UNDECODABLE = "undecodable"  # will never decode, however often retried
+
+
 class DrainResult(NamedTuple):
     """What one pass over the modem's message store achieved.
 
-    Both numbers are needed, because the only safe reason to erase the store is
-    that every entry read out of it was delivered. A count of successes on its
-    own cannot express that.
+    All three numbers are needed. The only safe reason to erase the store is
+    that everything still recoverable from it has been delivered, and neither a
+    count of successes nor a count of entries can express that on its own: the
+    entries that can never be decoded have to be taken out of the comparison,
+    or one corrupt entry keeps the store for good.
     """
 
-    entries: int    # entries the modem listed
-    forwarded: int  # entries confirmed delivered downstream
+    entries: int      # entries the modem listed
+    delivered: int    # entries confirmed delivered downstream
+    undecodable: int  # entries that will never decode, however often retried
+
+    @property
+    def deliverable(self) -> int:
+        """Entries that decoded, and so could still be delivered later."""
+        return self.entries - self.undecodable
 
     @property
     def complete(self) -> bool:
-        """Whether every listed entry reached its destination."""
-        return self.forwarded >= self.entries
+        """Whether everything still recoverable from the store was delivered.
+
+        Undecodable entries are excluded on purpose. Nothing can retrieve them,
+        so holding the store against them would never end, while erasing them
+        loses nothing that any later attempt could have read.
+        """
+        return self.delivered >= self.deliverable
 
 
 class ConcatSmsBuffer:
@@ -548,6 +580,13 @@ class DeviceManager:
                 # is read again on the next reconnect, so whatever did get
                 # through arrives a second time. Duplicates are recoverable by
                 # the person reading them; an erase is not.
+                #
+                # Only entries that could be decoded are weighed here. One that
+                # cannot be decoded is unreadable to every future attempt too,
+                # so holding the store against it would not be a trade at all:
+                # the duplicates would never stop and the storage area would
+                # fill until the modem refused new messages, which loses the
+                # messages this gate exists to protect.
                 if drain is None:
                     logger.error(
                         "Skipping the erase: the store was never read, so "
@@ -555,10 +594,11 @@ class DeviceManager:
                     )
                 else:
                     logger.warning(
-                        f"Skipping the erase: only {drain.forwarded} of "
-                        f"{drain.entries} stored message(s) were delivered. "
-                        f"The store is kept and read again on the next "
-                        f"reconnect, so delivered messages will arrive again"
+                        f"Skipping the erase: only {drain.delivered} of "
+                        f"{drain.deliverable} readable stored message(s) were "
+                        f"delivered. The store is kept and read again on the "
+                        f"next reconnect, so delivered messages will arrive "
+                        f"again"
                     )
                 continue
 
@@ -771,17 +811,27 @@ class DeviceManager:
                 f"{_describe_line(bytes_message)}"
             )
 
-    async def _forward_pdu(self, pdu_hex: str, force_process: bool = False) -> bool:
+    async def _forward_pdu(
+        self, pdu_hex: str, force_process: bool = False
+    ) -> ForwardOutcome:
         """Decode one PDU and forward it, merging concatenated parts.
 
         Both the live push path and the startup drain go through here so the
         two cannot drift apart.
 
-        :return: whether the message was delivered, not merely decoded. The
-            drain erases the modem's store on the strength of this answer, and
-            a PDU that decodes has not yet reached anyone: the callback fails
-            on its own whenever the outbound link is down, which is the normal
-            state for the first moments after a restart.
+        :return: which of the three outcomes this PDU met. Delivery is reported
+            separately from decoding because the drain erases the modem's store
+            on the strength of this answer, and a PDU that decodes has not yet
+            reached anyone: the callback fails on its own whenever the outbound
+            link is down, which is the normal state for the first moments after
+            a restart. See ForwardOutcome for why the two failures may not be
+            treated alike.
+
+        The decode and the forward are guarded separately, and that separation
+        is load-bearing rather than stylistic. Under one shared guard a failure
+        raised on the way out - which is retryable - would be reported as a PDU
+        that cannot be decoded, and the caller would erase a store holding a
+        message that was still recoverable.
         """
         try:
             decoded = decodeSmsPdu(pdu_hex)
@@ -810,26 +860,43 @@ class DeviceManager:
                     }
                     break
 
+        except Exception as exc:
+            # The message body must never reach the log.
+            logger.error(f"Could not decode PDU: {exc}")
+            return ForwardOutcome.UNDECODABLE
+
+        try:
             if concat_info:
                 logger.debug(
                     f"Concatenated message part ref={concat_info['ref']} "
                     f"seq={concat_info['seq']}/{concat_info['max']}"
                 )
-                return await self._handle_concat_sms_part(
+                accounted = await self._handle_concat_sms_part(
                     sender, timestamp, content,
                     concat_info['ref'], concat_info['max'], concat_info['seq']
                 )
-
-            logger.info(
-                f"Decoded message from {_mask_number(sender)} at {timestamp_str}"
-                + (" (forced, may be incomplete)" if force_process else "")
-            )
-            return bool(await self.receive_sms_callback(sender, timestamp_str, content))
+            else:
+                logger.info(
+                    f"Decoded message from {_mask_number(sender)} at {timestamp_str}"
+                    + (" (forced, may be incomplete)" if force_process else "")
+                )
+                accounted = bool(
+                    await self.receive_sms_callback(sender, timestamp_str, content)
+                )
 
         except Exception as exc:
-            # The message body must never reach the log.
-            logger.error(f"Could not decode PDU: {exc}")
-            return False
+            # Retryable by definition: the PDU decoded, so a later attempt can
+            # still deliver this message. Only the kind of failure is named -
+            # an exception raised on the way out may quote the text it was
+            # carrying, and a body must never reach the log.
+            logger.error(
+                f"Could not forward a decoded message: {type(exc).__name__}"
+            )
+            return ForwardOutcome.UNDELIVERED
+
+        return (
+            ForwardOutcome.DELIVERED if accounted else ForwardOutcome.UNDELIVERED
+        )
 
     async def _drain_stored_sms(self) -> DrainResult:
         """Read messages already in the modem's store and forward them.
@@ -839,9 +906,9 @@ class DeviceManager:
         first means the process silently destroys those messages, which is
         exactly the window a restart is supposed to recover from.
 
-        :return: how many entries were listed and how many of them were
-            delivered. The caller needs both to decide whether erasing the
-            store is safe.
+        :return: how many entries were listed, how many were delivered, and how
+            many can never be decoded. The caller needs all three to decide
+            whether erasing the store is safe.
         """
         lines = await self._send_and_wait(
             'AT+CMGL=4', timeout=config.AT_SLOW_COMMAND_TIMEOUT
@@ -856,33 +923,51 @@ class DeviceManager:
             # it, so continuing would destroy messages that were never read.
             raise RuntimeError("Modem did not acknowledge AT+CMGL=4; store left unread")
 
-        forwarded = 0
+        delivered = 0
+        undecodable = 0
         entries = 0
         index = 0
         while index < len(lines):
             if lines[index].startswith(b'+CMGL:') and index + 1 < len(lines):
                 entries += 1
                 pdu_hex = lines[index + 1].decode('ascii', errors='ignore').strip()
-                # One unreadable entry must not cost us the rest of the store.
-                if await self._forward_pdu(pdu_hex):
-                    forwarded += 1
+                # One unreadable entry must not cost us the rest of the store,
+                # so every outcome is counted and the loop carries on.
+                outcome = await self._forward_pdu(pdu_hex)
+                if outcome is ForwardOutcome.DELIVERED:
+                    delivered += 1
+                elif outcome is ForwardOutcome.UNDECODABLE:
+                    undecodable += 1
                 index += 2
             else:
                 index += 1
 
-        if forwarded < entries:
-            # Either the decode failed or the delivery did. Both mean the entry
-            # has not reached anyone, so the caller must leave the store alone.
+        result = DrainResult(
+            entries=entries, delivered=delivered, undecodable=undecodable
+        )
+
+        # The two failures are reported apart because they call for different
+        # responses. Repeated deliveries after an outage explain themselves and
+        # stop on their own; a corrupt entry never will, and is the one an
+        # operator may have to clear by hand.
+        if undecodable:
             logger.error(
-                f"{entries - forwarded} of {entries} stored message(s) were "
-                f"not delivered; the store must not be erased while they are "
-                f"still in it"
+                f"{undecodable} of {entries} stored message(s) could not be "
+                f"decoded and are unrecoverable; no retry can read them, so "
+                f"they do not hold the store"
             )
-        if forwarded:
-            logger.warning(f"Recovered {forwarded} message(s) from modem storage")
+        undelivered = result.deliverable - delivered
+        if undelivered:
+            logger.error(
+                f"{undelivered} of {result.deliverable} readable stored "
+                f"message(s) were not delivered; the store must not be erased "
+                f"while they are still in it"
+            )
+        if delivered:
+            logger.warning(f"Recovered {delivered} message(s) from modem storage")
         elif not entries:
             logger.info("Modem listed an empty storage area")
-        return DrainResult(entries=entries, forwarded=forwarded)
+        return result
 
     async def handle_incoming_sms_pdu(self, pdu_part: bytes = b'', force_process: bool = False) -> None:
         """Accumulate a pushed PDU and forward it once it is complete.
