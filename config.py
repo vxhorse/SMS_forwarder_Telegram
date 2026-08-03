@@ -95,17 +95,42 @@ MODEM_PROBE_INTERVAL = max(1.0, min(
 MODEM_PROBE_TIMEOUT = float(os.getenv("MODEM_PROBE_TIMEOUT", "5.0"))
 MODEM_PROBE_FAILURES = int(os.getenv("MODEM_PROBE_FAILURES", "3"))
 
+# The longest gap the heartbeat can legitimately leave between two refreshes of
+# the health snapshot. A missed probe costs its whole interval plus the deadline
+# it waits for a reply, and MODEM_PROBE_FAILURES of them in a row have to pass
+# before the probe gives up and raises. For all of that time the component is
+# working and has simply not refreshed the file. Anything that treats a gap this
+# short as a failure is reading a slow modem as a dead one.
+WATCHDOG_REFRESH_BUDGET = MODEM_PROBE_FAILURES * (
+    MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT
+)
+# Doubled for margin, because the probe is not the only thing the loop does
+# between refreshes. The second term keeps the floor positive if the probe is
+# configured never to retry at all.
+WATCHDOG_STALL_FLOOR = max(2 * WATCHDOG_REFRESH_BUDGET, 4 * MODEM_PROBE_INTERVAL)
+
 # How long the health snapshot may go unrefreshed before the watchdog treats
 # the process as stalled. A component that blocks without raising never reaches
-# mark_down, so this is the only signal that catches it. Floored at four refresh
-# cycles so a single slow cycle can never trip it; at zero it would fire the
-# moment the first snapshot was written, which would kill a working process.
+# mark_down, so this is the only signal that catches it.
+#
+# Bounded at both ends. Below the floor above, the watchdog restarts a process
+# that is merely riding out a slow modem. Above WATCHDOG_DOWN_SECONDS, a stall
+# outlives the operator's stated tolerance for losing a component outright -
+# and a stall is a component lost without saying so, so it must not be given
+# more room than one that says so.
+#
+# The floor is applied last, so it wins if the two ever conflict. Holding the
+# threshold above the down tolerance only delays a restart; cutting it below the
+# refresh budget restarts a process that is working.
 #
 # This belongs with the watchdog settings above, and sits here instead because
-# it is derived from MODEM_PROBE_INTERVAL, which is itself derived from
-# HEALTH_STALE_SECONDS. Naming either one earlier in the file would be a
+# it is derived from the modem probe settings, which are themselves derived from
+# HEALTH_STALE_SECONDS. Naming any of them earlier in the file would be a
 # forward reference, and the module would fail to import.
 WATCHDOG_STALL_SECONDS = max(
-    4 * MODEM_PROBE_INTERVAL,
-    float(os.getenv("WATCHDOG_STALL_SECONDS", str(2 * HEALTH_STALE_SECONDS))),
+    WATCHDOG_STALL_FLOOR,
+    min(
+        float(WATCHDOG_DOWN_SECONDS),
+        float(os.getenv("WATCHDOG_STALL_SECONDS", str(2 * HEALTH_STALE_SECONDS))),
+    ),
 )
