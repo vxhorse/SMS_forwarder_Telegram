@@ -17,12 +17,27 @@ logger = setup_logger(__name__)
 # What may appear in a log line, and why.
 #
 # This service carries one-time codes and bank notifications, so no log line
-# may reproduce a message. The only part of a serial line that is ever echoed
-# is the URC keyword, the "+NAME" ahead of the colon: it is a protocol token
-# defined by the AT command set and cannot contain message text. Everything
-# else is reduced to a byte count, including whatever follows the colon,
-# because a line this code did not recognise may itself be a message.
-_URC_KEYWORD = re.compile(rb'^\+[A-Z0-9]{1,12}')
+# may reproduce a message. Only a token drawn from one of the two fixed sets
+# below is ever echoed; everything else is reduced to a byte count.
+#
+# Matching a shape rather than a fixed set is not good enough here. These
+# describers are applied to lines this code did not recognise, and a line it
+# did not recognise may itself be a message: a body beginning with a number,
+# for instance, has exactly the shape of a URC keyword. Membership of a set
+# written out here is the only test that cannot be satisfied by message text.
+# The cost is that an unlisted URC is logged as a byte count rather than by
+# name; it is still visible as an unhandled line, and adding it here is a
+# one-line change once someone has seen it.
+
+# URC names this code either handles or expects to see from a 3GPP modem.
+_KNOWN_URCS = frozenset({
+    b'+CMT', b'+CMTI', b'+CMGL', b'+CMGR', b'+CMGS', b'+CMSS',
+    b'+CDS', b'+CDSI', b'+CBM', b'+CSQ', b'+CREG', b'+CGREG', b'+CEREG',
+    b'+CPIN', b'+CUSD', b'+CIEV', b'+CLIP', b'+COLP', b'+CCLK',
+    b'+CTZV', b'+CTZE', b'+CPMS', b'+CFUN',
+    b'+CME ERROR', b'+CMS ERROR',
+    b'+QIND', b'+QUSIM', b'+QCFG', b'+QNWINFO',
+})
 
 # Bare responses defined by the AT command set. They have no payload at all, so
 # quoting them in full costs nothing and says what the modem actually sent,
@@ -37,8 +52,10 @@ def _describe_line(message: bytes) -> str:
     """Describe a serial line for the log without reproducing its payload."""
     if message in _SAFE_BARE_RESPONSES:
         return message.decode('ascii')
-    match = _URC_KEYWORD.match(message)
-    prefix = f"{match.group().decode('ascii')} " if match else ""
+    head, separator, _ = message.partition(b':')
+    # Echoed only when it is one of the names above, so what reaches the log
+    # comes from that set rather than from the line.
+    prefix = f"{head.decode('ascii')} " if separator and head in _KNOWN_URCS else ""
     return f"{prefix}[{len(message)} bytes]"
 
 
@@ -396,6 +413,17 @@ class DeviceManager:
     async def teardown(self) -> None:
         """Release the serial connection. Idempotent, never raises."""
         self.is_running = False
+
+        # Per-session parse state, dropped with the session it belongs to. A
+        # disconnect can land between a +CMT header and the PDU it announced;
+        # carrying that half-read state forward would make the first line of
+        # the next session get appended to it as PDU data, and the message that
+        # line belonged to would be lost. Queued lines are stale for the same
+        # reason: they describe a connection that no longer exists.
+        self.pending_sms = {"pdu": None, "expected_length": None}
+        while not self.message_queue.empty():
+            self.message_queue.get_nowait()
+
         writer, self.writer = self.writer, None
         self.reader = None
         if writer is None:
@@ -507,9 +535,6 @@ class DeviceManager:
             try:
                 assert self.reader is not None
                 line = await self.reader.readline()
-                if line:
-                    await self.message_queue.put(line)
-                    errors = 0
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -518,6 +543,22 @@ class DeviceManager:
                 if errors >= self.max_retries:
                     raise RuntimeError(f"Serial read failed {errors} times: {exc}")
                 await self._sleep(self.retry_delay)
+                continue
+
+            if not line:
+                # End of stream: the device is gone. This is not a transient
+                # error and must not go through the retry path above, for a
+                # mechanical reason. A stream at end of file yields empty
+                # immediately and forever, and it does so without awaiting
+                # anything, so a loop that treats it as "nothing arrived" never
+                # reaches a suspension point again. Nothing else in the process
+                # would ever run: not the heartbeat, not the supervisor waiting
+                # on this body, not the shutdown signal, not the watchdog. The
+                # sibling case in _send_and_wait is guarded the same way.
+                raise RuntimeError("Serial connection closed; the device is gone")
+
+            await self.message_queue.put(line)
+            errors = 0
 
         logger.warning("Read loop stopped")
 
