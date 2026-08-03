@@ -924,6 +924,70 @@ async def test_a_send_confirmation_is_not_mistaken_for_pdu_data():
     assert manager.pending_sms["pdu"] == b""
 
 
+async def test_only_a_hexadecimal_line_can_be_pdu_data():
+    """What separates PDU data from a URC that interrupted it, tested directly.
+    Hoisting one branch at a time only protects the URCs someone thought of."""
+    from module.device_manager import _is_pdu_line
+
+    assert _is_pdu_line(DELIVER_PDU.encode()) is True
+    # The standard fixes the encoding, not the case.
+    assert _is_pdu_line(DELIVER_PDU.lower().encode()) is True
+    assert _is_pdu_line(b"") is False
+    assert _is_pdu_line(b'+CREG: 2,"2AF3","0123ABC",7') is False
+    assert _is_pdu_line(b"+CSQ: 21,99") is False
+    assert _is_pdu_line(b"+QIND: SMS DONE") is False
+    assert _is_pdu_line(b"RING") is False
+
+
+async def test_a_registration_urc_is_not_mistaken_for_pdu_data():
+    """+CREG sat behind the pending-PDU check. AT+CREG=2 is part of setup, so
+    registration reports arrive precisely while the radio is reattaching, which
+    is the same moment a store of waiting messages is being drained. Appended
+    to a pending PDU one of them destroys the message that was arriving, and is
+    itself never routed."""
+    received = []
+
+    async def collect(sender, timestamp, content):
+        received.append(timestamp)
+        return True
+
+    manager = DeviceManager(collect, port="/hostdev/ttyUSB2")
+    manager.reader = FakeReader()
+    manager.writer = FakeWriter()
+
+    await manager.process_message(b"+CMT: ,26\r\n")
+    await manager.process_message(b'+CREG: 2,"2AF3","0123ABC",7\r\n')
+    # The PDU is still waiting for its own line, unaltered.
+    assert manager.pending_sms["pdu"] == b""
+
+    await manager.process_message(f"{DELIVER_PDU}\r\n".encode())
+    assert len(received) == 1
+    assert manager.pending_sms["pdu"] is None
+
+
+async def test_an_unhandled_urc_is_not_mistaken_for_pdu_data():
+    """The guard has to hold for lines this code has never seen, which is why
+    it tests what a PDU is made of instead of naming the intruders."""
+    manager = _make()
+
+    await manager.process_message(b"+CMT: ,26\r\n")
+    await manager.process_message(b"+QIND: SMS DONE\r\n")
+    assert manager.pending_sms["pdu"] == b""
+
+    await manager.process_message(b"RING\r\n")
+    assert manager.pending_sms["pdu"] == b""
+
+
+async def test_a_hexadecimal_line_still_reaches_the_pending_pdu():
+    """The guard must not cost us the PDU itself. A PDU is hexadecimal and can
+    arrive in more than one read, so a partial one has to accumulate."""
+    manager = _make()
+
+    await manager.process_message(b"+CMT: ,26\r\n")
+    await manager.process_message(DELIVER_PDU[:20].encode() + b"\r\n")
+    assert manager.pending_sms["pdu"] == DELIVER_PDU[:20].encode()
+
+
 async def test_heartbeat_raises_after_consecutive_failures():
     manager = _make([])
     manager.probe_interval = 0.01
