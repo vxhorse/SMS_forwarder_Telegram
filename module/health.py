@@ -44,11 +44,13 @@ class HealthState:
             name: {"up": False, "since": now, "progress": None}
             for name in service_names
         }
-        # None until the snapshot has been written at least once. A system that
-        # has never been fully up is waiting, not stalled, and must never be
-        # treated as the latter - that would reinstate the startup deadline
-        # this project exists to remove.
+        # When the snapshot was last written, and None until it has been.
         self._last_refresh: Optional[float] = None
+        # When every component was last up at the same moment, and None until
+        # they have been. A system that has never been fully up is waiting, not
+        # stalled, and must never be treated as the latter - that would
+        # reinstate the startup deadline this project exists to remove.
+        self._all_up_since: Optional[float] = None
 
     def mark_up(self, name: str) -> None:
         """Mark a component ready. Idempotent: does not reset the timestamp."""
@@ -68,6 +70,13 @@ class HealthState:
             # reconnected. This is also what lets stall_duration() assume that
             # anything reported up has a progress stamp.
             service["progress"] = now
+            # The moment the system became whole. The snapshot is not written
+            # while anything is down, so the age it carries here measures the
+            # outage; stall_duration() reads from this instead when it is the
+            # later of the two. Recorded at the transition, where the moment is
+            # exact, rather than left to be sampled by whoever reads the age.
+            if self.all_up():
+                self._all_up_since = now
             logger.info(f"Component is up: {name}")
 
     def mark_down(self, name: str, error: Optional[BaseException] = None) -> None:
@@ -160,10 +169,20 @@ class HealthState:
           A loop blocked on something that never returns raises nothing, so the
           component stays marked up and no other reading in this process
           changes at all.
-        - the snapshot file, from the last time it was written. It says nothing
+        - the snapshot file, from the last time it was written or the moment
+          the system last became whole, whichever is later. It says nothing
           about any single component, because either component loop writes it
           for both, and is kept only because it is also the reading that fails
           when HEALTH_FILE itself can no longer be written.
+
+        The snapshot is not written at all while a component is down, so the
+        age it carries at the moment of a recovery measures the outage rather
+        than anything that is wrong now, and reading that as a stall would
+        restart the process for having reconnected. Measuring from the recovery
+        instead is what discounts it, and doing so here rather than downstream
+        is what makes it exact: this is where the moment is known. It expires
+        by itself, because the time since the recovery grows while the outage
+        it discounts does not, so an old outage cannot shorten a later stall.
 
         A component that is down is not measured here. Its loop is not running,
         so of course it is not advancing; that state belongs to down_duration()
@@ -174,10 +193,17 @@ class HealthState:
         does. Only a system that was healthy and then stopped advancing is
         stalled.
         """
-        if self._last_refresh is None:
+        if self._all_up_since is None:
             return None
         now = self._clock()
-        ages = [now - self._last_refresh]
+        # A snapshot that has never been written has no age of its own, and the
+        # absence of one is not a reason to stop measuring: a process that
+        # cannot write HEALTH_FILE at all is one whose healthcheck will never
+        # pass again.
+        written = self._all_up_since
+        if self._last_refresh is not None and self._last_refresh > written:
+            written = self._last_refresh
+        ages = [now - written]
         # Anything reported up has a progress stamp: mark_up is the only way to
         # become up, and it writes one.
         ages.extend(
