@@ -35,6 +35,11 @@ class HealthState:
         # from process start. A device that never appears is therefore visible
         # as a restart count rather than a silently idle container.
         self._services = {name: {"up": False, "since": now} for name in service_names}
+        # None until the snapshot has been written at least once. A system that
+        # has never been fully up is waiting, not stalled, and must never be
+        # treated as the latter - that would reinstate the startup deadline
+        # this project exists to remove.
+        self._last_refresh: Optional[float] = None
 
     def mark_up(self, name: str) -> None:
         """Mark a component ready. Idempotent: does not reset the timestamp."""
@@ -95,6 +100,20 @@ class HealthState:
             os.replace(tmp_path, self._health_file)
         except OSError as exc:
             logger.warning(f"Could not write health file: {exc}")
+            return
+        self._last_refresh = self._clock()
+
+    def stall_duration(self) -> Optional[float]:
+        """Seconds since the snapshot was last written, or None if never.
+
+        None means the system has not yet been fully up even once, which is a
+        legitimate waiting state - hardware can appear long after the process
+        does. Only a system that was healthy and then stopped refreshing is
+        stalled.
+        """
+        if self._last_refresh is None:
+            return None
+        return self._clock() - self._last_refresh
 
     def clear_file(self) -> None:
         """Remove the snapshot file. Safe to call repeatedly."""

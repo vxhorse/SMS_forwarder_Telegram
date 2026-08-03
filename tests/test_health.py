@@ -126,3 +126,60 @@ def test_unknown_service_name_is_ignored(tmp_path):
     health, _, _ = _make(tmp_path)
     health.mark_up("nonexistent")
     assert health.all_up() is False
+
+
+def test_stall_duration_is_none_before_the_first_healthy_moment(tmp_path):
+    health, clock, _ = _make(tmp_path)
+    clock.advance(9999.0)
+    # Never all-up, so the snapshot has never been written. That is a system
+    # still waiting for hardware, not a stalled one.
+    assert health.stall_duration() is None
+
+
+def test_stall_duration_starts_after_the_first_successful_refresh(tmp_path):
+    health, clock, _ = _make(tmp_path)
+    health.mark_up("device")
+    health.mark_up("telegram")
+    health.refresh_file()
+    clock.advance(30.0)
+    assert health.stall_duration() == 30.0
+
+
+def test_stall_duration_survives_a_component_going_down(tmp_path):
+    health, clock, _ = _make(tmp_path)
+    health.mark_up("device")
+    health.mark_up("telegram")
+    health.refresh_file()
+    health.mark_down("device")
+    clock.advance(50.0)
+    # refresh_file() is now a no-op, so the age keeps growing. That is the
+    # point: a component that is down stops the file being refreshed.
+    health.refresh_file()
+    assert health.stall_duration() == 50.0
+
+
+def test_a_successful_refresh_resets_the_stall_age(tmp_path):
+    health, clock, _ = _make(tmp_path)
+    health.mark_up("device")
+    health.mark_up("telegram")
+    health.refresh_file()
+    clock.advance(40.0)
+    health.refresh_file()
+    assert health.stall_duration() == 0.0
+
+
+def test_a_failed_write_does_not_count_as_a_refresh(tmp_path, monkeypatch):
+    health, clock, path = _make(tmp_path)
+    health.mark_up("device")
+    health.mark_up("telegram")
+    health.refresh_file()
+    clock.advance(10.0)
+
+    def explode(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("module.health.os.replace", explode)
+    health.refresh_file()
+    # The write failed, so the healthcheck still sees the old file. Pretending
+    # it was refreshed would hide exactly that.
+    assert health.stall_duration() == 10.0
