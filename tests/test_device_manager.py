@@ -315,23 +315,32 @@ async def test_drain_parses_cmgl_and_forwards_each_message():
     ])
     manager.writer = FakeWriter()
 
-    assert await manager._drain_stored_sms() == 2
+    result = await manager._drain_stored_sms()
+    assert (result.entries, result.forwarded) == (2, 2)
+    assert result.complete is True
     assert len(forwarded) == 2
 
 
 async def test_drain_returns_zero_when_store_is_empty():
     manager = _make([b"OK\r\n"])
-    assert await manager._drain_stored_sms() == 0
+    result = await manager._drain_stored_sms()
+    assert (result.entries, result.forwarded) == (0, 0)
+    assert result.complete is True
 
 
 async def test_drain_survives_a_corrupt_pdu():
     manager = _make([b"+CMGL: 0,1,,26\r\n", b"not a valid pdu\r\n", b"OK\r\n"])
-    assert await manager._drain_stored_sms() == 0
+    result = await manager._drain_stored_sms()
+    assert (result.entries, result.forwarded) == (1, 0)
 
 
 async def test_drain_survives_a_trailing_header_without_a_pdu():
+    """The terminating OK is consumed as the entry's PDU and fails to decode,
+    which is the same outcome as any other unreadable entry: nothing is
+    forwarded and the drain does not raise."""
     manager = _make([b"+CMGL: 0,1,,26\r\n", b"OK\r\n"])
-    assert await manager._drain_stored_sms() == 0
+    result = await manager._drain_stored_sms()
+    assert result.forwarded == 0
 
 
 async def test_drain_keeps_going_after_an_undecodable_entry():
@@ -352,7 +361,8 @@ async def test_drain_keeps_going_after_an_undecodable_entry():
     ])
     manager.writer = FakeWriter()
 
-    assert await manager._drain_stored_sms() == 1
+    result = await manager._drain_stored_sms()
+    assert (result.entries, result.forwarded) == (2, 1)
     assert len(forwarded) == 1
 
 
@@ -377,7 +387,7 @@ async def test_drain_forwards_a_stored_message_with_its_carrier_timestamp():
     ])
     manager.writer = FakeWriter()
 
-    assert await manager._drain_stored_sms() == 1
+    assert (await manager._drain_stored_sms()).forwarded == 1
     assert captured[0].startswith("2024-11-02 13:15:51")
     assert not captured[0].startswith(str(datetime.now().year))
 
@@ -398,6 +408,42 @@ async def test_forward_uses_the_operator_timestamp_not_local_time():
     assert await manager._forward_pdu(deliver) is True
     assert captured["timestamp"].startswith("2024-11-02 13:15:51")
     assert not captured["timestamp"].startswith(str(datetime.now().year))
+
+
+async def test_forward_reports_a_delivery_the_callback_refused():
+    """Decoding a PDU is not delivering it. The callback returns whether the
+    message actually reached its destination, and the store may only be erased
+    on the strength of that answer."""
+    async def refuse(sender, timestamp, content):
+        return False
+
+    manager = DeviceManager(refuse, port="/hostdev/ttyUSB2")
+    assert await manager._forward_pdu(DELIVER_PDU) is False
+
+
+async def test_a_held_concatenated_part_counts_as_progress():
+    """A fragment that is still waiting for its siblings has not failed. Only
+    the part that completes the message can report a delivery outcome, so
+    holding one must not read as an undelivered entry and block the erase."""
+    manager = _make()
+    held = await manager._handle_concat_sms_part(
+        "+8613800138000", datetime(2024, 11, 2, 13, 15, 51), "AAAA", 7, 2, 1
+    )
+    assert held is True
+
+
+async def test_a_completed_concatenated_message_reports_its_delivery():
+    outcomes = []
+
+    async def refuse(sender, timestamp, content):
+        outcomes.append(content)
+        return False
+
+    manager = DeviceManager(refuse, port="/hostdev/ttyUSB2")
+    when = datetime(2024, 11, 2, 13, 15, 51)
+    assert await manager._handle_concat_sms_part("+8613800138000", when, "AAAA", 7, 2, 1) is True
+    assert await manager._handle_concat_sms_part("+8613800138000", when, "BBBB", 7, 2, 2) is False
+    assert len(outcomes) == 1
 
 
 def _recording_manager(callback=_noop_callback, responder=None):
@@ -499,6 +545,98 @@ async def test_setup_does_not_erase_a_store_that_refused_to_be_listed():
 
     commands = [command for command, _ in sent]
     assert "AT+CMGD=1,4" not in commands
+
+
+def _listing_responder(entries):
+    """Answer AT+CMGL=4 with `entries` stored messages, and OK to everything else."""
+    listing = []
+    for index in range(entries):
+        listing.append(f"+CMGL: {index},1,,26".encode())
+        listing.append(STORED_PDU.encode())
+    listing.append(b"OK")
+
+    def responder(command):
+        return list(listing) if command == "AT+CMGL=4" else [b"OK"]
+
+    return responder
+
+
+async def test_setup_does_not_erase_a_store_it_could_not_deliver():
+    """Reading the store and delivering it are two different things. The modem
+    comes back before the outbound link does, so every forward can fail while
+    the listing succeeds; erasing on the strength of a decode destroys exactly
+    the messages the drain exists to recover."""
+    attempts = []
+
+    async def refuse(sender, timestamp, content):
+        attempts.append(timestamp)
+        return False
+
+    manager, sent = _recording_manager(refuse, _listing_responder(1))
+    await manager.setup_sms()
+
+    commands = [command for command, _ in sent]
+    assert len(attempts) == 1
+    assert "AT+CMGD=1,4" not in commands
+    # The rest of the sequence still runs: an undelivered store is a reason to
+    # keep the messages, not to abandon initialisation.
+    assert commands[-1] == "AT&W"
+
+
+async def test_setup_erases_the_store_once_every_message_is_delivered():
+    """The other half of the gate. A drain that delivered everything must still
+    erase, or the store is replayed on every reconnect forever."""
+    delivered = []
+
+    async def accept(sender, timestamp, content):
+        delivered.append(timestamp)
+        return True
+
+    manager, sent = _recording_manager(accept, _listing_responder(2))
+    await manager.setup_sms()
+
+    commands = [command for command, _ in sent]
+    assert len(delivered) == 2
+    assert "AT+CMGD=1,4" in commands
+
+
+async def test_setup_does_not_erase_when_only_some_messages_were_delivered():
+    """A partial success is still a loss: erasing would destroy the entries
+    that did not get through while keeping none of them recoverable."""
+    outcomes = iter([True, False])
+    attempted = []
+
+    async def flaky(sender, timestamp, content):
+        result = next(outcomes)
+        attempted.append(result)
+        return result
+
+    manager, sent = _recording_manager(flaky, _listing_responder(2))
+    await manager.setup_sms()
+
+    commands = [command for command, _ in sent]
+    assert attempted == [True, False]
+    assert "AT+CMGD=1,4" not in commands
+
+
+async def test_a_skipped_erase_says_why_the_messages_will_arrive_again():
+    """An operator seeing every stored message a second time has to be able to
+    find out from the log that the store was deliberately left intact."""
+    from module import device_manager as dm_module
+
+    async def refuse(sender, timestamp, content):
+        return False
+
+    manager, _sent = _recording_manager(refuse, _listing_responder(1))
+    with _LogCapture(dm_module) as captured:
+        await manager.setup_sms()
+
+    skipped = [
+        record for record in captured.records
+        if record.levelno >= logging.WARNING and "store" in record.getMessage()
+    ]
+    assert skipped, "the skipped erase must be reported at warning or above"
+    assert any("again" in record.getMessage() for record in skipped)
 
 
 async def test_setup_aborts_when_full_functionality_is_refused():

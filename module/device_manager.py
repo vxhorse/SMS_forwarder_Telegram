@@ -4,7 +4,7 @@ import os
 import time
 import re
 from datetime import datetime
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, NamedTuple
 import config
 from config import SMS_PORT, SMS_BAUDRATE
 from logger import setup_logger
@@ -57,6 +57,23 @@ def _describe_line(message: bytes) -> str:
     # comes from that set rather than from the line.
     prefix = f"{head.decode('ascii')} " if separator and head in _KNOWN_URCS else ""
     return f"{prefix}[{len(message)} bytes]"
+
+
+class DrainResult(NamedTuple):
+    """What one pass over the modem's message store achieved.
+
+    Both numbers are needed, because the only safe reason to erase the store is
+    that every entry read out of it was delivered. A count of successes on its
+    own cannot express that.
+    """
+
+    entries: int    # entries the modem listed
+    forwarded: int  # entries confirmed delivered downstream
+
+    @property
+    def complete(self) -> bool:
+        """Whether every listed entry reached its destination."""
+        return self.forwarded >= self.entries
 
 
 class ConcatSmsBuffer:
@@ -490,9 +507,37 @@ class DeviceManager:
         read_loop must only be created after it returns. Two readers on the
         same stream would race for the modem's replies.
         """
+        # What the drain achieved, once it has run. The erase is permitted only
+        # by a drain that accounted for every entry it listed, so any other
+        # state - including a sequence that somehow never reached the drain -
+        # leaves the store alone.
+        drain: Optional[DrainResult] = None
+
         for command in self.SETUP_COMMANDS:
             if command == self.DRAIN_MARKER:
-                await self._drain_stored_sms()
+                drain = await self._drain_stored_sms()
+                continue
+
+            if command == self.ERASE_COMMAND and (drain is None or not drain.complete):
+                # Erasing now would destroy messages that decoded but never
+                # reached anyone: the modem is reachable well before the
+                # outbound link is, so a drain can read the whole store and
+                # fail to deliver any of it. Leaving the store intact means it
+                # is read again on the next reconnect, so whatever did get
+                # through arrives a second time. Duplicates are recoverable by
+                # the person reading them; an erase is not.
+                if drain is None:
+                    logger.error(
+                        "Skipping the erase: the store was never read, so "
+                        "nothing proves it is safe to destroy"
+                    )
+                else:
+                    logger.warning(
+                        f"Skipping the erase: only {drain.forwarded} of "
+                        f"{drain.entries} stored message(s) were delivered. "
+                        f"The store is kept and read again on the next "
+                        f"reconnect, so delivered messages will arrive again"
+                    )
                 continue
 
             timeout = (
@@ -700,6 +745,12 @@ class DeviceManager:
 
         Both the live push path and the startup drain go through here so the
         two cannot drift apart.
+
+        :return: whether the message was delivered, not merely decoded. The
+            drain erases the modem's store on the strength of this answer, and
+            a PDU that decodes has not yet reached anyone: the callback fails
+            on its own whenever the outbound link is down, which is the normal
+            state for the first moments after a restart.
         """
         try:
             decoded = decodeSmsPdu(pdu_hex)
@@ -733,30 +784,33 @@ class DeviceManager:
                     f"Concatenated message part ref={concat_info['ref']} "
                     f"seq={concat_info['seq']}/{concat_info['max']}"
                 )
-                await self._handle_concat_sms_part(
+                return await self._handle_concat_sms_part(
                     sender, timestamp, content,
                     concat_info['ref'], concat_info['max'], concat_info['seq']
                 )
-            else:
-                logger.info(
-                    f"Decoded message from {sender} at {timestamp_str}"
-                    + (" (forced, may be incomplete)" if force_process else "")
-                )
-                await self.receive_sms_callback(sender, timestamp_str, content)
-            return True
+
+            logger.info(
+                f"Decoded message from {sender} at {timestamp_str}"
+                + (" (forced, may be incomplete)" if force_process else "")
+            )
+            return bool(await self.receive_sms_callback(sender, timestamp_str, content))
 
         except Exception as exc:
             # The message body must never reach the log.
             logger.error(f"Could not decode PDU: {exc}")
             return False
 
-    async def _drain_stored_sms(self) -> int:
+    async def _drain_stored_sms(self) -> DrainResult:
         """Read messages already in the modem's store and forward them.
 
         Anything that arrives while the process is not running lands in the
         modem's storage. Erasing the store during startup without reading it
         first means the process silently destroys those messages, which is
         exactly the window a restart is supposed to recover from.
+
+        :return: how many entries were listed and how many of them were
+            delivered. The caller needs both to decide whether erasing the
+            store is safe.
         """
         lines = await self._send_and_wait(
             'AT+CMGL=4', timeout=config.AT_SLOW_COMMAND_TIMEOUT
@@ -786,16 +840,18 @@ class DeviceManager:
                 index += 1
 
         if forwarded < entries:
-            # These are about to be erased and cannot be recovered afterwards.
+            # Either the decode failed or the delivery did. Both mean the entry
+            # has not reached anyone, so the caller must leave the store alone.
             logger.error(
-                f"{entries - forwarded} of {entries} stored message(s) could "
-                f"not be decoded and will not be forwarded"
+                f"{entries - forwarded} of {entries} stored message(s) were "
+                f"not delivered; the store must not be erased while they are "
+                f"still in it"
             )
         if forwarded:
             logger.warning(f"Recovered {forwarded} message(s) from modem storage")
         elif not entries:
             logger.info("Modem listed an empty storage area")
-        return forwarded
+        return DrainResult(entries=entries, forwarded=forwarded)
 
     async def handle_incoming_sms_pdu(self, pdu_part: bytes = b'', force_process: bool = False) -> None:
         """Accumulate a pushed PDU and forward it once it is complete.
@@ -824,7 +880,7 @@ class DeviceManager:
     async def _handle_concat_sms_part(
         self, sender: str, timestamp: datetime, content: str,
         ref_num: int, max_parts: int, seq_num: int
-    ) -> None:
+    ) -> bool:
         """
         Handle one part of a concatenated message.
 
@@ -834,6 +890,10 @@ class DeviceManager:
         :param ref_num: reference number shared by every part of one message
         :param max_parts: how many parts the message has
         :param seq_num: this part's position, counting from 1
+        :return: the delivery result once the message is whole, and True while
+            parts are still missing. A fragment that is not yet a message has
+            not failed, and reporting it as a failure would hold the store
+            against an orphaned part that can never complete.
         """
         cache_key = (sender, ref_num)
 
@@ -869,9 +929,18 @@ class DeviceManager:
                 f"{max_parts} part(s), {len(merged_content)} character(s)"
             )
 
-            await self.receive_sms_callback(sender, timestamp_str, merged_content)
+            delivered = bool(
+                await self.receive_sms_callback(sender, timestamp_str, merged_content)
+            )
 
+            # Dropped either way. The parts are still in the modem's store when
+            # this came from a drain, so a failed delivery is retried from
+            # there; keeping the buffer as well would only let a second copy of
+            # every part accumulate against a message already assembled.
             del self.concat_sms_cache[cache_key]
+            return delivered
+
+        return True
 
     async def _cleanup_expired_concat_cache(self) -> None:
         """Drop concatenated messages whose missing parts never arrived."""
