@@ -8,6 +8,7 @@ controls, and no test spends a real interval to synchronise.
 import ast
 import asyncio
 import importlib
+import logging
 import pathlib
 import signal
 import time
@@ -501,3 +502,78 @@ async def test_an_unexpected_supervision_failure_exits_one(monkeypatch, tmp_path
     assert supervisor.exit_reason is None
     assert device.teardowns.count >= 1
     assert telegram.teardowns.count >= 1
+
+
+# --- Configuration clamp notices --------------------------------------------
+
+
+class _LogCapture:
+    """Collect main's log records without printing them.
+
+    config.py cannot log a clamped setting itself - importing the logger
+    back into config would be circular, since logger.py reads its level from
+    config - so it only collects notices in CLAMP_NOTICES. This is what
+    proves the other half of that contract: main.py actually logs them.
+    """
+
+    def __init__(self):
+        self._logger = main.logger
+        self._handler = logging.Handler()
+        self.records = []
+        self._handler.emit = self.records.append
+        self._level = self._logger.level
+
+    def __enter__(self):
+        self._logger.setLevel(logging.DEBUG)
+        self._logger.addHandler(self._handler)
+        return self
+
+    def __exit__(self, *exc_info):
+        self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._level)
+        return False
+
+    @property
+    def text(self):
+        return " ".join(record.getMessage() for record in self.records)
+
+
+async def test_configuration_clamp_notices_are_logged_once(monkeypatch, tmp_path):
+    """A clamped setting is invisible until something logs it. This is that
+    something: whatever config.py collected gets logged once the logger
+    exists, before the components it might affect are ever built."""
+    monkeypatch.setattr(
+        config,
+        "CLAMP_NOTICES",
+        ["SOME_SETTING was requested as 1 but is running as 2 (floor is 2)"],
+    )
+    device = _FakeComponent("device")
+    telegram = _FakeComponent("telegram")
+    _, _, _, _, shutdown = _install(monkeypatch, tmp_path, device, telegram)
+
+    with _LogCapture() as captured:
+        task = asyncio.create_task(main.run())
+        await asyncio.wait_for(device.serving.at(1).wait(), timeout=_FAILSAFE)
+        shutdown.set()
+        assert await asyncio.wait_for(task, timeout=_FAILSAFE) == 0
+
+    assert "SOME_SETTING was requested as 1 but is running as 2" in captured.text
+
+
+async def test_an_unclamped_configuration_logs_nothing_about_itself(
+    monkeypatch, tmp_path
+):
+    """A stock configuration must stay silent. An operator who sees a
+    configuration warning on every start, clamped or not, stops reading them."""
+    monkeypatch.setattr(config, "CLAMP_NOTICES", [])
+    device = _FakeComponent("device")
+    telegram = _FakeComponent("telegram")
+    _, _, _, _, shutdown = _install(monkeypatch, tmp_path, device, telegram)
+
+    with _LogCapture() as captured:
+        task = asyncio.create_task(main.run())
+        await asyncio.wait_for(device.serving.at(1).wait(), timeout=_FAILSAFE)
+        shutdown.set()
+        assert await asyncio.wait_for(task, timeout=_FAILSAFE) == 0
+
+    assert captured.records == []
