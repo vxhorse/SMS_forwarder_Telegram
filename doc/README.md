@@ -89,8 +89,18 @@ for packet service alone, with messages delivered over a path that domain does
 not describe, reports one of the unregistered states while every message
 arrives — and on firmware predating `<stat>` 6 and 7 there is no value that
 expresses that case either. The heartbeat would then drop the session every few
-minutes and reinitialise the radio each time, which is worse than not checking,
-so set `MODEM_REGISTRATION_CHECK=0` on such a network.
+minutes and reinitialise the radio each time, which is worse than not checking.
+
+Because that failure cannot be distinguished from a real one without knowing
+what the SIM and the network actually report, `MODEM_REGISTRATION_CHECK`
+defaults to `0`. The state is still parsed, published in the health snapshot and
+logged with the check off — setup asks the module to report registration changes
+unasked — so the reading needed to make the decision is available without the
+check acting on it. Watch the snapshot's `registration` field over a period that
+includes ordinary message traffic: if it settles on 1, 5, 6 or 7, set
+`MODEM_REGISTRATION_CHECK=1` and the heartbeat will act on a run of unregistered
+readings. If it sits at 0 or 2 while messages keep arriving, this is the network
+described above and the check must stay off.
 
 Asking `AT+CGREG?` and `AT+CEREG?` as well — on the failing path only, counting
 a miss only when every domain agrees — is the complete answer, and it is not a

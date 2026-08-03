@@ -135,7 +135,9 @@ def _mask_number(number: Any) -> str:
 # branch and never reach a parser; and 27.007 allows their <n> to range up to
 # 5, which destroys the rule _registration_state_index relies on - that a
 # leading value above 2 cannot be an <n> - so they need a shape rule of their
-# own rather than this one. Until then MODEM_REGISTRATION_CHECK is the way out.
+# own rather than this one. Until then this is a question that can be wrong on
+# a whole class of network, which is why MODEM_REGISTRATION_CHECK ships off and
+# is enabled once the state read on a given SIM is known to be a true one.
 _REGISTERED_STATES = frozenset({1, 5, 6, 7})
 
 # No description carries a comma. They are interpolated into lines that
@@ -765,12 +767,15 @@ class DeviceManager:
         distinctive and cannot be confused with the OK produced by the message
         sending path; the signal strength it returns is useful diagnostically.
 
-        Answering is only half of what has to be true, so each answered probe
-        is followed by _probe_registration. A modem that has been detached from
-        the network answers every command exactly as it did before while not
-        one message can reach it - the same silent failure as a wedged modem,
-        arrived at by a different route, and invisible to a probe that asks
-        only whether the modem is still talking.
+        Answering is only half of what has to be true, so where the
+        registration check is enabled each answered probe is followed by
+        _probe_registration. A modem that has been detached from the network
+        answers every command exactly as it did before while not one message
+        can reach it - the same silent failure as a wedged modem, arrived at by
+        a different route, and invisible to a probe that asks only whether the
+        modem is still talking. That second question is off by default because
+        it cannot be answered truthfully on every network; see
+        MODEM_REGISTRATION_CHECK in config.py for when to switch it on.
 
         Both questions are asked through _probe_once, which bounds the whole
         transaction rather than the reply alone. Nothing this loop does can
