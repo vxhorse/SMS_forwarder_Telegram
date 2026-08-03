@@ -476,7 +476,7 @@ class DeviceManager:
         self.active_port = path
         await self._probe_modem()
         await self.setup_sms()
-        logger.warning(f"Connected to {path}")
+        logger.info(f"Connected to {path}")
         await self._notify(f"📶 Modem connected: {path}")
 
     async def run(self) -> None:
@@ -688,7 +688,7 @@ class DeviceManager:
             await self.message_queue.put(line)
             errors = 0
 
-        logger.warning("Read loop stopped")
+        logger.info("Read loop stopped")
 
     async def process_loop(self) -> None:
         """Drain the message queue. Reconnection belongs to the supervisor."""
@@ -711,7 +711,7 @@ class DeviceManager:
                     raise RuntimeError(f"Message processing failed {errors} times: {exc}")
                 await self._sleep(self.retry_delay)
 
-        logger.warning("Process loop stopped")
+        logger.info("Process loop stopped")
 
     async def process_message(self, message: bytes) -> None:
         """Route one line read from the serial port."""
@@ -1001,7 +1001,7 @@ class DeviceManager:
                 f"while they are still in it"
             )
         if delivered:
-            logger.warning(f"Recovered {delivered} message(s) from modem storage")
+            logger.info(f"Recovered {delivered} message(s) from modem storage")
         elif not entries:
             logger.info("Modem listed an empty storage area")
         return result
