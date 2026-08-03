@@ -291,6 +291,10 @@ class DeviceManager:
 
         # Parts of concatenated messages, keyed by (sender, ref_num).
         self.concat_sms_cache: Dict[tuple, ConcatSmsBuffer] = {}
+        # True only while the modem's store is being read out. Suspends the
+        # expiry of held parts, which would otherwise be able to discard one
+        # half of a long message between two entries of the same listing.
+        self._draining = False
 
         assert isinstance(self.baudrate, int), "baudrate must be an integer"
         assert isinstance(self.port, str), "port must be a string"
@@ -954,20 +958,26 @@ class DeviceManager:
         undecodable = 0
         entries = 0
         index = 0
-        while index < len(lines):
-            if lines[index].startswith(b'+CMGL:') and index + 1 < len(lines):
-                entries += 1
-                pdu_hex = lines[index + 1].decode('ascii', errors='ignore').strip()
-                # One unreadable entry must not cost us the rest of the store,
-                # so every outcome is counted and the loop carries on.
-                outcome = await self._forward_pdu(pdu_hex)
-                if outcome is ForwardOutcome.DELIVERED:
-                    delivered += 1
-                elif outcome is ForwardOutcome.UNDECODABLE:
-                    undecodable += 1
-                index += 2
-            else:
-                index += 1
+        # Held for the whole pass; see _cleanup_expired_concat_cache for why
+        # nothing may be aged out while the store is being read.
+        self._draining = True
+        try:
+            while index < len(lines):
+                if lines[index].startswith(b'+CMGL:') and index + 1 < len(lines):
+                    entries += 1
+                    pdu_hex = lines[index + 1].decode('ascii', errors='ignore').strip()
+                    # One unreadable entry must not cost us the rest of the
+                    # store, so every outcome is counted and the loop carries on.
+                    outcome = await self._forward_pdu(pdu_hex)
+                    if outcome is ForwardOutcome.DELIVERED:
+                        delivered += 1
+                    elif outcome is ForwardOutcome.UNDECODABLE:
+                        undecodable += 1
+                    index += 2
+                else:
+                    index += 1
+        finally:
+            self._draining = False
 
         result = DrainResult(
             entries=entries, delivered=delivered, undecodable=undecodable
@@ -1087,7 +1097,24 @@ class DeviceManager:
         return True
 
     async def _cleanup_expired_concat_cache(self) -> None:
-        """Drop concatenated messages whose missing parts never arrived."""
+        """Drop concatenated messages whose missing parts never arrived.
+
+        Suspended while the store is being read. The timeout exists to give up
+        on parts that are still in transit, and during a drain there are none:
+        every part that exists is already listed and will be handed over inside
+        the same bounded pass.
+
+        Letting it run there is worse than useless. The parts of one long
+        message are separate entries in the listing, and a drain slow enough to
+        cross the timeout between two of them would discard the parts already
+        read; the next part would then open a fresh buffer, report itself as a
+        fragment still waiting, and count as progress. The caller would see
+        every entry accounted for and erase a store that still held the only
+        copy of a message nobody ever received.
+        """
+        if self._draining:
+            return
+
         expired_keys = [
             key for key, buffer in self.concat_sms_cache.items()
             if buffer.is_expired(self.CONCAT_SMS_TIMEOUT)
