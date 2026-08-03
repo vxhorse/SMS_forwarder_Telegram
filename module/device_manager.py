@@ -721,10 +721,16 @@ class DeviceManager:
                 await self._probe_registration()
 
             if self.health is not None:
+                # Two reports, and they are not interchangeable. The first says
+                # this loop reached the end of a round, which is the only
+                # statement about this component that can be attributed to it -
+                # the second is written by whichever loop gets there first and
+                # so vouches for both. Neither is mark_up(): see
+                # Supervisor._serve_session for why that decision cannot be
+                # made from inside a component's own loop.
+                self.health.record_progress(self.name)
                 # Keep the snapshot file fresh so the container healthcheck can
-                # tell a live process from a wedged one. Refreshing only, never
-                # mark_up(): see Supervisor._serve_session for why that decision
-                # cannot be made from inside a component's own loop.
+                # tell a live process from a wedged one.
                 self.health.refresh_file()
 
     async def _probe_once(self, command: str, answered: asyncio.Event) -> bool:

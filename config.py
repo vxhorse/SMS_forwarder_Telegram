@@ -16,6 +16,26 @@ CHAT_ID = os.getenv("CHAT_ID", "your_telegram_chat_id")
 # "connect directly".
 PROXY_URL = os.getenv("PROXY_URL") or None
 
+# The timings the Telegram polling loop is built from.
+#
+# Deliberately not settable from the environment, unlike almost everything else
+# here. WATCHDOG_STALL_FLOOR below is derived from them, and that floor is only
+# correct while it describes the loop it is measuring: lengthening a deadline
+# here without moving the floor would put the stall threshold underneath the
+# time one working iteration can legitimately take, and the watchdog would
+# restart a process that is doing its job. Keeping them together is what makes
+# that impossible to do by halves.
+#
+# Deadline for one whole HTTP request to the API.
+TELEGRAM_REQUEST_TIMEOUT = 60.0
+# How long one getUpdates call parks on the server waiting for an update. Must
+# stay below the request deadline, which has to cover this wait plus the round
+# trip, or every poll expires on its own deadline before the API answers.
+TELEGRAM_LONG_POLL_SECONDS = 50
+# Attempts one outgoing message gets, and the wait between them.
+TELEGRAM_SEND_ATTEMPTS = 3
+TELEGRAM_SEND_RETRY_DELAY = 5.0
+
 # Health snapshot file written by the process and read by the container healthcheck.
 HEALTH_FILE = os.getenv("HEALTH_FILE", "/tmp/healthy")
 # How old the health file may be before the healthcheck considers it stale.
@@ -128,10 +148,13 @@ MODEM_REGISTRATION_CHECK = os.getenv(
     "MODEM_REGISTRATION_CHECK", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
 
-# The gap the heartbeat can legitimately leave between two refreshes of the
-# health snapshot, written as the rounds that make it up.
+# The gap the heartbeat can legitimately leave between two reports of progress,
+# written as the rounds that make it up.
 #
-# Only a round whose liveness probe went unanswered skips the refresh, and such
+# The device loop reports its own progress and refreshes the health snapshot at
+# the same point, so this one figure bounds both gaps.
+#
+# Only a round whose liveness probe went unanswered skips that point, and such
 # a round costs the interval before it plus the one deadline it spent waiting.
 # MODEM_PROBE_FAILURES - 1 of them can pass before the next one gives up and
 # raises. The round that does refresh costs an interval and two deadlines rather
@@ -163,15 +186,44 @@ WATCHDOG_REFRESH_BUDGET = (
     + MODEM_PROBE_INTERVAL
     + 2 * MODEM_PROBE_TIMEOUT
 )
-# Doubled for margin, because the probe is not the only thing the loop does
-# between refreshes. The second term covers a configuration that has cut the
-# reply deadline and the retry count to almost nothing, where twice the budget
-# would come to barely more than a single round.
-WATCHDOG_STALL_FLOOR = max(2 * WATCHDOG_REFRESH_BUDGET, 4 * MODEM_PROBE_INTERVAL)
+# The gap the Telegram polling loop can legitimately leave between two reports
+# of progress.
+#
+# It reports one when a poll returns and one after each update it handles, so a
+# single gap holds at most one of two things: a poll, bounded by the request
+# deadline; or the handling of one update. The slowest thing handling an update
+# can do is send a message, which is attempted TELEGRAM_SEND_ATTEMPTS times
+# behind that same deadline with a wait between attempts. The two are added
+# rather than maximised so the figure also covers a handler that answers the
+# API and then sends.
+#
+# This has to be in the floor below, not merely in the margin. Before progress
+# was tracked per component the Telegram loop's own pace did not matter, because
+# the device heartbeat refreshed the shared snapshot every half-minute whatever
+# Telegram was doing. Now that the loop is measured on its own, a threshold
+# under this figure would restart the process for taking a long poll.
+TELEGRAM_PROGRESS_BUDGET = (
+    TELEGRAM_REQUEST_TIMEOUT
+    + TELEGRAM_SEND_ATTEMPTS * TELEGRAM_REQUEST_TIMEOUT
+    + max(0, TELEGRAM_SEND_ATTEMPTS - 1) * TELEGRAM_SEND_RETRY_DELAY
+)
 
-# How long the health snapshot may go unrefreshed before the watchdog treats
-# the process as stalled. A component that blocks without raising never reaches
-# mark_down, so this is the only signal that catches it.
+# The modem term is doubled for margin, because the probe is not the only thing
+# that loop does between reports; its second form covers a configuration that
+# has cut the reply deadline and the retry count to almost nothing, where twice
+# the budget would come to barely more than a single round. The Telegram term is
+# not doubled: it is already a whole iteration's worst case rather than a
+# per-round figure, so there is nothing outside it to leave room for.
+WATCHDOG_STALL_FLOOR = max(
+    2 * WATCHDOG_REFRESH_BUDGET,
+    4 * MODEM_PROBE_INTERVAL,
+    TELEGRAM_PROGRESS_BUDGET,
+)
+
+# How long a component loop may go without advancing, or the health snapshot
+# without being written, before the watchdog treats the process as stalled. A
+# component that blocks without raising never reaches mark_down, so this is the
+# only signal that catches it.
 #
 # Bounded at both ends. Below the floor above, the watchdog restarts a process
 # that is merely riding out a slow modem. Above WATCHDOG_DOWN_SECONDS, a stall

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 
@@ -1271,6 +1272,66 @@ async def test_a_single_missed_heartbeat_keeps_the_session():
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+class _RecordingHealth(HealthState):
+    """The real HealthState, with a note of every progress report it is given."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.progress = []
+
+    def record_progress(self, name):
+        self.progress.append(name)
+        super().record_progress(name)
+
+
+async def test_the_heartbeat_reports_progress_even_with_nothing_to_refresh(tmp_path):
+    """The stamp has to be written by this loop, and refresh_file() cannot be
+    the route.
+
+    The snapshot is written only while every component is up, so it falls
+    silent for reasons that have nothing to do with this loop - here, a
+    Telegram component that has not connected yet. A stamp that travelled
+    through it would go silent with it and the loop would look stopped. It
+    would be no better the other way round either: both component loops refresh
+    the same file, so one that is still running keeps it fresh on behalf of one
+    that has stopped.
+    """
+    health = _RecordingHealth(
+        ["device", "telegram"], health_file=str(tmp_path / "healthy")
+    )
+    health.mark_up("device")  # Telegram deliberately left down.
+    manager = DeviceManager(_noop_callback, health=health, port="/hostdev/ttyUSB2")
+    manager.reader = FakeReader()
+    manager.writer = FakeWriter()
+    manager.probe_timeout = 0.01
+    manager._sleep = _no_delay
+    rounds = []
+    settled = asyncio.Event()
+
+    async def fake_probe(command):
+        if command == "AT+CREG?":
+            await manager.process_message(b"+CREG: 2,1")
+            return
+        rounds.append(command)
+        manager._probe_event.set()
+        if len(rounds) >= 2:
+            settled.set()
+
+    manager.send_at_command_async = fake_probe
+
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(settled.wait(), timeout=2.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert health.progress[:2] == ["device", "device"]
+    # Not one refresh landed in all that time, which is the point.
+    assert not os.path.exists(str(tmp_path / "healthy"))
 
 
 async def _heartbeat_must_give_up(manager, blocked_on: str) -> str:
