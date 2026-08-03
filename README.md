@@ -140,6 +140,15 @@ For detailed tutorial, refer to the [Telegram Bot API documentation](https://cor
 docker pull vxhorse/sms-forwarder
 ```
 
+Or build it from this repository instead, which is the usual choice if you have
+just cloned it:
+
+```bash
+docker build -t sms-forwarder .
+```
+
+If you build it, set `image: sms-forwarder` in your `docker-compose.yml`.
+
 2. Create local configuration files from the sanitized templates:
 
 ```bash
@@ -174,10 +183,9 @@ docker compose ps          # health goes from starting to healthy
 docker compose logs -f     # follow the startup sequence
 ```
 
-The container reports `starting` for up to three minutes. That is expected: a
-component is only reported up once its connection has held for
-`SERVICE_STABLE_SECONDS`, so the first health report cannot arrive before then,
-and the modem may still be enumerating.
+The container reports `starting` for up to three minutes, which is expected.
+[Reading the health check](#reading-the-health-check) explains what each health
+state means and how to inspect it.
 
 ## Configuration
 
@@ -250,6 +258,51 @@ the service waits for it with exponential backoff.
 If your modem is not a USB serial device (major 188) but CDC-ACM (major 166),
 both are already allowed. Check with `ls -l /dev/ttyUSB*` or `ls -l /dev/ttyACM*`.
 
+### Reading the health check
+
+`healthcheck.py` answers one question — can this process forward a message right
+now — and two things have to hold for the answer to be yes:
+
+1. The snapshot file at `HEALTH_FILE` was written less than
+   `HEALTH_STALE_SECONDS` ago, which shows the process is still running its
+   loops.
+2. Every component recorded in that file is up, which shows it can reach both
+   the modem and the Telegram API.
+
+The file is only written while every component is up, and each component
+rewrites it from its own loop, so a process that has stopped running stops
+refreshing it and the file it left behind goes stale. Freshness alone is never
+taken as health, and neither is the file merely existing.
+
+Ask the container runtime what it currently thinks:
+
+```bash
+docker inspect --format '{{.State.Health.Status}}' sms-forwarder
+docker inspect --format '{{json .State.Health.Log}}' sms-forwarder
+```
+
+Or run the same check by hand and read its exit code — `0` healthy, `1`
+unhealthy:
+
+```bash
+docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
+```
+
+Three states are worth recognising:
+
+- **`starting`** — inside `start_period`, which the example compose file sets to
+  180s. A component is only reported up once its session has held for
+  `SERVICE_STABLE_SECONDS` (60s by default), and the snapshot is not written
+  until every component is up, so the earliest possible first write is a minute
+  after both have connected. `start_period` has to cover that plus however long
+  the modem takes to enumerate; raise it if yours is slow.
+- **`unhealthy`** — nothing is being forwarded. Note that this does not restart
+  anything by itself; the container runtime only records it. Recovery comes from
+  the service reconnecting on its own, and failing that from the watchdog, which
+  exits the process after `WATCHDOG_DOWN_SECONDS` so the restart policy takes
+  over.
+- **`healthy`** — the snapshot is fresh and every component is up.
+
 ## Usage Instructions
 
 Once the service is started, it will automatically monitor incoming SMS and forward them to the configured Telegram conversation.
@@ -291,8 +344,36 @@ Send `/help` in the Telegram bot conversation to view all available commands.
    - Confirm bot permission settings are correct
 
 3. **Module Not Recognized**:
+   - Read what discovery reported: `docker compose logs | grep -iE 'candidate|discovered|answered'`.
+     `Discovered modem AT port: ...` means it succeeded; `No candidate port
+     answered AT` means every candidate was probed and none replied; `No
+     candidate serial ports under ...` means there was nothing to probe at all
    - Confirm the host sees the device: `ls -l /dev/ttyUSB*` and `dmesg | grep tty`
    - If the host sees it but the container does not, check that the major number
      in the listing is covered by `device_cgroup_rules`
+   - If candidates were probed and none answered, the usual cause is another
+     process holding the AT port — see [Avoid Device Conflicts](#3-avoid-device-conflicts)
+   - If your module's AT port is neither a `ttyUSB*` nor a `ttyACM*` device it is
+     never probed; set `SMS_PORT` explicitly, as the path under `SMS_DEV_ROOT`
    - Nothing has to be restarted after plugging the module in: the service is
      waiting for it and picks it up on its own
+
+4. **A Module This Project Has Not Been Tested With**:
+   - Two commands in the startup sequence are vendor specific (`AT+QCFG`,
+     `AT+QURCCFG`). A module that does not implement them logs
+     `... was not acknowledged; continuing setup` and carries on, which is
+     harmless
+   - Only four commands are mandatory: `AT+CFUN=1`, `AT+CMGF=0`, `AT+CPMS` and
+     `AT+CNMI`. `Modem did not acknowledge <command>` followed by a reconnect
+     means one of those was refused, and the module cannot be driven as it stands
+   - [`doc/README.md`](doc/README.md) maps every command the service issues to
+     what it does, so each one can be looked up in your own module's AT manual
+
+5. **The Container Never Becomes Healthy**:
+   - `starting` for up to three minutes is expected — see
+     [Reading the health check](#reading-the-health-check)
+   - Staying `unhealthy` means a component is down, and the log names which:
+     `Component <name> failed ...`
+   - An unhealthy container is not restarted by the container runtime. The
+     watchdog exits the process after `WATCHDOG_DOWN_SECONDS`, and the restart
+     policy takes it from there

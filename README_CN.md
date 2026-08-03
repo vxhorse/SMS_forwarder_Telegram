@@ -135,6 +135,14 @@ sudo systemctl disable ModemManager
 docker pull vxhorse/sms-forwarder
 ```
 
+也可以直接用本仓库构建镜像，刚克隆下来时通常这样做：
+
+```bash
+docker build -t sms-forwarder .
+```
+
+若自行构建，请在 `docker-compose.yml` 中把 `image:` 改为 `sms-forwarder`。
+
 2. 从脱敏模板创建本地配置文件：
 
 ```bash
@@ -166,9 +174,8 @@ docker compose ps          # 健康状态由 starting 变为 healthy
 docker compose logs -f     # 跟踪启动过程
 ```
 
-容器最多会显示三分钟的 `starting`，这是正常现象：组件必须在连接持续
-`SERVICE_STABLE_SECONDS` 之后才会被标记为就绪，因此第一次健康上报不可能更早，
-而此时模块也可能仍在枚举。
+容器最多会显示三分钟的 `starting`，这是正常现象。
+各个健康状态的含义以及查看方法，详见「读懂健康检查」一节。
 
 ## 配置说明
 
@@ -235,6 +242,43 @@ docker compose logs -f     # 跟踪启动过程
 如果您的模块不是USB串口设备（主设备号 188）而是CDC-ACM设备（主设备号 166），
 两者都已在允许之列。可用 `ls -l /dev/ttyUSB*` 或 `ls -l /dev/ttyACM*` 确认。
 
+### 读懂健康检查
+
+`healthcheck.py` 只回答一个问题——此刻这个进程能否转发短信——
+而答案为「能」需要同时满足两点：
+
+1. `HEALTH_FILE` 指向的状态快照文件，写入时间距今不足 `HEALTH_STALE_SECONDS`，
+   这说明进程的各个循环仍在运行。
+2. 该文件记录的每个组件都处于就绪状态，这说明进程既能访问模块，也能访问 Telegram API。
+
+只有全部组件就绪时才会写入该文件，且每个组件都会从自己的循环中刷新它，
+因此进程一旦不再运行就不会再刷新，遗留下来的文件自然变陈旧。
+仅仅文件新鲜、或者文件存在，都不会被当作健康。
+
+查看容器运行时当前的判断：
+
+```bash
+docker inspect --format '{{.State.Health.Status}}' sms-forwarder
+docker inspect --format '{{json .State.Health.Log}}' sms-forwarder
+```
+
+也可以手动执行同一项检查并读取退出码——`0` 表示健康，`1` 表示不健康：
+
+```bash
+docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
+```
+
+有三种状态值得辨认：
+
+- **`starting`**——仍处于 `start_period` 之内，示例编排文件将其设为 180 秒。
+  组件必须在会话持续 `SERVICE_STABLE_SECONDS`（默认 60 秒）之后才会被标记为就绪，
+  而快照要等到全部组件都就绪才写入，因此最早也要在两者都连上之后再过一分钟。
+  `start_period` 必须覆盖这段时间，再加上模块枚举所需的时间；模块较慢时请调大它。
+- **`unhealthy`**——此时没有任何短信被转发。请注意它本身不会重启任何东西，
+  容器运行时只是把它记录下来。恢复要么靠服务自行重连，要么靠看门狗：
+  掉线超过 `WATCHDOG_DOWN_SECONDS` 后看门狗会退出进程，之后由重启策略接手。
+- **`healthy`**——快照是新鲜的，且全部组件均已就绪。
+
 ## 使用说明
 
 服务启动后，将自动监听接收短信并转发至配置的Telegram会话。
@@ -276,6 +320,28 @@ docker compose logs -f     # 跟踪启动过程
    - 确认机器人权限设置正确
 
 3. **模块无法识别**：
+   - 先看自动发现报告了什么：`docker compose logs | grep -iE 'candidate|discovered|answered'`。
+     `Discovered modem AT port: ...` 表示成功；`No candidate port answered AT`
+     表示所有候选端口都探测过但无人应答；`No candidate serial ports under ...`
+     表示根本没有可供探测的端口
    - 确认主机能看到设备：`ls -l /dev/ttyUSB*` 与 `dmesg | grep tty`
    - 若主机能看到而容器看不到，检查列表中的主设备号是否已被 `device_cgroup_rules` 覆盖
+   - 若确实探测过候选端口却无人应答，最常见的原因是别的进程占用了AT端口，详见「避免设备冲突」一节
+   - 若模块的AT端口既不是 `ttyUSB*` 也不是 `ttyACM*`，它永远不会被探测；
+     请显式设置 `SMS_PORT`，并填写 `SMS_DEV_ROOT` 之下的路径
    - 插入模块后无需重启任何东西：服务本就在等待，会自行接管
+
+4. **本项目尚未验证过的模块**：
+   - 初始化序列中有两条厂商专有命令（`AT+QCFG`、`AT+QURCCFG`）。不支持它们的模块会记录
+     `... was not acknowledged; continuing setup` 并继续执行，这是无害的
+   - 只有四条命令是必需的：`AT+CFUN=1`、`AT+CMGF=0`、`AT+CPMS` 与 `AT+CNMI`。
+     日志出现 `Modem did not acknowledge <command>` 并随即重连，说明其中一条被拒绝，
+     该模块按现状无法驱动
+   - [`doc/README.md`](doc/README.md) 列出了本服务发出的每一条命令及其用途，
+     可据此在您自己模块的AT命令手册中逐条查阅
+
+5. **容器始终不进入健康状态**：
+   - 最多三分钟的 `starting` 属于正常，详见「读懂健康检查」一节
+   - 一直是 `unhealthy` 说明有组件掉线，日志会指出是哪一个：`Component <name> failed ...`
+   - 容器运行时不会因为不健康而自行重启容器。看门狗会在 `WATCHDOG_DOWN_SECONDS`
+     之后退出进程，随后由重启策略接手
