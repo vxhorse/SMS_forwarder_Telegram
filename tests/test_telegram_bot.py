@@ -9,7 +9,6 @@ import asyncio
 import inspect
 import json
 import logging
-import time
 
 import aiohttp
 import pytest
@@ -440,13 +439,6 @@ async def test_polling_refreshes_the_health_file_without_marking_up():
 
     assert health.refreshes >= 3
     assert health.marked_up == []
-
-
-async def test_activity_is_stamped_with_a_monotonic_clock():
-    """Wall clock is not usable for durations here: a host without a
-    battery-backed clock jumps years forward the moment time is synchronised."""
-    bot = _make()
-    assert bot.last_activity <= time.monotonic()
 
 
 # --- Nothing in the log may carry a message -----------------------------------

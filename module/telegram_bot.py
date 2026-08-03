@@ -12,7 +12,6 @@ import asyncio
 import json
 import re
 import html
-import time
 from typing import Optional, Callable, Dict, Any
 from logger import setup_logger
 from module.supervisor import FatalConfigError
@@ -121,10 +120,6 @@ class TelegramBot:
 
         # Running state.
         self.is_running = False
-        # Monotonic, not wall clock: a host without a battery-backed clock boots
-        # years in the past and leaps forward once time is synchronised, which
-        # would make any wall-clock interval nonsense.
-        self.last_activity = time.monotonic()
 
         # Session management.
         self.session: Optional[aiohttp.ClientSession] = None
@@ -274,7 +269,6 @@ class TelegramBot:
             updates = await self.get_updates()
             for update in updates:
                 await self.process_update(update)
-            self.last_activity = time.monotonic()
             # Refreshing only, never mark_up(): see Supervisor._serve_session
             # for why that decision cannot be made from inside a component's
             # own loop.
@@ -627,16 +621,3 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"Error building a keyboard layout: {self._describe_error(e)}")
             return {}
-
-    @staticmethod
-    def create_inline_keyboard(buttons: list[list[str]], callback_data: list[list[str]]) -> dict:
-        """Build an inline keyboard, checking that labels and data line up."""
-        if len(buttons) != len(callback_data):
-            raise ValueError("buttons and callback_data must have the same number of rows")
-
-        inline_keyboard = [
-            [{'text': text, 'callback_data': data} for text, data in zip(row_buttons, row_data)]
-            for row_buttons, row_data in zip(buttons, callback_data)
-        ]
-
-        return {'inline_keyboard': inline_keyboard}
