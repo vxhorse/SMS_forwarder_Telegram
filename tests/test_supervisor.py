@@ -575,12 +575,37 @@ async def test_watchdog_holds_fire_below_the_stall_threshold():
     await task
 
 
-async def test_the_down_threshold_still_wins_when_both_apply():
+async def test_a_component_down_past_its_threshold_is_reported_as_down():
+    """A component that is down stops the snapshot being refreshed too, so both
+    ages are large at once. The reason recorded has to be the one that names
+    what actually happened, or the logs send an operator looking for a block
+    that is not there.
+
+    This does not pin the order of the two checks: the stall check is gated on
+    nothing being reported down, so with a component down it cannot fire
+    whichever order they are in. The test below pins the order.
+    """
     shutdown = asyncio.Event()
     health = _StallHealth(down=4000.0, stall=300.0)
     sup = Supervisor(health, shutdown)
     await asyncio.wait_for(
         sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0),
+        timeout=_FAILSAFE,
+    )
+    assert sup.exit_reason == "watchdog"
+
+
+async def test_the_down_reason_wins_when_both_criteria_are_met_at_once():
+    """The two criteria are mutually exclusive at any sane configuration, so a
+    down threshold of zero is the only way to satisfy both at the same moment
+    and make the order observable. The down reason is the more specific of the
+    two and must be the one recorded.
+    """
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=300.0)
+    sup = Supervisor(health, shutdown)
+    await asyncio.wait_for(
+        sup.watchdog_loop(threshold=0.0, interval=0.0, stall_threshold=240.0),
         timeout=_FAILSAFE,
     )
     assert sup.exit_reason == "watchdog"
@@ -610,13 +635,166 @@ async def test_a_component_that_is_down_is_not_also_reported_as_stalled():
     await task
 
 
-def test_watchdog_stall_threshold_has_a_floor(monkeypatch):
-    """The threshold is operator-settable, and zero would make it fire the
-    moment the first snapshot is written, killing a working process."""
+async def test_a_recovery_does_not_inherit_the_outage_as_a_stall():
+    """The age left behind by an outage must not be read as a stall the moment
+    the component comes back.
+
+    Nothing re-stamps the last-refresh time on recovery: the snapshot is not
+    written while anything is down, and the component loops only refresh it on
+    their own next cycle, which is a cycle away. So the first inspection after
+    a component comes back sees nothing down beside an age as old as the whole
+    outage. Acting on that would restart the process for having reconnected,
+    and would put the same short ceiling on an outage that the gate above
+    exists to keep off it.
+    """
+    shutdown = asyncio.Event()
+    # Ten minutes down, well inside the down threshold. The age tracks it,
+    # because a down component is exactly when the snapshot is not written.
+    health = _StallHealth(down=600.0, stall=600.0)
+    sup = Supervisor(health, shutdown)
+    task = asyncio.create_task(
+        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    assert not task.done()
+
+    # The component reconnects. The age it accrued while down is still there,
+    # and no loop has reached its next refresh yet.
+    health.down = 0.0
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    assert not task.done()
+    assert sup.exit_reason is None
+    # The watchdog did inspect the recovered state rather than never looking.
+    assert health.stall_reads >= _MIN_INSPECTIONS
+    shutdown.set()
+    await task
+
+
+async def test_a_stall_beginning_after_a_recovery_is_still_caught():
+    """Discounting the outage's age delays detection by one threshold measured
+    from the recovery. It must not disable it: a component that comes back and
+    then stops making progress is exactly the failure this check is for.
+    """
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=600.0, stall=600.0)
+    sup = Supervisor(health, shutdown)
+    task = asyncio.create_task(
+        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    health.down = 0.0  # Recovered, carrying the outage's age with it.
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    assert not task.done()
+
+    # No refresh ever lands, so the age keeps growing from where it was. A full
+    # threshold of it has now accrued since the recovery rather than before it.
+    health.stall = 600.0 + 240.0
+    await asyncio.wait_for(task, timeout=_FAILSAFE)
+    assert sup.exit_reason == "stalled"
+    assert shutdown.is_set()
+
+
+async def test_a_refresh_after_a_recovery_stops_the_outage_being_discounted():
+    """The discount lasts until a refresh lands, and no longer.
+
+    Once the loops are refreshing again the reading no longer contains the
+    outage's age, so keeping the old figure to subtract would hold detection
+    off by the length of an outage that is long over - and the older the
+    outage, the longer the blind spot.
+    """
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=600.0, stall=600.0)
+    sup = Supervisor(health, shutdown)
+    task = asyncio.create_task(
+        sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+    )
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    health.down = 0.0
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    assert not task.done()
+
+    # The loops reach their next cycle and the snapshot is written again.
+    health.stall = 1.0
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    assert not task.done()
+
+    # Much later, progress stops for a full threshold. This is an ordinary
+    # stall now: nothing about the old outage should still be subtracted.
+    health.stall = 240.0
+    await asyncio.wait_for(task, timeout=_FAILSAFE)
+    assert sup.exit_reason == "stalled"
+
+
+def _legitimate_refresh_gap(cfg) -> float:
+    """The longest gap the heartbeat can leave between two refreshes.
+
+    A missed probe costs its interval plus the deadline it waits for a reply,
+    and MODEM_PROBE_FAILURES of them in a row have to pass before the probe
+    gives up and raises. Until it does, the component is working and simply
+    has not refreshed the snapshot.
+    """
+    return cfg.MODEM_PROBE_FAILURES * (cfg.MODEM_PROBE_INTERVAL + cfg.MODEM_PROBE_TIMEOUT)
+
+
+def test_watchdog_stall_threshold_clears_the_probes_own_retry_budget(monkeypatch):
+    """The threshold is operator-settable, and any value inside that budget
+    restarts a process that is only riding out a slow modem."""
     monkeypatch.setenv("WATCHDOG_STALL_SECONDS", "0")
     try:
         reloaded = importlib.reload(config)
-        assert reloaded.WATCHDOG_STALL_SECONDS >= 4 * reloaded.MODEM_PROBE_INTERVAL
+        assert reloaded.WATCHDOG_STALL_SECONDS >= 2 * _legitimate_refresh_gap(reloaded)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+
+def test_the_stall_floor_still_clears_the_budget_at_the_shortest_window(monkeypatch):
+    """The floor has to be derived from the same settings the budget is, not
+    from the refresh interval alone. At the shortest configurable staleness
+    window the probe interval is clamped down but the reply deadline is not,
+    so a floor scaled off the interval alone lands under the budget and the
+    watchdog restarts a working process.
+    """
+    monkeypatch.setenv("HEALTH_STALE_SECONDS", "2")
+    monkeypatch.setenv("WATCHDOG_STALL_SECONDS", "0")
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.WATCHDOG_STALL_SECONDS >= 2 * _legitimate_refresh_gap(reloaded)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+
+def test_watchdog_stall_threshold_has_a_ceiling(monkeypatch):
+    """A stall is a component lost without saying so. It must not go unnoticed
+    for longer than the operator's stated tolerance for one that says so,
+    which is what WATCHDOG_DOWN_SECONDS is.
+    """
+    monkeypatch.setenv("HEALTH_STALE_SECONDS", "10000")
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.WATCHDOG_STALL_SECONDS <= reloaded.WATCHDOG_DOWN_SECONDS
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+
+def test_the_stall_floor_outranks_the_ceiling(monkeypatch):
+    """The two bounds can conflict, and which one gives has to be the safe one.
+    Holding the threshold above the probe budget costs a slower restart;
+    cutting it below restarts a process that is working.
+    """
+    monkeypatch.setenv("WATCHDOG_DOWN_SECONDS", "1")
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.WATCHDOG_STALL_SECONDS >= 2 * _legitimate_refresh_gap(reloaded)
     finally:
         monkeypatch.undo()
         importlib.reload(config)

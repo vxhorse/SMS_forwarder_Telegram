@@ -271,6 +271,12 @@ class Supervisor:
         Both thresholds sit far above any normal cycle, so neither fires on a
         component that is merely reconnecting.
         """
+        # The snapshot age that was already on the clock when the last recovery
+        # was observed, or None when there is nothing to discount. See the
+        # stall check below.
+        inherited_age: Optional[float] = None
+        seen_down = False
+
         while not self.shutdown_event.is_set():
             try:
                 await asyncio.wait_for(self.shutdown_event.wait(), timeout=interval)
@@ -298,17 +304,49 @@ class Supervisor:
             # What is down is already on the clock above, with the tolerance
             # chosen for it.
             stalled = self.health.stall_duration() if duration == 0.0 else None
-            # None also means the system has not been fully up even once. That
-            # is a process still waiting for its dependencies, which must never
-            # be killed for waiting.
-            if stalled is not None and stalled >= stall_threshold:
-                logger.error(
-                    f"Watchdog tripped: the health snapshot has not been "
-                    f"refreshed for {stalled:.0f}s (threshold "
-                    f"{stall_threshold:.0f}s) while every component still "
-                    f"reports up, which means something is blocked rather than "
-                    f"failing; exiting so the container runtime can restart it"
-                )
-                self.exit_reason = "stalled"
-                self.shutdown_event.set()
-                return
+
+            # An outage's age outlives the outage. Nothing re-stamps the
+            # snapshot when a component comes back: it is not written at all
+            # while anything is down, and the component loops only refresh it
+            # on their own next cycle, which is a cycle away. So the first
+            # inspections after a recovery find an age as old as the whole
+            # outage sitting beside nothing being down, and reading that as a
+            # stall would restart the process for having reconnected. Whatever
+            # age the outage left behind is therefore discounted until a
+            # refresh actually lands, at which point the reading no longer
+            # contains it and there is nothing left to discount.
+            if duration > 0.0:
+                seen_down = True
+                inherited_age = None
+            elif seen_down:
+                seen_down = False
+                inherited_age = stalled
+            elif inherited_age is not None and (
+                stalled is None or stalled < inherited_age
+            ):
+                inherited_age = None
+
+            # None means the system has not been fully up even once. That is a
+            # process still waiting for its dependencies, which must never be
+            # killed for waiting.
+            if stalled is not None:
+                # Measured against the same reading the age comes from, so both
+                # sides use HealthState's clock and no second time source is
+                # involved. Detection is delayed to one threshold past a
+                # recovery, never suppressed: this term grows with the age.
+                accrued = stalled
+                if inherited_age is not None:
+                    accrued = stalled - inherited_age
+                if accrued >= stall_threshold:
+                    logger.error(
+                        f"Watchdog tripped: the health snapshot has not been "
+                        f"refreshed for {stalled:.0f}s (threshold "
+                        f"{stall_threshold:.0f}s) while every component still "
+                        f"reports up. Either a component loop has stopped "
+                        f"making progress without failing, or HEALTH_FILE can "
+                        f"no longer be written; exiting so the container "
+                        f"runtime can restart everything"
+                    )
+                    self.exit_reason = "stalled"
+                    self.shutdown_event.set()
+                    return
