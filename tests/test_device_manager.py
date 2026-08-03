@@ -767,6 +767,19 @@ async def test_a_csq_reply_is_not_mistaken_for_pdu_data():
     assert manager.pending_sms["pdu"] == b""
 
 
+async def test_a_send_confirmation_is_not_mistaken_for_pdu_data():
+    """The same collision as the heartbeat reply, from the other direction: a
+    +CMGS for a message the user just sent can arrive between a +CMT header and
+    its PDU. Appending it to the pending PDU corrupts the inbound message and
+    swallows the confirmation, so the send path reports a failure for a message
+    the modem accepted."""
+    manager = _make()
+    await manager.process_message(b"+CMT: ,26\r\n")
+    await manager.process_message(b"+CMGS: 42\r\n")
+    assert manager.sms_sent_event.is_set() is True
+    assert manager.pending_sms["pdu"] == b""
+
+
 async def test_heartbeat_raises_after_consecutive_failures():
     manager = _make([])
     manager.probe_interval = 0.01

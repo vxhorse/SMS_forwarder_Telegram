@@ -648,12 +648,21 @@ class DeviceManager:
             # it to the PDU would corrupt the message and lose the heartbeat.
             # A PDU line is hexadecimal, so it can never be mistaken for this.
             self._handle_csq(message)
-        elif self.pending_sms["pdu"] is not None:
-            await self.handle_incoming_sms_pdu(message)
         elif message.startswith(b'+CMGS:'):
+            # Ahead of the pending-PDU branch for the same reason as +CSQ, and
+            # safe for the same reason. A send confirmation arrives whenever
+            # the modem accepts an outgoing message, which is independent of
+            # what is arriving, so it can land between a +CMT header and its
+            # PDU. Appending it there breaks two things at once: the inbound
+            # message fails to decode and is dropped, and the confirmation is
+            # never seen, so the sending path waits out its deadline and
+            # reports a failure for a message the modem did accept.
+            #
             # +CMGS carries only the message reference number.
             logger.info(f"Message accepted by the modem: {message.decode('utf-8')}")
             self.sms_sent_event.set()
+        elif self.pending_sms["pdu"] is not None:
+            await self.handle_incoming_sms_pdu(message)
         elif message.startswith(b'+CREG:'):
             # Decoded outside the try so the failure path below can always
             # name the line it could not parse.
