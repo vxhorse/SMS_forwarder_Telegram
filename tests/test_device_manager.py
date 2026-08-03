@@ -1221,6 +1221,9 @@ async def test_an_answered_heartbeat_resets_the_failure_count():
     manager.probe_timeout = 0.01
     manager.probe_failures = 2
     manager._sleep = _no_delay
+    # The whole round, both questions, as an operator who enabled the check
+    # gets it: the liveness count has to behave the same either way.
+    manager.registration_check = True
     answers = iter([False, True, False, False])
     probes = []
 
@@ -1251,6 +1254,7 @@ async def test_a_single_missed_heartbeat_keeps_the_session():
     manager.probe_timeout = 0.01
     manager.probe_failures = 3
     manager._sleep = _no_delay
+    manager.registration_check = True  # the full round, as an operator who enabled it
     probes = []
     settled = asyncio.Event()
 
@@ -1311,6 +1315,9 @@ async def test_the_heartbeat_reports_progress_even_with_nothing_to_refresh(tmp_p
     manager.writer = FakeWriter()
     manager.probe_timeout = 0.01
     manager._sleep = _no_delay
+    # The longer of the two rounds, so the report being asserted is the one a
+    # round that asks both questions makes.
+    manager.registration_check = True
     rounds = []
     settled = asyncio.Event()
 
@@ -1436,6 +1443,7 @@ async def test_a_blocked_write_on_the_registration_probe_is_a_miss_not_a_hang():
     manager.probe_timeout = 0.01
     manager.probe_failures = 99  # the liveness path must not be what raises
     manager.registration_failures = 2
+    manager.registration_check = True  # the question this test is about
 
     async def answer(command):
         if command == b"AT+CSQ\r\n":
@@ -1539,6 +1547,13 @@ _PARKED = 3600
 def _answering_modem(manager, replies):
     """Answer the heartbeat's probes, one registration reading at a time.
 
+    The registration check is switched on here, because it ships off and every
+    test using this helper is a test of what the check does once an operator
+    has turned it on. Turning the default off must not quietly delete that
+    coverage: with this line removed, every test below would stop asking the
+    question and the assertions counting AT+CREG? would fail rather than pass
+    vacuously.
+
     Every AT+CSQ is answered, so the liveness path can never be what decides
     the outcome of a test about registration. Each AT+CREG? is answered with
     the next entry of `replies`, fed through the real routing path so it is
@@ -1558,6 +1573,7 @@ def _answering_modem(manager, replies):
     :return: the commands as they are sent, and the event announcing that the
         scripted rounds are over.
     """
+    manager.registration_check = True
     remaining = list(replies)
     sent = []
     exhausted = asyncio.Event()
@@ -1796,12 +1812,52 @@ async def test_the_off_network_warning_names_one_state_and_one_count():
     assert "," not in warnings[0], warnings
 
 
+async def test_a_stock_start_asks_the_liveness_question_and_nothing_else():
+    """What an unconfigured deployment does, asserted through the real config
+    default rather than a value the test chose.
+
+    The check ships off, so the heartbeat asks AT+CSQ and stops there. Nothing
+    about the modem's registration is asked, no reading is counted, and a
+    network that cannot answer the question truthfully cannot end a session
+    over it.
+    """
+    manager = _make()
+    manager._sleep = _no_delay
+    manager.probe_timeout = 0.01
+    manager.probe_failures = 99
+    # Straight from config, untouched: this is the assertion that fails if the
+    # default is flipped back without the reasoning that flipped it off.
+    assert manager.registration_check is False
+
+    probes = []
+    settled = asyncio.Event()
+
+    async def fake_probe(command):
+        probes.append(command)
+        manager._probe_event.set()
+        if len(probes) >= 5:
+            settled.set()
+
+    manager.send_at_command_async = fake_probe
+
+    task = asyncio.create_task(manager.heartbeat_loop())
+    try:
+        await asyncio.wait_for(settled.wait(), timeout=2.0)
+        assert task.done() is False
+        assert probes == ["AT+CSQ"] * 5
+        assert manager.registration_misses == 0
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 async def test_the_registration_check_can_be_switched_off():
     """A network that attaches the modem for data alone, with messages
     arriving over a path this question does not describe, has no true answer
-    to give it. An operator seeing that must be able to stop asking without
-    waiting for a release, and without the radio being reinitialised every
-    few minutes in the meantime."""
+    to give it. An operator who enabled the check and then saw that must be
+    able to stop asking without waiting for a release, and without the radio
+    being reinitialised every few minutes in the meantime."""
     manager = _make()
     manager._sleep = _no_delay
     manager.probe_timeout = 0.01
@@ -1840,13 +1896,22 @@ async def test_the_registration_check_is_switched_off_separately_from_its_thresh
     """A switch and a count are deliberately two settings. Folding the switch
     into the count would let an operator raising the threshold disable the
     guard by accident, which is why the count keeps a floor it cannot be
-    tuned below."""
+    tuned below.
+
+    The switch defaults to off, and an unset environment must read the same as
+    an explicit no. What the check asks cannot be answered truthfully on every
+    network, and where it cannot the misreading ends a session on a timescale
+    longer than the one a session takes to count as recovered - so each cycle
+    resets what the watchdog measures and the loop registers nowhere. Enabling
+    it is a decision to take per SIM, once the state that modem reports is
+    known.
+    """
     import importlib
 
     original = config.MODEM_REGISTRATION_CHECK
     try:
         monkeypatch.delenv("MODEM_REGISTRATION_CHECK", raising=False)
-        assert importlib.reload(config).MODEM_REGISTRATION_CHECK is True
+        assert importlib.reload(config).MODEM_REGISTRATION_CHECK is False
 
         for value in ("0", "false", "no", "off"):
             monkeypatch.setenv("MODEM_REGISTRATION_CHECK", value)
@@ -1855,8 +1920,12 @@ async def test_the_registration_check_is_switched_off_separately_from_its_thresh
             # Switching the check off does not lower the floor on the count.
             assert reloaded.MODEM_REGISTRATION_FAILURES >= 2
 
-        monkeypatch.setenv("MODEM_REGISTRATION_CHECK", "1")
-        assert importlib.reload(config).MODEM_REGISTRATION_CHECK is True
+        # And the opt-in still works, from every spelling an operator is
+        # likely to reach for: a default of off would be worth nothing if
+        # turning it on were unreachable.
+        for value in ("1", "true", "yes", "on"):
+            monkeypatch.setenv("MODEM_REGISTRATION_CHECK", value)
+            assert importlib.reload(config).MODEM_REGISTRATION_CHECK is True, value
     finally:
         monkeypatch.undo()
         importlib.reload(config)
@@ -1870,6 +1939,7 @@ async def test_run_parks_while_the_modem_keeps_answering():
     therefore never end, while its heartbeat keeps going underneath it."""
     manager = _make([])
     manager._sleep = _no_delay
+    manager.registration_check = True  # both questions, as the longer round
     probes = []
     settled = asyncio.Event()
 

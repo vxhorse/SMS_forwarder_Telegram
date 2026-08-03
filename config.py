@@ -214,17 +214,40 @@ MODEM_REGISTRATION_FAILURES = _clamped(
 # patience can switch the guard off by accident - so the count keeps a floor it
 # cannot be tuned below, and switching off is spelt out here instead.
 #
-# It exists because the question can have no true answer. The registration
-# state read by this check describes the circuit-switched domain, and a network
-# that attaches a module for packet service alone, delivering messages over a
-# path that state does not describe, reports "not registered" while every
-# message arrives. On such a network the check would drop the session every few
-# minutes and reinitialise the radio each time, which is worse than not
-# checking; see the known limitation recorded beside _REGISTERED_STATES in
-# module/device_manager.py for what a complete answer would require. Anyone in
-# that position needs a way out that does not involve waiting for a release.
+# Off by default, which is an opt-in and not an oversight. The question can
+# have no true answer: the registration state read by this check describes the
+# circuit-switched domain, and a network that attaches a module for packet
+# service alone, delivering messages over a path that state does not describe,
+# reports "not registered" while every message arrives. See the known
+# limitation recorded beside _REGISTERED_STATES in module/device_manager.py for
+# what a complete answer would require.
+#
+# On such a network the check does more than report nothing useful, and this is
+# what decides the default rather than the noise alone. It raises only after
+# MODEM_REGISTRATION_FAILURES misses spaced MODEM_PROBE_INTERVAL apart, which
+# at the values above is longer than SERVICE_STABLE_SECONDS - so every cycle
+# reaches the point where the session counts as recovered before the point
+# where it fails. Each recovery re-stamps the health record, which is what both
+# watchdog criteria measure from, so neither the down clock nor the stall clock
+# accumulates across cycles and the loop is invisible to both. The snapshot
+# goes stale for only the width of one teardown, so the container healthcheck
+# stays green through it too. Meanwhile every cycle reinitialises the radio and
+# rewrites the modem's stored profile. A guard whose false positive cannot be
+# seen by anything watching is not one to ship enabled.
+#
+# Turning it on is a decision to take once the answer is known for the SIM and
+# the network in use, and costs nothing to defer: setup asks the modem to
+# report registration changes unasked, so the state is still parsed, still
+# published in the health snapshot and still logged with this off. What is
+# deferred is only whether a run of unregistered readings ends the session.
+# Read the registration field of the snapshot over a period that includes
+# ordinary message traffic; if it settles on 1 or 5 - or on 6 or 7, registered
+# for messages alone - then the question has a true answer on that network and
+# MODEM_REGISTRATION_CHECK=1 buys the detection it was built for. If it sits at
+# 0 or 2 while messages keep arriving, leave it off: that is the network this
+# check cannot describe.
 MODEM_REGISTRATION_CHECK = os.getenv(
-    "MODEM_REGISTRATION_CHECK", "1"
+    "MODEM_REGISTRATION_CHECK", "0"
 ).strip().lower() not in ("0", "false", "no", "off")
 
 # The gap the heartbeat can legitimately leave between two reports of progress,
