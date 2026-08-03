@@ -11,7 +11,10 @@ SMS_BAUDRATE = int(os.getenv("SMS_BAUDRATE", "115200"))
 # Telegram bot settings.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "your_telegram_bot_token")
 CHAT_ID = os.getenv("CHAT_ID", "your_telegram_chat_id")
-PROXY_URL = os.getenv("PROXY_URL", "http://127.0.0.1:7890")
+# Outbound proxy for the Telegram API. Unset by default: a proxy is a property
+# of one particular network, not a sensible default. Unset and empty both mean
+# "connect directly".
+PROXY_URL = os.getenv("PROXY_URL") or None
 
 # Health snapshot file written by the process and read by the container healthcheck.
 HEALTH_FILE = os.getenv("HEALTH_FILE", "/tmp/healthy")
