@@ -212,8 +212,8 @@ WATCHDOG_REFRESH_BUDGET = (
 # deadline; or the handling of one update. The slowest thing handling an update
 # can do is send a message, which is attempted TELEGRAM_SEND_ATTEMPTS times
 # behind that same deadline with a wait between attempts. The two are added
-# rather than maximised so the figure also covers a handler that answers the
-# API and then sends.
+# rather than maximised because two handlers really do both: answering a button
+# press and then replying to it reaches this figure exactly.
 #
 # This has to be in the floor below, not merely in the margin. Before progress
 # was tracked per component the Telegram loop's own pace did not matter, because
@@ -229,13 +229,18 @@ TELEGRAM_PROGRESS_BUDGET = (
 # The modem term is doubled for margin, because the probe is not the only thing
 # that loop does between reports; its second form covers a configuration that
 # has cut the reply deadline and the retry count to almost nothing, where twice
-# the budget would come to barely more than a single round. The Telegram term is
-# not doubled: it is already a whole iteration's worst case rather than a
-# per-round figure, so there is nothing outside it to leave room for.
+# the budget would come to barely more than a single round.
+#
+# The Telegram term is not doubled - it is already a whole iteration's worst
+# case rather than a per-round figure - but it cannot be used bare either. It is
+# a figure two real handlers reach exactly, and the watchdog compares with >=,
+# so a threshold equal to it makes the worst legitimate gap a tripping gap. One
+# further request deadline is added: the unit that gap is built from, and enough
+# for a handler that makes one more call than today's slowest.
 WATCHDOG_STALL_FLOOR = max(
     2 * WATCHDOG_REFRESH_BUDGET,
     4 * MODEM_PROBE_INTERVAL,
-    TELEGRAM_PROGRESS_BUDGET,
+    TELEGRAM_PROGRESS_BUDGET + TELEGRAM_REQUEST_TIMEOUT,
 )
 
 # How long a component loop may go without advancing, or the health snapshot

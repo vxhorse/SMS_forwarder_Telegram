@@ -905,13 +905,49 @@ def test_the_stall_floor_still_clears_the_budget_at_the_shortest_window(monkeypa
         importlib.reload(config)
 
 
+def _legitimate_telegram_gap(cfg) -> float:
+    """The longest gap the polling loop can leave between two progress reports.
+
+    Counted as the calls it is made of rather than as the closed form the
+    configuration uses, so the two have to agree about the loop rather than
+    merely about each other.
+
+    The loop reports when a poll returns and after each update it handles, so
+    one gap holds at most one poll or the handling of one update. A poll costs
+    a request deadline. Handling an update costs whatever its slowest handler
+    does, and the slowest sends a message: one attempt per allowed try, each
+    behind the same deadline, with a wait between them. The two are added
+    because answering a button press and then replying to it does both.
+    """
+    poll = cfg.TELEGRAM_REQUEST_TIMEOUT
+    send = cfg.TELEGRAM_SEND_ATTEMPTS * cfg.TELEGRAM_REQUEST_TIMEOUT + max(
+        0, cfg.TELEGRAM_SEND_ATTEMPTS - 1
+    ) * cfg.TELEGRAM_SEND_RETRY_DELAY
+    return poll + send
+
+
+def test_the_telegram_budget_is_the_worst_gap_the_polling_loop_can_leave():
+    """The floor below is measured against this figure, so it has to be the gap
+    the loop can actually produce. Understating it - by counting the poll alone
+    and forgetting that one update can be retried behind three deadlines - puts
+    the stall threshold under the time a working component legitimately spends
+    between two reports."""
+    assert config.TELEGRAM_PROGRESS_BUDGET == _legitimate_telegram_gap(config)
+
+
 def test_the_stall_floor_clears_one_telegram_polling_iteration():
     """Now that each loop is measured on its own, the Telegram loop's own pace
     is load-bearing. It was not before: the device heartbeat rewrote the shared
     snapshot every half-minute whatever Telegram was doing, so a long poll never
     showed up in the reading. A threshold under one working iteration would
-    restart the process for polling."""
-    assert config.WATCHDOG_STALL_SECONDS >= config.TELEGRAM_PROGRESS_BUDGET
+    restart the process for polling.
+
+    Strictly greater, not merely at least. Two real handlers reach the budget
+    exactly - answering a button press and then replying to it - and the
+    watchdog compares with >=, so a threshold equal to the budget makes the
+    worst legitimate gap a tripping gap.
+    """
+    assert config.WATCHDOG_STALL_SECONDS > config.TELEGRAM_PROGRESS_BUDGET
 
 
 def test_the_stall_floor_clears_telegram_at_the_shortest_window(monkeypatch):
@@ -923,7 +959,7 @@ def test_the_stall_floor_clears_telegram_at_the_shortest_window(monkeypatch):
     monkeypatch.setenv("WATCHDOG_STALL_SECONDS", "0")
     try:
         reloaded = importlib.reload(config)
-        assert reloaded.WATCHDOG_STALL_SECONDS >= reloaded.TELEGRAM_PROGRESS_BUDGET
+        assert reloaded.WATCHDOG_STALL_SECONDS > reloaded.TELEGRAM_PROGRESS_BUDGET
     finally:
         monkeypatch.undo()
         importlib.reload(config)
