@@ -687,7 +687,7 @@ class DeviceManager:
         except asyncio.TimeoutError:
             logger.warning(
                 f"Serial port did not close within {config.SERIAL_CLOSE_TIMEOUT:.0f}s; "
-                f"aborting the transport and discarding whatever it still held"
+                f"discarding what is still queued for it and forcing the close"
             )
             self._abort_transport(writer)
         except Exception as exc:
@@ -700,13 +700,45 @@ class DeviceManager:
 
         The escalation for a close that cannot complete, and never the ordinary
         path: what it discards is real data that a working port would have sent.
+
+        Two buffers have to go, and only one of them is the transport's.
+        Aborting drops that one and schedules the remainder of the close, but
+        the remainder begins by flushing the port - and a flush waits for the
+        kernel's own output queue to empty, which is the queue that stopped
+        moving and the reason the close had to be forced at all. That wait
+        belongs to no task: it blocks whichever thread reaches it, and the
+        thread that reaches it is the event loop, which would take the
+        watchdog, the reconnect and the signal handler down with it. A process
+        that can no longer decide to exit is one no restart policy outside it
+        will act on either.
+
+        So the kernel queue is discarded first, which returns at once and
+        leaves the flush nothing to wait for.
         """
-        abort = getattr(getattr(writer, "transport", None), "abort", None)
+        transport = getattr(writer, "transport", None)
+        abort = getattr(transport, "abort", None)
         if abort is None:
             logger.warning(
                 "Serial transport offers no way to abort; the port may stay held"
             )
             return
+
+        discard = getattr(
+            getattr(transport, "serial", None), "reset_output_buffer", None
+        )
+        if discard is None:
+            # Still worth aborting: what is left is a close that may wait,
+            # against a port that is certainly never given back otherwise.
+            logger.warning(
+                "Serial port offers no way to discard its output queue; the "
+                "close may still have to wait for it"
+            )
+        else:
+            try:
+                discard()
+            except Exception as exc:
+                logger.warning(f"Could not discard the serial output queue: {exc}")
+
         try:
             abort()
         except Exception as exc:

@@ -2112,20 +2112,65 @@ async def test_teardown_without_a_connection_does_nothing():
     assert manager.writer is None
 
 
-class UnflushableWriter(FakeWriter):
-    """A port whose close can never complete.
+class WedgedPort:
+    """The port behind a transport that has stopped accepting bytes.
 
-    serial_asyncio finishes a close only once the transport's write buffer has
-    drained, and leaves it to the write path to report that it has. A port that
-    has stopped accepting bytes never reports it and raises nothing: the bytes
-    are merely queued behind flow control. abort() is the way out, because it
-    discards the buffer and forces the close through.
+    Two of its calls matter here and they are opposites. flush() waits for the
+    kernel's own output queue to empty and carries no deadline; on a queue that
+    is not moving it never returns, and it is called on whichever thread asked
+    for it. reset_output_buffer() discards that queue and returns at once.
+    """
+
+    def __init__(self, calls):
+        # Bytes the file descriptor refused, which is the only reason the
+        # transport still holds any - and so the only reason its close could
+        # not complete in the first place.
+        self.queued = True
+        self.discarded = False
+        self.parked = False
+        self.closed = False
+        self.calls = calls
+
+    def reset_output_buffer(self):
+        self.calls.append("discard")
+        self.queued = False
+        self.discarded = True
+
+    def flush(self):
+        if self.queued:
+            # Recorded rather than reproduced. Really parking here would park
+            # the thread running this test, and with it the event loop and the
+            # rest of the suite; what a caller can observe is the same either
+            # way, which is that nothing after this point ever runs.
+            self.parked = True
+
+    def close(self):
+        self.closed = True
+
+
+class UnflushableWriter(FakeWriter):
+    """A port whose close can never complete, and the transport behind it.
+
+    A transport finishes a close only once its own write buffer has drained,
+    and leaves it to the write path to report that it has. A port that has
+    stopped accepting bytes never reports it and raises nothing: the bytes are
+    merely queued behind flow control.
+
+    abort() is the way out, but it only forces the *rest* of the close to be
+    scheduled - and that remainder begins by flushing the port, which is the
+    call that waits for the very queue that is not moving. So an abort issued
+    without discarding the queue first hands the wait to the event loop
+    instead of to one task.
     """
 
     def __init__(self):
         super().__init__()
         self.aborted = False
-        # A StreamWriter exposes the transport this reaches for.
+        self.connection_lost = False
+        self.calls = []
+        self.serial = WedgedPort(self.calls)
+        # A StreamWriter exposes the transport this reaches for; here the two
+        # are the same object.
         self.transport = self
 
     async def wait_closed(self):
@@ -2133,6 +2178,16 @@ class UnflushableWriter(FakeWriter):
 
     def abort(self):
         self.aborted = True
+        self.calls.append("abort")
+        # The real one schedules the remainder for the next loop iteration.
+        asyncio.get_running_loop().call_soon(self._finish_closing)
+
+    def _finish_closing(self):
+        self.serial.flush()
+        if self.serial.parked:
+            return  # The real transport does not reach its next line either.
+        self.connection_lost = True
+        self.serial.close()
 
 
 async def _teardown_must_return(manager) -> None:
@@ -2176,16 +2231,57 @@ async def test_teardown_gives_up_on_a_port_that_will_not_close(monkeypatch):
     assert manager.writer is None
 
 
+async def test_the_abort_leaves_the_transport_nothing_to_wait_for(monkeypatch):
+    """Forcing the close is not the whole of it. What the abort schedules
+    begins by flushing the port, and flushing waits for the kernel's output
+    queue - the queue that is not moving, which is why the close needed forcing
+    at all. That wait runs on the event loop rather than on one task, so it
+    parks the watchdog, the reconnect and the signal handler together, and a
+    process that cannot exit is not restarted by any policy outside it.
+
+    Discarding the queue first is what leaves the flush nothing to wait for.
+    """
+    monkeypatch.setattr(config, "SERIAL_CLOSE_TIMEOUT", 0.01)
+    manager = _make()
+    writer = UnflushableWriter()
+    manager.writer = writer
+
+    await _teardown_must_return(manager)
+    # The transport completes the close on the next iteration, as the real one
+    # does; nothing before this point could have run it.
+    await asyncio.sleep(0)
+
+    assert writer.serial.parked is False, (
+        "the flush inside the abort waited for a queue that is not moving, "
+        "which parks the event loop rather than one task"
+    )
+    assert writer.connection_lost is True
+    assert writer.serial.closed is True
+    # Ordered, not merely both present. The abort schedules the flush rather
+    # than performing it, so today the two happen to work either way round;
+    # pinning the order is what keeps that true if anything is ever awaited
+    # between them, which would let the flush run first.
+    assert writer.calls == ["discard", "abort"]
+
+
 async def test_the_port_can_be_reopened_after_a_close_that_never_completed(monkeypatch):
     """Returning is only half of it. The supervisor reconnects straight after a
-    teardown, so the point of aborting is that the next attempt finds a
-    component with nothing held and can open the port again."""
+    teardown, so the point of aborting is that the close really does run to the
+    end and the next attempt finds the port free rather than still held by a
+    transport that is waiting to flush it.
+    """
     from module import device_manager as dm_module
 
     monkeypatch.setattr(config, "SERIAL_CLOSE_TIMEOUT", 0.01)
     manager = _make()
-    manager.writer = UnflushableWriter()
+    writer = UnflushableWriter()
+    manager.writer = writer
     await _teardown_must_return(manager)
+    await asyncio.sleep(0)
+
+    # The port was actually given back, rather than teardown merely returning.
+    assert writer.connection_lost is True
+    assert writer.serial.closed is True
 
     reopened = FakeWriter()
 
