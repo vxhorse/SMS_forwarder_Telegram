@@ -418,10 +418,23 @@ Three states are worth recognising:
     within ...`. Only sessions that connected and then held long enough to
     count as a recovery are counted here, which is what makes this criterion
     mean what it says: a session that ends sooner re-stamps neither clock
-    above, so the first of them has been measuring it all along, with the hour
-    of tolerance chosen for it. A modem that has not been plugged in yet never
+    above, so the first of them goes on measuring it from the last recovery,
+    with the hour of tolerance chosen for it. A modem that has not been plugged in yet never
     reaches a session at all and is still waited for indefinitely.
 - **`healthy`** — the snapshot is fresh and every component is up.
+
+One shape falls between those three criteria, and it is written down here rather
+than guarded against. The down clock runs from a component's **last recovery**,
+not from process start, so a component that alternates — several failures inside
+`SERVICE_STABLE_SECONDS`, then one session that outlasts it — resets that clock
+with the recovery while adding just one to the churn count. Neither reading
+reaches its threshold and the process keeps running. What you see instead is the
+container flapping between `healthy` and `unhealthy`: the snapshot is written
+only while every component is up, so its mtime stops advancing for the whole of
+every down phase, and messages arriving during one are not delivered. Nothing
+restarts on that by itself — a failing healthcheck triggers no restart. Watch
+the `reconnects` counts in the snapshot alongside the container's health
+transitions if you suspect it.
 
 One failure deliberately does **not** restart anything: a snapshot file that
 cannot be written. The container goes `unhealthy`, because `healthcheck.py`

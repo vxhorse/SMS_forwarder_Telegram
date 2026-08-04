@@ -582,7 +582,7 @@ if WATCHDOG_STALL_FLOOR > WATCHDOG_DOWN_SECONDS:
 # Only sessions that reached that recovery are counted, which is the same
 # sentence read backwards: what hides such a loop from the other two criteria
 # is exactly what makes it visible here. A session that ends before it
-# re-stamps nothing, so the down clock has been running throughout and
+# re-stamps nothing, so the down clock goes on running and
 # WATCHDOG_DOWN_SECONDS is already measuring that failure - counting those here
 # as well would put a second ceiling underneath it, shorter by an order of
 # magnitude, and the process would exit for a fault that was being measured
@@ -590,8 +590,28 @@ if WATCHDOG_STALL_FLOOR > WATCHDOG_DOWN_SECONDS:
 # by construction at the values this file ships: the liveness probe takes
 # MODEM_PROBE_FAILURES x (MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT) to raise,
 # and the registration check at least MODEM_REGISTRATION_FAILURES x
-# MODEM_PROBE_INTERVAL, which are 105 and 90 seconds against a 60-second
-# window.
+# MODEM_PROBE_INTERVAL, which are 105 and 90 seconds against a 60-second window;
+# WATCHDOG_RAISE_FLOOR above is that figure, and reports a configuration where
+# it stops holding.
+#
+# Known limitation: the two criteria overlap only for a component that stays in
+# one shape. "The down clock goes on running" means from the last recovery, not
+# from process start - HealthState.mark_down re-stamps a component that was up,
+# so one recovered session resets it. A component that alternates, failing
+# repeatedly inside the stable window and then holding one session past it,
+# therefore hands the down clock a reset it never earned enough of to trip
+# anything, while contributing only that one session to this count. Neither
+# reading reaches its threshold, the stall clock is not consulted at all while
+# anything is down, and the process runs on. Nothing in this file detects that,
+# and nothing here is a proxy for it: a fifth criterion would need its own
+# design, not a constant.
+#
+# What an operator does see is the health snapshot. It is refreshed only while
+# every component is up (HealthState.refresh_file), so the file's mtime stops
+# advancing for the whole of every down phase and the container healthcheck
+# fails throughout each one - the fault is visible as a container flapping
+# between healthy and unhealthy rather than as a restart. Nothing acts on that
+# by itself: a container runtime does not restart on a failing healthcheck.
 #
 # Counting reconnections rather than lengthening the stable window is what
 # makes this cover the failures nobody has enumerated yet. It does not ask what
