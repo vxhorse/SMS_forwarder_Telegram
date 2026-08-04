@@ -589,12 +589,43 @@ WATCHDOG_CHURN_SESSIONS = _clamped(
 # criterion is simply switched off while looking enabled. It is a floor against
 # a false negative, unlike most of the bounds in this file.
 #
+# The "longest to raise" term is the heartbeat's, because that loop is where a
+# session ends by counting rather than by one event, and both of the ways it
+# does so are longer than anything else a session can do:
+#
+#   - the liveness path raises after MODEM_PROBE_FAILURES unanswered rounds,
+#     each costing an interval and a deadline. WATCHDOG_REFRESH_BUDGET is that
+#     figure plus one more deadline, so it covers this path as it stands.
+#   - the registration path raises only once MODEM_REGISTRATION_FAILURES rounds
+#     have been answered and found the modem off the network, and one answered
+#     probe clears the liveness count, so up to MODEM_PROBE_FAILURES - 1
+#     unanswered rounds fit in front of each of them without ending the session
+#     first. That is the refresh budget again, once per required reading:
+#     MODEM_REGISTRATION_FAILURES x WATCHDOG_REFRESH_BUDGET.
+#
+# So the count multiplies the slowest cycle whenever the check is on, and it
+# appears in no other bound in this file. Left out, a patient count puts the
+# slowest cycle past what the floor models, the window is then too short to
+# hold the threshold's worth of them, and the criterion is off while the
+# documentation says it is on.
+#
+# Counted only when MODEM_REGISTRATION_CHECK is on, unlike the second deadline
+# inside the refresh budget, which is counted either way. The two figures are
+# bounding opposite things: the budget is compared against the staleness
+# window, where assuming the longer round for every configuration is the
+# conservative direction, and this one widens a window that decides when the
+# process exits, where assuming a multiplier that is not in force would make
+# the criterion hungrier than the configuration warrants.
+WATCHDOG_RAISE_BUDGET = WATCHDOG_REFRESH_BUDGET * (
+    MODEM_REGISTRATION_FAILURES if MODEM_REGISTRATION_CHECK else 1
+)
+#
 # Deliberately unbounded above. Widening it only makes the criterion more eager,
 # in proportion to what the operator asked for, and no value of it disables a
 # guard or reinstates a failure - which is what every ceiling in this file is
 # for. The absence of one here is a decision, not an oversight.
 WATCHDOG_CHURN_WINDOW_FLOOR = WATCHDOG_CHURN_SESSIONS * (
-    RECONNECT_BACKOFF_MAX + WATCHDOG_REFRESH_BUDGET
+    RECONNECT_BACKOFF_MAX + WATCHDOG_RAISE_BUDGET
 )
 _churn_window_env = os.environ.get("WATCHDOG_CHURN_WINDOW")
 _churn_window_requested = (
