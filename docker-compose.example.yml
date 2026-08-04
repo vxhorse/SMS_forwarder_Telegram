@@ -1,5 +1,8 @@
 services:
   sms-forwarder:
+    # A dated tag rather than latest is worth the edit on a machine you rely on:
+    # an upgrade becomes an explicit act, and a rollback is this one line. The
+    # tags published alongside latest are named for the date they were built.
     image: vxhorse/sms-forwarder:latest
     container_name: sms-forwarder
     restart: unless-stopped
@@ -23,8 +26,10 @@ services:
       - 'c 188:* rmw'      # USB serial adapters (ttyUSB*)
       - 'c 166:* rmw'      # CDC-ACM devices (ttyACM*)
     env_file:
-      # Copy .env.example to .env first; without it the container starts with
-      # no credentials configured.
+      # Copy .env.example to .env first. Without that file Compose refuses to
+      # parse this one and starts nothing at all, which is the better failure:
+      # a container that came up with no credentials would look like a working
+      # deployment and forward nothing.
       - .env
     environment:
       # Overrides whatever .env says, because it describes this compose file's
