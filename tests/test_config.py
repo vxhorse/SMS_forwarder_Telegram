@@ -298,6 +298,42 @@ def test_watchdog_down_seconds_comfortably_above_the_floor_is_silent(monkeypatch
     assert reloaded.CLAMP_NOTICES == []
 
 
+def test_a_down_tolerance_under_the_first_recovery_is_reported(monkeypatch):
+    """Every clock in this file measures from a recovery, and a component
+    cannot reach its first one until it has connected and then held for
+    SERVICE_STABLE_SECONDS. Until then it is marked down, and has been since
+    the process started.
+
+    So a down tolerance under that window plus one inspection interval exits
+    before any component could possibly be marked up: a permanent restart loop
+    on hardware that is working, reported by a line about a component being
+    down for an hour's worth of reasons that do not apply. Nothing can clamp
+    this - the connect time is a property of the hardware and unknowable from
+    here - so the part that is knowable is reported instead.
+    """
+    monkeypatch.setenv("WATCHDOG_DOWN_SECONDS", "60")
+    reloaded = importlib.reload(config_module)
+    matches = [
+        notice
+        for notice in reloaded.CLAMP_NOTICES
+        if "SERVICE_STABLE_SECONDS" in notice and "WATCHDOG_DOWN_SECONDS" in notice
+    ]
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "WATCHDOG_CHECK_INTERVAL" in matches[0]
+
+
+def test_a_down_tolerance_that_clears_the_first_recovery_is_silent(monkeypatch):
+    """The bound is only the part that can be computed, so it has to stay quiet
+    for a configuration that satisfies it - including one tuned right up to the
+    edge, or every operator who shortens the tolerance deliberately learns to
+    ignore the line that matters."""
+    monkeypatch.setenv("WATCHDOG_DOWN_SECONDS", "3000")
+    monkeypatch.setenv("SERVICE_STABLE_SECONDS", "120")
+    monkeypatch.setenv("WATCHDOG_CHECK_INTERVAL", "10")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.CLAMP_NOTICES == []
+
+
 # --- WATCHDOG_CHURN_*: a fixed floor, and a window with a derived one --------
 
 
@@ -432,6 +468,12 @@ def _invariants(cfg):
             ("MODEM_PROBE_INTERVAL",),
         ),
         (
+            "the first recovery can be reached before the down clock runs out",
+            cfg.SERVICE_STABLE_SECONDS + cfg.WATCHDOG_CHECK_INTERVAL
+            < float(cfg.WATCHDOG_DOWN_SECONDS),
+            ("SERVICE_STABLE_SECONDS", "WATCHDOG_DOWN_SECONDS"),
+        ),
+        (
             "a stall is not tolerated longer than an outright loss",
             cfg.WATCHDOG_STALL_SECONDS <= float(cfg.WATCHDOG_DOWN_SECONDS),
             ("WATCHDOG_STALL", "WATCHDOG_DOWN_SECONDS"),
@@ -470,6 +512,10 @@ _TUNINGS = [
     {"HEALTH_STALE_SECONDS": "10"},
     {"HEALTH_STALE_SECONDS": "600", "MODEM_PROBE_TIMEOUT": "60"},
     {"WATCHDOG_DOWN_SECONDS": "100"},
+    # Short enough that the watchdog would exit before any component could
+    # reach its first recovery - a permanent restart loop on hardware that is
+    # working perfectly.
+    {"WATCHDOG_DOWN_SECONDS": "60"},
     {"WATCHDOG_STALL_SECONDS": "30"},
     {"MODEM_PROBE_FAILURES": "0", "MODEM_PROBE_TIMEOUT": "0"},
     {"RECONNECT_BACKOFF_MIN": "10", "RECONNECT_BACKOFF_MAX": "5"},
