@@ -229,6 +229,9 @@ docker compose logs -f     # 跟踪启动过程
 
 最需要留意的是 `WATCHDOG_CHURN_WINDOW` 的下限：它越过 1800 这个默认值所需的余量
 比两个数字看上去要小，而且运维者动过的那个设置本身完全看不出会引起这件事。
+推得最狠的是 `MODEM_REGISTRATION_CHECK=1`，它把下限推到 3600，也是唯一一个在其余
+设置都保持默认时就越过 1800 的：该检查要连续读到 `MODEM_REGISTRATION_FAILURES` 次
+才结束会话，而不是一次，因此它是把最慢周期成倍放大，而不是加上一点。
 `RECONNECT_BACKOFF_MAX=90` 会把下限推到 2000，且文件里没有别的东西会对它有反应。
 放慢探测计划也是一样——`MODEM_PROBE_INTERVAL=50` 把下限推到 1840，`=60` 推到 2140
 ——不过这两种配置整体上并不安静：它们同时会把 `MODEM_PROBE_TIMEOUT` 的上限压垮，

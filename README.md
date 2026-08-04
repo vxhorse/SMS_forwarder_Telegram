@@ -243,8 +243,11 @@ the column is derived, so read a bound as a relationship, not as a number.
 `WATCHDOG_CHURN_WINDOW`'s floor is the one to watch, because it can pass the
 shipped default of 1800 with less headroom than the two numbers suggest, and
 because nothing about the setting an operator touched hints that it will.
-`RECONNECT_BACKOFF_MAX=90` puts the floor at 2000, and nothing else in the file
-reacts to it. A slower probe schedule does the same — `MODEM_PROBE_INTERVAL=50`
+The biggest mover is `MODEM_REGISTRATION_CHECK=1`, which puts the floor at 3600
+and is the only one that clears 1800 at otherwise-stock values: that check ends a
+session after `MODEM_REGISTRATION_FAILURES` readings rather than one, so it
+multiplies the slowest cycle instead of adding to it. `RECONNECT_BACKOFF_MAX=90`
+puts the floor at 2000, and nothing else in the file reacts to it. A slower probe schedule does the same — `MODEM_PROBE_INTERVAL=50`
 puts it at 1840, `=60` at 2140 — though those two are not quiet configurations
 overall: each also collapses `MODEM_PROBE_TIMEOUT`'s ceiling, clamping it to 1
 and reporting that the worst refresh gap no longer fits `HEALTH_STALE_SECONDS`.
