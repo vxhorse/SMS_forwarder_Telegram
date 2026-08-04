@@ -190,17 +190,6 @@ if (
         "above those two together plus however long this hardware takes to "
         "connect, or shorten SERVICE_STABLE_SECONDS."
     )
-# Deadline for one outward component-state notification, in seconds.
-#
-# Sending a notification retries several times with a delay between attempts, so
-# an unreachable messaging API can hold its caller for far longer than the send
-# itself would suggest. The device path awaits one when it connects and another
-# while it is shutting down: unbounded, the first slows every reconnect cycle
-# and the second can outlast the stop grace period the container runtime allows,
-# turning a clean stop into a kill. Floored because zero would abandon every
-# notification before it was attempted, and capped because an over-large value
-# reinstates exactly the stall the deadline exists to prevent.
-#
 # The whole shutdown path's budget, in seconds.
 #
 # There is nothing in this process to measure it against: the stop grace period
@@ -213,6 +202,18 @@ if (
 # outward notification - and two deadlines each inside the budget can still add
 # up to more than it.
 STOP_BUDGET_SECONDS = 10.0
+
+# Deadline for one outward component-state notification, in seconds.
+#
+# Sending a notification retries several times with a delay between attempts, so
+# an unreachable messaging API can hold its caller for far longer than the send
+# itself would suggest. The device path awaits one when it connects and another
+# while it is shutting down: unbounded, the first slows every reconnect cycle
+# and the second can outlast the stop grace period the container runtime allows,
+# turning a clean stop into a kill. Floored because zero would abandon every
+# notification before it was attempted, and capped at STOP_BUDGET_SECONDS,
+# because an over-large value reinstates exactly the stall the deadline exists
+# to prevent.
 NOTIFY_TIMEOUT = _clamped(
     "NOTIFY_TIMEOUT",
     float(os.getenv("NOTIFY_TIMEOUT", "5.0")),
@@ -228,7 +229,8 @@ PORT_PROBE_TIMEOUT = float(os.getenv("PORT_PROBE_TIMEOUT", "3.0"))
 
 # Timeout for a single AT command to produce a terminating response, in seconds.
 AT_COMMAND_TIMEOUT = float(os.getenv("AT_COMMAND_TIMEOUT", "3.0"))
-# Longer timeout for commands the modem processes slowly (AT&F, AT+CFUN, AT&W).
+# Longer timeout for commands the modem processes slowly (AT&F, AT+CFUN, AT&W,
+# and the stored-message listing AT+CMGL=4).
 AT_SLOW_COMMAND_TIMEOUT = float(os.getenv("AT_SLOW_COMMAND_TIMEOUT", "10.0"))
 
 # How long the serial transport gets to flush what it is still holding when the
@@ -362,8 +364,10 @@ if _probe_timeout_ceiling < MODEM_PROBE_TIMEOUT_FLOOR:
 # command exactly as before while nothing arrives. Registration also dips for a
 # moment whenever a modem hands over between cells, so one reading is not
 # evidence of anything and only a run of them means the radio is not attached.
-# Floored at two for that reason, and because zero would switch the check off
-# while looking like a setting.
+# Floored at two for that reason, and because zero behaves exactly as one -
+# the loop raises once the count reaches this figure - while reading like an
+# off switch, which is what MODEM_REGISTRATION_CHECK exists separately to
+# provide.
 MODEM_REGISTRATION_FAILURES = _clamped(
     "MODEM_REGISTRATION_FAILURES",
     int(os.getenv("MODEM_REGISTRATION_FAILURES", "3")),
@@ -443,16 +447,14 @@ MODEM_REGISTRATION_CHECK = os.getenv(
 # working and has simply not refreshed the file, so anything treating a gap this
 # short as a failure is reading a slow modem as a dead one.
 #
-# This is an exact bound rather than an estimate, and it only became one when the
-# probe's own lock acquisition and write were brought inside its deadline. While
-# the deadline covered the reply alone there was no arithmetic to write: a modem
-# that stops accepting bytes blocks the write under serial flow control with no
-# bound and no exception, and a send stuck mid-transaction holds the AT lock the
-# probe needs, so the worst gap was unbounded rather than large.
+# This is an exact bound rather than an estimate, because _probe_once bounds
+# the whole transaction - taking the port and writing as well as the reply -
+# so no term in the sum above is unbounded. See its docstring for why each
+# step has to be inside the deadline.
 #
 # The margin this protects is the one against HEALTH_STALE_SECONDS, which the
 # container healthcheck reads: 120 seconds against a worst gap of 110 at the
-# values this file ships. Both terms it is built from are now bounded so that
+# values this file ships. Both terms it is built from are bounded so that
 # the gap cannot leave that window silently - MODEM_PROBE_INTERVAL against half
 # of it, MODEM_PROBE_TIMEOUT against what the interval and the retry count
 # leave of it - and where those bounds cannot both hold, a notice above says so.
@@ -472,11 +474,9 @@ WATCHDOG_REFRESH_BUDGET = (
 # rather than maximised because two handlers really do both: answering a button
 # press and then replying to it reaches this figure exactly.
 #
-# This has to be in the floor below, not merely in the margin. Before progress
-# was tracked per component the Telegram loop's own pace did not matter, because
-# the device heartbeat refreshed the shared snapshot every half-minute whatever
-# Telegram was doing. Now that the loop is measured on its own, a threshold
-# under this figure would restart the process for taking a long poll.
+# This has to be in the floor below, not merely in the margin. The loop is
+# measured on its own progress stamps, so a threshold under this figure would
+# restart the process for taking a long poll.
 TELEGRAM_PROGRESS_BUDGET = (
     TELEGRAM_REQUEST_TIMEOUT
     + TELEGRAM_SEND_ATTEMPTS * TELEGRAM_REQUEST_TIMEOUT
@@ -500,10 +500,12 @@ WATCHDOG_STALL_FLOOR = max(
     TELEGRAM_PROGRESS_BUDGET + TELEGRAM_REQUEST_TIMEOUT,
 )
 
-# How long a component loop may go without advancing, or the health snapshot
-# without being written, before the watchdog treats the process as stalled. A
-# component that blocks without raising never reaches mark_down, so this is the
-# only signal that catches it.
+# How long a component loop may go without advancing before the watchdog
+# treats the process as stalled. A component that blocks without raising
+# never reaches mark_down, so this is the only signal that catches it. The
+# same threshold is also what an unwritable snapshot is reported against, at
+# ERROR and without a restart - a restart cannot make an unwritable path
+# writable.
 #
 # Bounded at both ends. Below the floor above, the watchdog restarts a process
 # that is merely riding out a slow modem. Above WATCHDOG_DOWN_SECONDS, a stall
@@ -576,7 +578,8 @@ if WATCHDOG_STALL_FLOOR > WATCHDOG_DOWN_SECONDS:
 # ever with the down clock and the stall clock both reading zero. The liveness
 # probe is one such failure at the values this file ships: a modem that opens
 # and answers the handshake but then stops answering AT+CSQ takes
-# WATCHDOG_REFRESH_BUDGET to raise, which is longer than
+# MODEM_PROBE_FAILURES x (MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT) to raise
+# - 105 seconds at the values this file ships - which is longer than
 # SERVICE_STABLE_SECONDS.
 #
 # Only sessions that reached that recovery are counted, which is the same
@@ -746,11 +749,7 @@ if SERVICE_STABLE_SECONDS >= WATCHDOG_RAISE_FLOOR:
         "tolerance. Any slower failure is still counted. Lower "
         "SERVICE_STABLE_SECONDS, or lengthen the schedule this is read against."
     )
-#
-# Deliberately unbounded above. Widening it only makes the criterion more eager,
-# in proportion to what the operator asked for, and no value of it disables a
-# guard or reinstates a failure - which is what every ceiling in this file is
-# for. The absence of one here is a decision, not an oversight.
+
 WATCHDOG_CHURN_WINDOW_FLOOR = WATCHDOG_CHURN_SESSIONS * (
     RECONNECT_BACKOFF_MAX + WATCHDOG_RAISE_BUDGET
 )
@@ -758,6 +757,10 @@ _churn_window_env = os.environ.get("WATCHDOG_CHURN_WINDOW")
 _churn_window_requested = (
     float(_churn_window_env) if _churn_window_env is not None else 1800.0
 )
+# Deliberately unbounded above. Widening it only makes the criterion more eager,
+# in proportion to what the operator asked for, and no value of it disables a
+# guard or reinstates a failure - which is what every ceiling in this file is
+# for. The absence of one here is a decision, not an oversight.
 WATCHDOG_CHURN_WINDOW = max(WATCHDOG_CHURN_WINDOW_FLOOR, _churn_window_requested)
 
 # Reported only for a window the operator actually set, on the same reasoning
