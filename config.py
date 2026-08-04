@@ -546,7 +546,11 @@ if WATCHDOG_STALL_FLOOR > WATCHDOG_DOWN_SECONDS:
 # wrong: messages are still being forwarded between them. Ten is chosen to sit
 # above that noise while still bounding detection of a real loop to roughly ten
 # cycles - about twenty minutes for the slowest failure this criterion is for,
-# well inside the window below.
+# against the window below. That is a margin of a few hundred seconds, not a
+# comfortable one, which is exactly why the window carries the derived floor it
+# does: the same arithmetic that makes the margin narrow is what raises the
+# window when a longer backoff or a slower probe schedule would otherwise close
+# it altogether.
 #
 # Floored at two for the same reason as MODEM_REGISTRATION_FAILURES: one
 # reconnection is not a pattern, and at zero or one a single transient failure
