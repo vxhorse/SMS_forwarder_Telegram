@@ -10,7 +10,9 @@ import os
 CLAMP_NOTICES: list = []
 
 
-def _clamped(name: str, requested, low=None, high=None):
+def _clamped(
+    name: str, requested, low=None, high=None, low_label=None, high_label=None
+):
     """Apply a floor and/or a ceiling to an operator-supplied setting.
 
     Returns the value actually in force. When a bound moves the value away
@@ -18,6 +20,23 @@ def _clamped(name: str, requested, low=None, high=None):
     setting, what was asked for, and what is running instead - an operator
     who tunes a setting outside its allowed range gets told, rather than
     left believing it took effect.
+
+    Which bound gets blamed is decided from what was requested, not from
+    what came out: if the request was above the ceiling, the ceiling is what
+    cut it, otherwise the floor did. That stays correct even where the two
+    bounds happen to coincide - a derived ceiling that lands exactly on the
+    floor is still the ceiling, and a request above it is still a request
+    above the ceiling, not a floor violation.
+
+    low_label / high_label let a derived bound name where it came from,
+    instead of the bare number it works out to - e.g. a ceiling built from
+    another setting can say so and give that setting's value, which is what
+    an operator actually needs to act on the notice. Left unset, the bound's
+    own value is reported, which is already correct for a bound that is
+    just a fixed number. Like `name`, a label is a literal built at the call
+    site out of other settings' names and values - never out of arbitrary
+    operator-controlled text - so a notice still cannot be made to carry a
+    credential.
 
     Only ever called below with a numeric setting and a literal name typed
     at the call site, never with an arbitrary key - so it has no way to be
@@ -30,10 +49,12 @@ def _clamped(name: str, requested, low=None, high=None):
     if high is not None:
         applied = min(high, applied)
     if applied != requested:
-        if low is not None and applied == low:
-            reason = f"floor is {low:g}"
+        if high is not None and requested > high:
+            bound = high_label if high_label is not None else f"{high:g}"
+            reason = f"ceiling is {bound}"
         else:
-            reason = f"ceiling is {high:g}"
+            bound = low_label if low_label is not None else f"{low:g}"
+            reason = f"floor is {bound}"
         CLAMP_NOTICES.append(
             f"{name} was requested as {requested:g} but is running as "
             f"{applied:g} ({reason})"
@@ -95,7 +116,15 @@ HEALTH_STALE_SECONDS = _clamped(
 WATCHDOG_DOWN_SECONDS = int(os.getenv("WATCHDOG_DOWN_SECONDS", "3600"))
 # Exponential backoff bounds for component reconnection, in seconds.
 RECONNECT_BACKOFF_MIN = float(os.getenv("RECONNECT_BACKOFF_MIN", "1.0"))
-RECONNECT_BACKOFF_MAX = float(os.getenv("RECONNECT_BACKOFF_MAX", "30.0"))
+# Floored at RECONNECT_BACKOFF_MIN: a maximum below the minimum would make
+# each retry's backoff shrink instead of grow, the opposite of what an
+# exponential backoff is for.
+RECONNECT_BACKOFF_MAX = _clamped(
+    "RECONNECT_BACKOFF_MAX",
+    float(os.getenv("RECONNECT_BACKOFF_MAX", "30.0")),
+    low=RECONNECT_BACKOFF_MIN,
+    low_label=f"RECONNECT_BACKOFF_MIN={RECONNECT_BACKOFF_MIN:g}",
+)
 # How long a connected session must last before it counts as a recovery.
 # Supervisor._serve_session states what this buys and why; in short, a component
 # that connects and then fails immediately is still broken.
@@ -182,10 +211,15 @@ SERIAL_CLOSE_TIMEOUT = _clamped(
     "SERIAL_CLOSE_TIMEOUT",
     float(os.getenv("SERIAL_CLOSE_TIMEOUT", "5.0")),
     low=SERIAL_CLOSE_TIMEOUT_FLOOR,
-    # The floor wins where the two conflict, and the notice below says so.
-    # Zero here would abort every disconnect outright, which is a worse answer
-    # to a tight budget than overrunning it.
+    # Where the derived ceiling and the floor collide, max() picks the floor
+    # value, and the collision notice below says so. Zero here would abort
+    # every disconnect outright, which is a worse answer to a tight budget
+    # than overrunning it.
     high=max(SERIAL_CLOSE_TIMEOUT_FLOOR, _serial_close_ceiling),
+    high_label=(
+        f"STOP_BUDGET_SECONDS={STOP_BUDGET_SECONDS:g} minus "
+        f"NOTIFY_TIMEOUT={NOTIFY_TIMEOUT:g}"
+    ),
 )
 if _serial_close_ceiling < SERIAL_CLOSE_TIMEOUT_FLOOR:
     CLAMP_NOTICES.append(
@@ -236,7 +270,9 @@ MODEM_PROBE_FAILURES = _clamped(
 # which is seven and a half seconds at the values this file ships. Raising the
 # reply deadline is exactly what one does for a modem that answers slowly, and
 # past this bound it fails the healthcheck on a process that is working.
-# MODEM_PROBE_INTERVAL is clamped for the same reason; until now this was not.
+# MODEM_PROBE_INTERVAL is clamped for the same reason: both terms make up the
+# same closed-form gap, and bounding only one of them would leave the window
+# guarantee holding only for settings nobody has tuned.
 #
 # Floored because a deadline of zero abandons every probe before the modem
 # could answer it, which fails the connection on the first round for ever.
@@ -249,6 +285,11 @@ MODEM_PROBE_TIMEOUT = _clamped(
     float(os.getenv("MODEM_PROBE_TIMEOUT", "5.0")),
     low=MODEM_PROBE_TIMEOUT_FLOOR,
     high=max(MODEM_PROBE_TIMEOUT_FLOOR, _probe_timeout_ceiling),
+    high_label=(
+        f"HEALTH_STALE_SECONDS={HEALTH_STALE_SECONDS:g}, "
+        f"MODEM_PROBE_INTERVAL={MODEM_PROBE_INTERVAL:g}, "
+        f"MODEM_PROBE_FAILURES={MODEM_PROBE_FAILURES:g}"
+    ),
 )
 if _probe_timeout_ceiling < MODEM_PROBE_TIMEOUT_FLOOR:
     CLAMP_NOTICES.append(
