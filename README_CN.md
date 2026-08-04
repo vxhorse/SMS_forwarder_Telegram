@@ -59,8 +59,9 @@ graph TD
 `Supervisor` 驱动两个相互独立的组件。每个组件各自连接、运行，失败后按指数退避重连，
 彼此不互相等待。只有当一次会话持续超过 `SERVICE_STABLE_SECONDS` 后，组件才算真正恢复，
 因此「连上就立刻断开」的组件仍会被判定为故障。`HealthState` 记录这一状态，
-看门狗会在组件失联的两种情形下退出进程——掉线时间超过 `WATCHDOG_DOWN_SECONDS`，
-或虽仍报告就绪、但其循环已停止推进达 `WATCHDOG_STALL_SECONDS`；
+看门狗会在组件失联的三种情形下退出进程——掉线时间超过 `WATCHDOG_DOWN_SECONDS`；
+虽仍报告就绪、但其循环已停止推进达 `WATCHDOG_STALL_SECONDS`；
+或在 `WATCHDOG_CHURN_WINDOW` 之内结束了 `WATCHDOG_CHURN_SESSIONS` 次已连接的会话；
 `healthcheck.py` 则把同一状态报告给容器运行时。
 
 ## 硬件要求
@@ -185,33 +186,48 @@ docker compose logs -f     # 跟踪启动过程
 全部配置均从环境变量读取，且都有默认值。可用的 `.env` 只需填写
 `BOT_TOKEN` 与 `CHAT_ID`。时间单位均为秒。
 
-| 变量 | 默认值 | 用途 |
-| --- | --- | --- |
-| `LOG_LEVEL` | `INFO` | 日志级别 |
-| `SMS_PORT` | *(空)* | 模块AT端口，留空表示自动发现 |
-| `SMS_BAUDRATE` | `115200` | 串口波特率 |
-| `SMS_DEV_ROOT` | `/dev` | 扫描设备的根目录，编排文件中设为 `/hostdev` |
-| `PORT_PROBE_TIMEOUT` | `3.0` | 候选端口应答 `AT` 的时限 |
-| `BOT_TOKEN` | *(占位符)* | Telegram机器人Token |
-| `CHAT_ID` | *(占位符)* | 接收转发短信的Telegram会话 |
-| `PROXY_URL` | *(空)* | 访问Telegram API的出站代理，留空表示直连 |
-| `NOTIFY_TIMEOUT` | `5.0` | 单次状态通知的时限，取值被限制在 1–10 |
-| `RECONNECT_BACKOFF_MIN` | `1.0` | 重连退避的最小间隔 |
-| `RECONNECT_BACKOFF_MAX` | `30.0` | 重连退避的最大间隔 |
-| `SERVICE_STABLE_SECONDS` | `60.0` | 会话持续多久才算恢复，下限为 5 |
-| `MODEM_PROBE_INTERVAL` | `30.0` | 心跳探测间隔，上限为 `HEALTH_STALE_SECONDS` 的一半 |
-| `MODEM_PROBE_TIMEOUT` | `5.0` | 模块应答一次探测的时限 |
-| `MODEM_PROBE_FAILURES` | `3` | 连续丢失多少次探测后触发重连 |
-| `MODEM_REGISTRATION_CHECK` | `0` | 是否额外询问模块是否已驻网。默认关闭——见[驻网检查](#驻网检查) |
-| `MODEM_REGISTRATION_FAILURES` | `3` | 开启该检查后，连续多少次读到「未驻网」触发重连，下限为 2 |
-| `AT_COMMAND_TIMEOUT` | `3.0` | 单条AT命令的时限 |
-| `AT_SLOW_COMMAND_TIMEOUT` | `10.0` | 慢速命令（`AT&F`、`AT+CFUN`、`AT&W`）的时限 |
-| `SERIAL_CLOSE_TIMEOUT` | `5.0` | 释放串口时等待缓冲区排空的时限，超时后强制关闭，下限为 1 |
-| `HEALTH_FILE` | `/tmp/healthy` | 健康检查读取的状态快照文件 |
-| `HEALTH_STALE_SECONDS` | `120` | 该快照的最大允许陈旧时间，下限为 2 |
-| `WATCHDOG_DOWN_SECONDS` | `3600` | 组件掉线超过该时长后退出进程 |
-| `WATCHDOG_STALL_SECONDS` | *(推导得出)* | 组件循环停止推进达该时长后退出进程。默认取 `HEALTH_STALE_SECONDS` 的两倍，再由推导出的下限抬高（当前默认约 310），并以 `WATCHDOG_DOWN_SECONDS` 为上限 |
-| `WATCHDOG_CHECK_INTERVAL` | `30.0` | 看门狗检查间隔，下限为 1 |
+**边界**一列是约定的一部分，而不是附注。凡是取值会让某项守卫失效、
+或让该守卫所防的故障重新出现的设置，都会被钳制，且启动日志会点名每一个被边界改动过的设置。
+没有上限的设置会明说没有、以及为什么没有，这样「未设边界」就绝不会被误读成「漏写了」。
+
+| 变量 | 默认值 | 用途 | 边界 |
+| --- | --- | --- | --- |
+| `LOG_LEVEL` | `INFO` | 日志级别 | 无——这是级别名而非数值，无法识别的名称回落为 `INFO` |
+| `SMS_PORT` | *(空)* | 模块AT端口，留空表示自动发现 | 无——这是一个路径 |
+| `SMS_BAUDRATE` | `115200` | 串口波特率 | 无。与模块不匹配的速率表现为「该端口从不应答 `AT`」，自动发现会在日志中点名 |
+| `SMS_DEV_ROOT` | `/dev` | 扫描设备的根目录，编排文件中设为 `/hostdev` | 无——这是一个路径 |
+| `PORT_PROBE_TIMEOUT` | `3.0` | 候选端口应答 `AT` 的时限 | 故意无界。端口探测发生在任何会话存在之前，而「等待硬件」是本服务从不设时限的事 |
+| `BOT_TOKEN` | *(占位符)* | Telegram机器人Token | 无——这是凭据。凭据没有边界，也绝不会出现在启动通知里 |
+| `CHAT_ID` | *(占位符)* | 接收转发短信的Telegram会话 | 无——同上，这是凭据 |
+| `PROXY_URL` | *(空)* | 访问Telegram API的出站代理，留空表示直连 | 无——这是一个URL |
+| `NOTIFY_TIMEOUT` | `5.0` | 单次状态通知的时限 | 下限 1，上限为十秒的关停预算——它与 `SERIAL_CLOSE_TIMEOUT` 共用这一份预算：关停路径上先后等待这两者，两者之和不得超过常见运行时中最短的那个停机宽限期 |
+| `RECONNECT_BACKOFF_MIN` | `1.0` | 重连退避的最小间隔 | 无界。这一对的次序由另一侧保证——被钳制的是 `RECONNECT_BACKOFF_MAX` |
+| `RECONNECT_BACKOFF_MAX` | `30.0` | 重连退避的最大间隔 | 下限为 `RECONNECT_BACKOFF_MIN`：最大值低于最小值会让每次重试的等待越缩越短，而不是越拉越长。故意不设上限——等得更久只是推迟重连，而 `WATCHDOG_CHURN_WINDOW` 的下限会随之增大，重连频次判据因此不会掉队 |
+| `SERVICE_STABLE_SECONDS` | `60.0` | 会话持续多久才算恢复 | 下限 5：取零时，连上的那一瞬间就算恢复，而这正是本设置要防的事。故意不设上限——窗口更长只会让「算作恢复」更难达成 |
+| `MODEM_PROBE_INTERVAL` | `30.0` | 心跳探测间隔 | 下限 1，上限为 `HEALTH_STALE_SECONDS` 的一半（当前默认 60）。刷新快照的正是这个探测，所以仅凭这一条循环也必须能让文件保持新鲜 |
+| `MODEM_PROBE_TIMEOUT` | `5.0` | 模块应答一次探测的时限 | 下限 1，上限为 `(HEALTH_STALE_SECONDS − MODEM_PROBE_FAILURES × MODEM_PROBE_INTERVAL) / (MODEM_PROBE_FAILURES + 1)`，**当前默认为 7.5**。模块应答慢时正是要调大它，而一旦越过该值，两次快照刷新之间最坏的间隔就会超出 `HEALTH_STALE_SECONDS`，健康检查会把正常工作的进程判为失败 |
+| `MODEM_PROBE_FAILURES` | `3` | 连续丢失多少次探测后触发重连 | 下限 1：计数达到该值时循环即抛错，所以取零与取一行为完全相同，却看起来像个开关。故意不设上限——更有耐心只是推迟重连，且 `MODEM_PROBE_TIMEOUT` 的上限会随它增大而收紧 |
+| `MODEM_REGISTRATION_CHECK` | `0` | 是否额外询问模块是否已驻网。默认关闭——见[驻网检查](#驻网检查) | 只有开与关，不是数值。它与下面的次数分成两个设置，正是为了让「调整耐心」不会顺手把这项守卫关掉 |
+| `MODEM_REGISTRATION_FAILURES` | `3` | 开启该检查后，连续多少次读到「未驻网」触发重连 | 下限 2：小区切换时驻网状态会短暂中断，单次读数说明不了任何事；取零则会在看起来像设置的同时把检查关掉。故意不设上限——更有耐心只是推迟会话结束 |
+| `AT_COMMAND_TIMEOUT` | `3.0` | 单条AT命令的时限 | 故意无界。它约束的是一条命令而非整个循环；某条命令若拖过心跳探测自身的时限，会由该探测及其触发的重连接手 |
+| `AT_SLOW_COMMAND_TIMEOUT` | `10.0` | 慢速命令（`AT&F`、`AT+CFUN`、`AT&W`）的时限 | 故意无界，理由同上。这些命令在初始化阶段执行，而这一段等待本服务从不设时限 |
+| `SERIAL_CLOSE_TIMEOUT` | `5.0` | 释放串口时等待缓冲区排空的时限，超时后强制关闭 | 下限 1，上限为同一份十秒关停预算中 `NOTIFY_TIMEOUT` 用剩的部分——默认值恰好用满：5 + 5 = 10。当下限与该上限相撞时以下限为准，并由启动通知说明该预算已不再成立 |
+| `HEALTH_FILE` | `/tmp/healthy` | 健康检查读取的状态快照文件 | 无——这是一个路径。写不进去的路径只会被报出、而不会触发重启，见[读懂健康检查](#读懂健康检查) |
+| `HEALTH_STALE_SECONDS` | `120` | 该快照的最大允许陈旧时间 | 下限 2：`MODEM_PROBE_INTERVAL` 被钳到它的一半但绝不低于 1，窗口更短就会短于可能的最快刷新间隔。故意不设上限——它表达的是运维者对「快照可以多陈旧」的容忍度，而两个探测上限都由它推导得出，放宽它会让二者同步放宽 |
+| `WATCHDOG_DOWN_SECONDS` | `3600` | 组件掉线超过该时长后退出进程 | 故意无界。它自身就是 `WATCHDOG_STALL_SECONDS` 的上限；若被设到该设置推导下限之下，以下限为准，并由启动通知说明该不变量对这份配置已不成立 |
+| `WATCHDOG_STALL_SECONDS` | *(推导得出)* | 组件循环虽仍报告就绪却停止推进达该时长后退出进程 | 默认取 `HEALTH_STALE_SECONDS` 的两倍，再由推导出的下限抬高（**当前默认约 310**），并以 `WATCHDOG_DOWN_SECONDS` 为上限，下限最后生效。低于该下限，看门狗会重启一个只是在耐心等待慢模块的进程 |
+| `WATCHDOG_CHECK_INTERVAL` | `30.0` | 看门狗检查间隔 | 下限 1：取零会把看门狗变成忙等循环。故意不设上限——它只是采样频率，每条阈值都以各自的时钟度量、而非以本循环采样的疏密度量，所以看门狗变慢只会推迟重启，不会漏掉 |
+| `WATCHDOG_CHURN_SESSIONS` | `10` | 单个组件在下面这个窗口内结束多少次已连接会话后退出进程 | 下限 2：一次重连算不上模式，取零或一时单次瞬时故障就会结束进程。故意不设上限——阈值更高只会让判据更迟钝，且 `WATCHDOG_CHURN_WINDOW` 的下限按它成倍放大，窗口不会跟不上要容纳的次数 |
+| `WATCHDOG_CHURN_WINDOW` | `1800.0` | 统计这些会话的时间窗 | 下限为 `WATCHDOG_CHURN_SESSIONS × (RECONNECT_BACKOFF_MAX + 组件抛错最慢所需的时间)`，**当前默认为 1400**。低于该值，计数永远到不了阈值，判据会在看起来仍启用的同时形同关闭——与本表中其他下限不同，这是一条防漏报的下限。**故意不设上限**：放宽它只会让判据按运维者要求的比例变得更积极，任何取值都不会关掉某项守卫或让某种故障重新出现，而这正是本表中每一条上限存在的理由 |
+
+其中有两条边界是推导得出而非固定的，因此它们所依赖的设置一动，它们就会跟着动。
+最需要留意的是 `WATCHDOG_CHURN_WINDOW` 的下限：它由 `WATCHDOG_CHURN_SESSIONS`、
+`RECONNECT_BACKOFF_MAX` 与心跳探测计划共同推出，越过 1800 这个默认值所需的余量
+比数字看上去要小。`MODEM_PROBE_INTERVAL=50`（仍在它自己的允许范围之内）会把下限推到
+1840，`=60` 则推到 2140。实际生效的值仍然是安全的，因为以下限为准；而任何自己设过
+`WATCHDOG_CHURN_WINDOW` 的人——包括所有照抄 `.env.example` 的人——都会收到点名该覆盖的
+启动通知。只有在完全不设 `WATCHDOG_CHURN_WINDOW` 时它才是静默的：那时被抬高的是默认值，
+而不是运维者要求过的值。
 
 ### 串口选择
 
@@ -243,8 +259,10 @@ docker compose logs -f     # 跟踪启动过程
 据此动作会每隔几分钟就中断一次本来正常的会话，每次都重新初始化射频
 （这只会拖长真正的断网恢复，而不是缩短），并且每个周期都改写模块的存储配置。
 这个循环从外部也很难看见：它触发失败的时间晚于一次会话被判定为恢复的时间，
-因此每个周期都会重置看门狗所测量的量；而快照仅在一次拆链的时间窗内变陈旧，
-所以容器健康检查全程保持绿色。
+因此每个周期都会把掉线计时与停滞计时清零；而快照仅在一次拆链的时间窗内变陈旧，
+所以容器健康检查在两个周期之间保持绿色。重连频次判据确实会把这些周期计入，
+并在累计到 `WATCHDOG_CHURN_SESSIONS` 次时结束进程——也就是说，在这个问题没有真实答案的网络上，
+打开该检查换来的是一个重启循环，而不是一个正常工作的服务。
 
 在弄清情况之前保持关闭并不损失任何诊断能力。启动流程已要求模块主动上报驻网变化，
 因此无论开关与否，状态都会被解析、写入快照并记入日志；被推迟的只是
@@ -291,6 +309,13 @@ docker compose exec sms-forwarder cat /tmp/healthy
 因此进程一旦不再运行就不会再刷新，遗留下来的文件自然变陈旧。
 仅仅文件新鲜、或者文件存在，都不会被当作健康。
 
+快照中还有一个 `reconnects` 对象：逐个组件给出它在 `WATCHDOG_CHURN_WINDOW`
+之内结束了多少次已连接的会话。**只有计数**——没有时间戳、没有原因，
+也没有任何来自短信本身的内容——因为建立在它之上的判据看的就只是这个数字，
+而这里是看门狗据此动作之前唯一能看到它的地方。条目一旦超出窗口就会自行淘汰，
+所以不再出故障的组件会自己回到 `0`。某个数字正在逼近 `WATCHDOG_CHURN_SESSIONS`，
+就是进程因此退出之前你能得到的唯一预警。
+
 查看容器运行时当前的判断：
 
 ```bash
@@ -312,17 +337,37 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
   `start_period` 必须覆盖这段时间，再加上模块枚举所需的时间；模块较慢时请调大它。
 - **`unhealthy`**——此时没有任何短信被转发。请注意它本身不会重启任何东西，
   容器运行时只是把它记录下来。恢复要么靠服务自行重连，要么靠看门狗退出进程、
-  再由重启策略接手。看门狗有两条退出路径，两者相差一个数量级：
+  再由重启策略接手。看门狗有三条退出路径。它们互不重叠，因为各自问的问题不同：
+  这个组件此刻处于什么状态、它的循环还在不在动、以及它最近多久处于那个状态一次。
   - **明确失败**的组件会被标记为掉线，掉线满 `WATCHDOG_DOWN_SECONDS`
     （默认一小时）后进程退出。日志为
     `Watchdog tripped: a component has been down for ...`。
   - **阻塞但未失败**的组件仍被标记为就绪，上面那个计时因此根本不会开始。
-    真正抓住它的是 `WATCHDOG_STALL_SECONDS`：没有任何组件循环上报推进，
-    快照也没有被写入，且持续了这么久。按当前默认约为 **310 秒**而非一小时，
-    因此「安静下来大约五分钟后」的意外重启属于这一条，而不是上一条。日志为
-    `Watchdog tripped: nothing has made progress for ...`；
-    `HEALTH_FILE` 无法写入同样会触发它。
+    真正抓住它的是 `WATCHDOG_STALL_SECONDS`：该组件自己的循环已有这么久没有上报推进。
+    按当前默认约为 **310 秒**而非一小时，因此「安静下来大约五分钟后」的意外重启属于这一条，
+    而不是第一条。日志为
+    `Watchdog tripped: a component loop has not advanced for ...`。
+  - **反复失败又反复恢复**的组件，从构造上就对上面两条不可见。
+    一次持续 `SERVICE_STABLE_SECONDS` 的会话即算作恢复，而恢复会把上面两个计时都清零
+    ——所以抛错慢于这一分钟的故障，总是先到达「看起来已恢复」那一刻、再到达「失败」那一刻，
+    于是可以永远循环下去，其间掉线计时为零、停滞计时为零，容器还报告健康。
+    抓住它的不是计时而是计数：单个组件在 `WATCHDOG_CHURN_WINDOW` 之内结束了
+    `WATCHDOG_CHURN_SESSIONS` 次已连接的会话，按当前默认是半小时内十次。日志为
+    `Watchdog tripped: component <name> has ended N connected sessions within ...`。
+    只有真正连上过的会话才计数，所以尚未插入的模块依旧会被无限期等待。
 - **`healthy`**——快照是新鲜的，且全部组件均已就绪。
+
+有一种故障**故意不**触发任何重启：快照文件写不出去。容器会变为 `unhealthy`，
+因为 `healthcheck.py` 读的正是这个文件自身的 mtime，而它已经不再变化。
+日志里会有一条 ERROR——`HEALTH_FILE has not been written for ...`——
+重复频率不高于停滞阈值。进程会继续运行，也继续转发短信。
+
+这是预期结果，不是缺口。所有组件循环都仍在上报推进，这正是让这条读数可归因的原因：
+失败的是写入这一步本身，而重启没法把一个写不进去的路径变成可写。重启只会每隔几分钟
+就把整个启动流程重来一遍，每次都重新初始化模块并重读它存储的短信，这比它所应对的故障
+本身更糟。最常见的原因是给容器加了只读根文件系统却没有给 `/tmp` 挂上可写卷，
+而 `HEALTH_FILE` 默认就是 `/tmp/healthy`：给 `/tmp` 挂一个 tmpfs，
+或把 `HEALTH_FILE` 指到进程能写的位置。
 
 ## 使用说明
 
@@ -345,7 +390,7 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
 
 - **长短信支持**：本服务已支持长短信自动合并，分片短信会在60秒内等待所有分片到达后合并转发
 - **兼容性**：不同型号的模块兼容性不同，某些模块可能不支持长文本短信的收发
-- **稳定性**：各组件独立按指数退避重连；若某组件掉线超过 `WATCHDOG_DOWN_SECONDS`，或虽仍报告就绪却停止推进达 `WATCHDOG_STALL_SECONDS`，看门狗会重启进程
+- **稳定性**：各组件独立按指数退避重连；看门狗在三种信号下重启进程——某组件掉线超过 `WATCHDOG_DOWN_SECONDS`；某组件循环虽仍报告就绪却停止推进达 `WATCHDOG_STALL_SECONDS`；或单个组件在 `WATCHDOG_CHURN_WINDOW` 之内结束了 `WATCHDOG_CHURN_SESSIONS` 次已连接的会话。健康快照写不出去是唯一一种只报出、不重启的故障
 - **串口选择**：优先让 `SMS_PORT` 保持为空，由自动发现决定；只有当发现选错设备时才设置，并填写 `SMS_DEV_ROOT` 之下的路径
 - **没有硬件不算错误**：未接入模块时，服务会无限期等待并重试，其间容器报告为不健康
 - **SIM卡检测**：确保SIM卡正确插入并有足够余额
@@ -390,5 +435,9 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
    - 一直是 `unhealthy` 说明有组件掉线，日志会指出是哪一个：`Component <name> failed ...`
    - 容器运行时不会因为不健康而自行重启容器。看门狗会退出进程——组件已失败的
      走 `WATCHDOG_DOWN_SECONDS`，未失败却停止推进的走短得多的
-     `WATCHDOG_STALL_SECONDS`——随后由重启策略接手。
+     `WATCHDOG_STALL_SECONDS`，某个组件在 `WATCHDOG_CHURN_WINDOW` 之内结束了
+     `WATCHDOG_CHURN_SESSIONS` 次已连接会话的则立即退出——随后由重启策略接手。
      `docker compose logs | grep 'Watchdog tripped'` 可看出是哪一条
+   - 若容器不健康、而日志里出现的是 `HEALTH_FILE has not been written for ...`，
+     这是唯一一种故意不重启的情形：循环都在跑，只是快照文件写不进去。
+     详见「读懂健康检查」一节

@@ -5,6 +5,12 @@ services:
     restart: unless-stopped
     network_mode: "host"
     stop_signal: SIGTERM
+    # The shutdown path inside the process is bounded at ten seconds:
+    # NOTIFY_TIMEOUT and SERIAL_CLOSE_TIMEOUT are awaited one after the other on
+    # the way out, and config.py clamps the two to share that one budget. Thirty
+    # seconds here is generous against it. Cutting it below ten is not: a
+    # teardown the grace period ends early is a kill rather than a clean stop,
+    # and the port is then released by the kernel rather than by the process.
     stop_grace_period: 30s
     volumes:
       # A bind mount rather than devices:, so that container creation does not

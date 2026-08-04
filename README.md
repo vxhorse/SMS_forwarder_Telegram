@@ -61,9 +61,10 @@ reconnected with exponential backoff when it fails; neither waits for the other.
 A component counts as recovered only once its session has held for
 `SERVICE_STABLE_SECONDS`, so a component that connects and immediately fails
 still looks broken. `HealthState` records that, the watchdog exits the process on
-either of the two ways a component can be lost — down past
-`WATCHDOG_DOWN_SECONDS`, or still reporting up while its loop has stopped
-advancing for `WATCHDOG_STALL_SECONDS` — and `healthcheck.py` reports the same
+any of the three ways a component can be lost — down past
+`WATCHDOG_DOWN_SECONDS`, still reporting up while its loop has stopped advancing
+for `WATCHDOG_STALL_SECONDS`, or ending `WATCHDOG_CHURN_SESSIONS` connected
+sessions inside `WATCHDOG_CHURN_WINDOW` — and `healthcheck.py` reports the same
 state to the container runtime.
 
 ## Hardware Requirements
@@ -196,33 +197,53 @@ state means and how to inspect it.
 Every setting is read from the environment, and every one has a default. A
 working `.env` only needs `BOT_TOKEN` and `CHAT_ID`. Durations are in seconds.
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `LOG_LEVEL` | `INFO` | Logging verbosity |
-| `SMS_PORT` | *(empty)* | Modem AT port. Empty means discover it |
-| `SMS_BAUDRATE` | `115200` | Serial speed |
-| `SMS_DEV_ROOT` | `/dev` | Device tree to scan. The compose file sets `/hostdev` |
-| `PORT_PROBE_TIMEOUT` | `3.0` | How long a candidate port has to answer `AT` |
-| `BOT_TOKEN` | *(placeholder)* | Telegram bot token |
-| `CHAT_ID` | *(placeholder)* | Telegram chat that receives forwarded SMS |
-| `PROXY_URL` | *(empty)* | Outbound proxy for the Telegram API. Empty means direct |
-| `NOTIFY_TIMEOUT` | `5.0` | Deadline for one state notification. Clamped to 1–10 |
-| `RECONNECT_BACKOFF_MIN` | `1.0` | Shortest wait between reconnection attempts |
-| `RECONNECT_BACKOFF_MAX` | `30.0` | Longest wait between reconnection attempts |
-| `SERVICE_STABLE_SECONDS` | `60.0` | How long a session must hold to count as recovered. Floored at 5 |
-| `MODEM_PROBE_INTERVAL` | `30.0` | Liveness probe interval. Clamped to half of `HEALTH_STALE_SECONDS` |
-| `MODEM_PROBE_TIMEOUT` | `5.0` | How long the modem has to answer a probe |
-| `MODEM_PROBE_FAILURES` | `3` | Consecutive missed probes that force a reconnect |
-| `MODEM_REGISTRATION_CHECK` | `0` | Also ask whether the modem is on the network. Off by default — see [The registration check](#the-registration-check) |
-| `MODEM_REGISTRATION_FAILURES` | `3` | Consecutive "not registered" readings that force a reconnect, once the check is on. Floored at 2 |
-| `AT_COMMAND_TIMEOUT` | `3.0` | Deadline for one AT command |
-| `AT_SLOW_COMMAND_TIMEOUT` | `10.0` | Deadline for slow commands (`AT&F`, `AT+CFUN`, `AT&W`) |
-| `SERIAL_CLOSE_TIMEOUT` | `5.0` | How long a serial port has to flush before the close is forced. Floored at 1 |
-| `HEALTH_FILE` | `/tmp/healthy` | Snapshot file the healthcheck reads |
-| `HEALTH_STALE_SECONDS` | `120` | How old that snapshot may be. Floored at 2 |
-| `WATCHDOG_DOWN_SECONDS` | `3600` | Exit once a component has been down this long |
-| `WATCHDOG_STALL_SECONDS` | *(derived)* | Exit once no component loop has advanced for this long. Defaults to twice `HEALTH_STALE_SECONDS`, raised by a derived floor (~310 as shipped) and capped at `WATCHDOG_DOWN_SECONDS` |
-| `WATCHDOG_CHECK_INTERVAL` | `30.0` | How often the watchdog looks. Floored at 1 |
+The **Bounds** column is part of the contract, not a footnote. A setting whose
+value would disable the guard it exists for, or reinstate the failure that guard
+prevents, is clamped, and the startup log names every setting a bound moved. A
+setting with no ceiling says so and says why, so an absent bound can never be
+read as a forgotten one.
+
+| Variable | Default | Purpose | Bounds |
+| --- | --- | --- | --- |
+| `LOG_LEVEL` | `INFO` | Logging verbosity | None — a level name, not a number. Anything unrecognised falls back to `INFO` |
+| `SMS_PORT` | *(empty)* | Modem AT port. Empty means discover it | None — a path |
+| `SMS_BAUDRATE` | `115200` | Serial speed | None. A speed the modem does not use shows up as a port that never answers `AT`, which discovery reports by name |
+| `SMS_DEV_ROOT` | `/dev` | Device tree to scan. The compose file sets `/hostdev` | None — a path |
+| `PORT_PROBE_TIMEOUT` | `3.0` | How long a candidate port has to answer `AT` | Unbounded, deliberately. Discovery runs before any session exists, and waiting for hardware is never something this service cuts short |
+| `BOT_TOKEN` | *(placeholder)* | Telegram bot token | None — a credential. Credentials have no bounds and never appear in a startup notice |
+| `CHAT_ID` | *(placeholder)* | Telegram chat that receives forwarded SMS | None — a credential, as above |
+| `PROXY_URL` | *(empty)* | Outbound proxy for the Telegram API. Empty means direct | None — a URL |
+| `NOTIFY_TIMEOUT` | `5.0` | Deadline for one state notification | 1 to the ten-second shutdown budget, which it shares with `SERIAL_CLOSE_TIMEOUT`: both are awaited one after the other on the way out, and together they must not outlast the shortest stop grace period in common use |
+| `RECONNECT_BACKOFF_MIN` | `1.0` | Shortest wait between reconnection attempts | Unbounded. The pair is kept in order from the other side — it is `RECONNECT_BACKOFF_MAX` that is held to this value |
+| `RECONNECT_BACKOFF_MAX` | `30.0` | Longest wait between reconnection attempts | Floored at `RECONNECT_BACKOFF_MIN`: a maximum below the minimum makes each retry's wait shrink instead of grow. Unbounded above, deliberately — a longer wait only delays a reconnection, and `WATCHDOG_CHURN_WINDOW`'s floor grows with it so the churn criterion keeps pace |
+| `SERVICE_STABLE_SECONDS` | `60.0` | How long a session must hold to count as recovered | Floored at 5: at zero every connection counts as a recovery the instant it is made, which is the one thing this setting exists to prevent. Unbounded above, deliberately — a longer window only makes a recovery harder to earn |
+| `MODEM_PROBE_INTERVAL` | `30.0` | Liveness probe interval | 1 to half of `HEALTH_STALE_SECONDS` (60 as shipped). The probe is also what refreshes the snapshot, so this loop alone has to be able to keep the file fresh |
+| `MODEM_PROBE_TIMEOUT` | `5.0` | How long the modem has to answer a probe | 1 to `(HEALTH_STALE_SECONDS − MODEM_PROBE_FAILURES × MODEM_PROBE_INTERVAL) / (MODEM_PROBE_FAILURES + 1)`, which is **7.5 as shipped**. Raising this is exactly what one does for a slow modem, and past that figure the worst gap between two snapshot refreshes leaves `HEALTH_STALE_SECONDS` and the healthcheck fails a working process |
+| `MODEM_PROBE_FAILURES` | `3` | Consecutive missed probes that force a reconnect | Floored at 1: the loop raises once the count reaches this figure, so zero behaves exactly as one while reading like an off switch. Unbounded above, deliberately — more patience only delays a reconnect, and `MODEM_PROBE_TIMEOUT`'s ceiling tightens as this grows |
+| `MODEM_REGISTRATION_CHECK` | `0` | Also ask whether the modem is on the network. Off by default — see [The registration check](#the-registration-check) | On or off, not a number. Kept as a separate setting from the count below precisely so that tuning how patient the check is cannot switch it off by accident |
+| `MODEM_REGISTRATION_FAILURES` | `3` | Consecutive "not registered" readings that force a reconnect, once the check is on | Floored at 2: registration dips for a moment during a handover, so one reading is evidence of nothing, and zero would switch the check off while looking like a setting. Unbounded above, deliberately — more patience only delays the session ending |
+| `AT_COMMAND_TIMEOUT` | `3.0` | Deadline for one AT command | Unbounded, deliberately. It bounds one command, not the loop; a command that outlasts the liveness probe's own deadline is caught by that probe and the reconnect it forces |
+| `AT_SLOW_COMMAND_TIMEOUT` | `10.0` | Deadline for slow commands (`AT&F`, `AT+CFUN`, `AT&W`) | Unbounded, deliberately, for the same reason. These commands run during setup, which is a wait this service never puts a ceiling on |
+| `SERIAL_CLOSE_TIMEOUT` | `5.0` | How long a serial port has to flush before the close is forced | 1 to whatever `NOTIFY_TIMEOUT` leaves of the same ten-second shutdown budget — the defaults use it exactly, 5 + 5 = 10. Where the floor and that ceiling collide the floor wins and a startup notice says the budget no longer holds |
+| `HEALTH_FILE` | `/tmp/healthy` | Snapshot file the healthcheck reads | None — a path. A path that cannot be written is reported rather than restarted for; see [Reading the health check](#reading-the-health-check) |
+| `HEALTH_STALE_SECONDS` | `120` | How old that snapshot may be | Floored at 2, because `MODEM_PROBE_INTERVAL` is clamped to half of it but never below 1, so a shorter window would be shorter than the fastest possible refresh. Unbounded above, deliberately — it is the operator's stated tolerance for a stale snapshot, and both probe ceilings are derived from it, so widening it loosens them in step |
+| `WATCHDOG_DOWN_SECONDS` | `3600` | Exit once a component has been down this long | Unbounded, deliberately. It is itself the ceiling on `WATCHDOG_STALL_SECONDS`; set below that setting's derived floor, the floor wins and a startup notice says the invariant no longer holds for that configuration |
+| `WATCHDOG_STALL_SECONDS` | *(derived)* | Exit once a component loop has not advanced for this long while still reporting up | Defaults to twice `HEALTH_STALE_SECONDS`, then floored at a derived figure (**310 as shipped**) and capped at `WATCHDOG_DOWN_SECONDS`, floor applied last. Below the floor the watchdog restarts a process that is merely riding out a slow modem |
+| `WATCHDOG_CHECK_INTERVAL` | `30.0` | How often the watchdog looks | Floored at 1: zero turns the watchdog into a busy loop. Unbounded above, deliberately — it is a sampling rate, and every threshold is measured from its own clock rather than from how often this loop samples, so a slower watchdog delays a restart instead of missing one |
+| `WATCHDOG_CHURN_SESSIONS` | `10` | Exit once one component has ended this many connected sessions inside the window below | Floored at 2: one reconnection is not a pattern, and at zero or one a single transient failure ends the process. Unbounded above, deliberately — a higher threshold only makes the criterion less eager, and `WATCHDOG_CHURN_WINDOW`'s floor is multiplied by it, so the window cannot fall behind the count it has to hold |
+| `WATCHDOG_CHURN_WINDOW` | `1800.0` | The window those sessions are counted in | Floored at `WATCHDOG_CHURN_SESSIONS × (RECONNECT_BACKOFF_MAX + the worst time a component can take to raise)`, which is **1400 as shipped**. Below that the count can never reach the threshold and the criterion is switched off while looking enabled — a floor against a false negative, unlike every other one here. **Unbounded above, deliberately**: widening it only makes the criterion more eager, in proportion to what was asked for, and no value of it disables a guard or reinstates a failure, which is what every ceiling in this table exists to prevent |
+
+Two of those bounds are derived rather than fixed, so they move when a setting
+they are built from moves. `WATCHDOG_CHURN_WINDOW`'s floor is the one to watch:
+it is built from `WATCHDOG_CHURN_SESSIONS`, `RECONNECT_BACKOFF_MAX` and the
+modem probe schedule, and it can pass the shipped default of 1800 with less
+headroom than the numbers suggest. `MODEM_PROBE_INTERVAL=50`, well inside its own
+allowed range, puts the floor at 1840; `=60` puts it at 2140. What is running is
+still safe, because the floor wins, and anyone who set `WATCHDOG_CHURN_WINDOW`
+themselves — which includes everyone who copied `.env.example` — gets a startup
+notice naming the override. It is silent only for a `WATCHDOG_CHURN_WINDOW` left
+unset, where the value being raised is the default rather than something the
+operator asked for.
 
 ### Serial port selection
 
@@ -260,8 +281,12 @@ ends a working session every few minutes, reinitialises the radio each time
 (which lengthens a real outage rather than shortening it) and rewrites the
 module's stored profile on every cycle. The loop is also hard to see from
 outside: it fails later than a session takes to count as recovered, so every
-cycle resets what the watchdog measures, and the snapshot goes stale for only
-the width of one teardown, so the container healthcheck stays green throughout.
+cycle resets both the down clock and the stall clock, and the snapshot goes
+stale for only the width of one teardown, so the container healthcheck stays
+green between cycles. The churn criterion does count those cycles, and will end
+the process at `WATCHDOG_CHURN_SESSIONS` of them — so on a network where the
+question has no true answer, turning the check on trades an invisible loop for a
+restart loop, not for a working service.
 
 Leaving it off while you find out costs no diagnostic value. Startup asks the
 module to report registration changes unasked, so the state is parsed, published
@@ -317,6 +342,15 @@ rewrites it from its own loop, so a process that has stopped running stops
 refreshing it and the file it left behind goes stale. Freshness alone is never
 taken as health, and neither is the file merely existing.
 
+The snapshot also carries a `reconnects` object: for each component, how many
+connected sessions it has ended inside `WATCHDOG_CHURN_WINDOW`. Counts only —
+no timestamps, no reasons, nothing from the messages themselves — because a
+count is the whole of what the criterion built on it looks at, and this is the
+one place that number is visible before the watchdog acts on it. Entries drop
+out as they age past the window, so a component that has stopped failing returns
+to `0` on its own. A figure climbing towards `WATCHDOG_CHURN_SESSIONS` is the
+warning you get before the process exits on it.
+
 Ask the container runtime what it currently thinks:
 
 ```bash
@@ -342,20 +376,50 @@ Three states are worth recognising:
 - **`unhealthy`** — nothing is being forwarded. Note that this does not restart
   anything by itself; the container runtime only records it. Recovery comes from
   the service reconnecting on its own, and failing that from the watchdog, which
-  exits the process so the restart policy takes over. The watchdog has two exit
-  paths, and they are an order of magnitude apart:
+  exits the process so the restart policy takes over. The watchdog has three
+  exit paths. They do not overlap, because each asks a different question: what
+  state is this component in now, is its loop still moving, and how often has it
+  been in that state lately.
   - A component that **failed loudly** is marked down, and the process exits once
     it has been down for `WATCHDOG_DOWN_SECONDS` — an hour by default. The log
     line reads `Watchdog tripped: a component has been down for ...`.
   - A component that **blocked without failing** is still marked up, so the
     clock above never starts. What catches it instead is
-    `WATCHDOG_STALL_SECONDS`: no component loop has reported progress, and the
-    snapshot has not been written, for that long. As shipped this is around
-    **310 seconds**, not an hour, so an unexplained restart roughly five minutes
-    after things went quiet is this one and not the other. The log line reads
-    `Watchdog tripped: nothing has made progress for ...`, and an unwritable
-    `HEALTH_FILE` trips it too.
+    `WATCHDOG_STALL_SECONDS`: that component's own loop has not reported
+    progress for that long. As shipped this is around **310 seconds**, not an
+    hour, so an unexplained restart roughly five minutes after things went quiet
+    is this one and not the first. The log line reads
+    `Watchdog tripped: a component loop has not advanced for ...`.
+  - A component that **keeps failing and recovering** is invisible to both of
+    the above by construction. A session that lasts `SERVICE_STABLE_SECONDS`
+    counts as a recovery, and a recovery restarts both clocks above from zero —
+    so a fault that takes longer than that minute to raise reaches the point
+    where it looks recovered before the point where it fails, and repeats for
+    ever with the down clock at zero, the stall clock at zero and the container
+    reporting healthy in between. What catches it is a count rather than a
+    clock: `WATCHDOG_CHURN_SESSIONS` connected sessions ended by one component
+    inside `WATCHDOG_CHURN_WINDOW`, ten in half an hour as shipped. The log line
+    reads `Watchdog tripped: component <name> has ended N connected sessions
+    within ...`. Only sessions that actually connected are counted, so a modem
+    that has not been plugged in yet is still waited for indefinitely.
 - **`healthy`** — the snapshot is fresh and every component is up.
+
+One failure deliberately does **not** restart anything: a snapshot file that
+cannot be written. The container goes `unhealthy`, because `healthcheck.py`
+reads that file's own mtime and it stops moving. The log carries a single line
+at ERROR — `HEALTH_FILE has not been written for ...` — repeated no more often
+than the stall threshold. The process keeps running and keeps forwarding
+messages.
+
+That is the intended outcome, not a gap. Every component loop is still reporting
+progress, which is what makes the reading attributable: the write itself is what
+failed, and restarting cannot make an unwritable path writable. It would instead
+repeat the whole startup every few minutes for ever, reinitialising the modem
+and re-reading its stored messages each time, which is a worse state than the
+fault it is reacting to. The usual cause is a container given a read-only root
+filesystem with no writable `/tmp`, since `HEALTH_FILE` defaults to
+`/tmp/healthy`: mount a tmpfs at `/tmp`, or point `HEALTH_FILE` somewhere the
+process can write.
 
 ## Usage Instructions
 
@@ -378,7 +442,7 @@ Send `/help` in the Telegram bot conversation to view all available commands.
 
 - **Long SMS Support**: This service supports automatic merging of long SMS. Segmented messages will wait up to 60 seconds for all parts to arrive before merging and forwarding
 - **Compatibility**: Different module models have varying compatibility; some modules may not support sending and receiving long text messages
-- **Stability**: Each component reconnects on its own with exponential backoff, and a watchdog restarts the process if one stays down past `WATCHDOG_DOWN_SECONDS`, or stops making progress for `WATCHDOG_STALL_SECONDS` while still reporting up
+- **Stability**: Each component reconnects on its own with exponential backoff, and a watchdog restarts the process on any of three signals — a component down past `WATCHDOG_DOWN_SECONDS`, a component loop that has not advanced for `WATCHDOG_STALL_SECONDS` while still reporting up, or one component ending `WATCHDOG_CHURN_SESSIONS` connected sessions inside `WATCHDOG_CHURN_WINDOW`. A health snapshot that cannot be written is the one fault reported without a restart
 - **Serial Port Selection**: Leave `SMS_PORT` empty and let discovery choose. Set it only when discovery picks the wrong device, and give the path under `SMS_DEV_ROOT`
 - **Missing hardware is not an error**: with no modem attached, the service waits and retries indefinitely; the container reports unhealthy while it does
 - **SIM Card Detection**: Ensure the SIM card is properly inserted and has sufficient balance
@@ -430,6 +494,12 @@ Send `/help` in the Telegram bot conversation to view all available commands.
      `Component <name> failed ...`
    - An unhealthy container is not restarted by the container runtime. The
      watchdog exits the process — after `WATCHDOG_DOWN_SECONDS` for a component
-     that failed, or after the much shorter `WATCHDOG_STALL_SECONDS` for one that
-     stopped advancing without failing — and the restart policy takes it from
-     there. `docker compose logs | grep 'Watchdog tripped'` says which
+     that failed, after the much shorter `WATCHDOG_STALL_SECONDS` for one that
+     stopped advancing without failing, or as soon as one has ended
+     `WATCHDOG_CHURN_SESSIONS` connected sessions inside
+     `WATCHDOG_CHURN_WINDOW` — and the restart policy takes it from there.
+     `docker compose logs | grep 'Watchdog tripped'` says which
+   - An unhealthy container whose log instead carries `HEALTH_FILE has not been
+     written for ...` is the one case that is deliberately not restarted: the
+     loops are running and the snapshot file is not writable. See
+     [Reading the health check](#reading-the-health-check)
