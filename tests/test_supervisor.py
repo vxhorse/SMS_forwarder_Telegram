@@ -516,14 +516,24 @@ async def test_watchdog_stays_quiet_while_components_are_up():
 class _StallHealth:
     """Minimal health double: answers only what the watchdog asks."""
 
-    def __init__(self, down=0.0, stall=None):
+    def __init__(
+        self, down=0.0, stall=None, snapshot=None, churner=None, reconnects=None
+    ):
         self.down = down
         self.stall = stall
+        self.snapshot = snapshot
+        self.churner = churner
+        self.reconnects = reconnects if reconnects is not None else {}
+        # Read by the watchdog's own log line, so the double has to carry it
+        # exactly as the real HealthState does.
+        self.churn_window = config.WATCHDOG_CHURN_WINDOW
         # Counts the inspections so a test can tell "the watchdog looked and
         # held its fire" apart from "the watchdog never got as far as looking",
         # which would otherwise satisfy the same assertions.
         self.down_reads = 0
         self.stall_reads = 0
+        self.snapshot_reads = 0
+        self.churn_reads = 0
 
     def down_duration(self):
         self.down_reads += 1
@@ -533,6 +543,17 @@ class _StallHealth:
         self.stall_reads += 1
         return self.stall
 
+    def snapshot_age(self):
+        self.snapshot_reads += 1
+        return self.snapshot
+
+    def churning(self, threshold):
+        self.churn_reads += 1
+        return self.churner
+
+    def reconnect_counts(self):
+        return self.reconnects
+
 
 # The watchdog is driven with interval=0, so every scheduling step below is one
 # or more full inspections. Fifty of them is far more cycles than the threshold
@@ -541,7 +562,15 @@ _INERT_STEPS = 50
 _MIN_INSPECTIONS = 5
 
 
-async def test_watchdog_exits_when_the_snapshot_stops_being_refreshed():
+async def test_watchdog_exits_when_the_stall_reading_crosses_its_threshold():
+    """Renamed from ...when_the_snapshot_stops_being_refreshed: that is no
+    longer true. `_StallHealth` sets `stall` directly, bypassing HealthState
+    entirely, so this exercises the watchdog's own comparison against
+    stall_duration() - a component loop gone quiet - not the file, which
+    cannot produce this exit any more. See
+    test_an_unwritable_snapshot_is_reported_but_does_not_exit for what an
+    unwritable snapshot now does instead: reported, not exited on.
+    """
     shutdown = asyncio.Event()
     health = _StallHealth(down=0.0, stall=300.0)
     sup = Supervisor(health, shutdown)
@@ -590,10 +619,11 @@ async def test_watchdog_holds_fire_below_the_stall_threshold():
 
 
 async def test_a_component_down_past_its_threshold_is_reported_as_down():
-    """A component that is down stops the snapshot being refreshed too, so both
-    ages are large at once. The reason recorded has to be the one that names
-    what actually happened, or the logs send an operator looking for a block
-    that is not there.
+    """A component down and a stall can be reported at once - modelled here
+    with a double that sets both readings directly, since a real HealthState
+    keeps the stall reading gated on nothing being down. The reason recorded
+    has to be the one that names what actually happened, or the logs send an
+    operator looking for a block that is not there.
 
     This does not pin the order of the two checks: the stall check is gated on
     nothing being reported down, so with a component down it cannot fire
@@ -994,3 +1024,391 @@ def test_the_stall_floor_outranks_the_ceiling(monkeypatch):
     finally:
         monkeypatch.undo()
         importlib.reload(config)
+
+
+class _FakeMonotonic:
+    """Stand-in for the `time` module as `_LogThrottle` uses it - only
+    `.monotonic()` is ever called on it, and only this advances it, never a
+    real clock.
+
+    `_StallHealth`'s condition is a constant the test sets directly, unlike
+    the real HealthState, whose age cannot cross a threshold before real time
+    has covered the same span. Patching the module's `time` name lets a test
+    reproduce that span deterministically instead of needing an actual wait,
+    without adding a clock parameter to `_LogThrottle` itself - which is used
+    elsewhere and has no other reason to take one.
+    """
+
+    def __init__(self, now: float = 0.0):
+        self._now = now
+
+    def monotonic(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+async def test_an_unwritable_snapshot_is_reported_but_does_not_exit(monkeypatch):
+    """A file that cannot be written is not a reason to restart: the loops are
+    demonstrably running - that is what the fresh progress stamps say - and a
+    restart cannot make the path writable. It repeats the whole startup every
+    few minutes instead, which is a worse outcome than the fault. The
+    healthcheck still fails on the file's own mtime, so the fault stays
+    visible without anything being restarted for it.
+    """
+    from module import supervisor as supervisor_module
+
+    fake_time = _FakeMonotonic()
+    monkeypatch.setattr(supervisor_module, "time", fake_time)
+
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=0.0, snapshot=900.0)
+    sup = Supervisor(health, shutdown)
+    with _LogCapture() as log:
+        task = asyncio.create_task(
+            sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+        )
+        # Let the loop construct its throttle - seeding it from the clock -
+        # before that clock moves, the same order production runs in: the
+        # throttle always exists well before the condition it gates could
+        # ever be true.
+        for _ in range(3):
+            await asyncio.sleep(0)
+        fake_time.advance(240.0)
+        for _ in range(_INERT_STEPS):
+            await asyncio.sleep(0)
+        assert not task.done()
+        assert sup.exit_reason is None
+        assert health.snapshot_reads >= _MIN_INSPECTIONS
+        shutdown.set()
+        await task
+    assert "HEALTH_FILE" in log.text
+    assert any(record.levelno >= logging.ERROR for record in log.records)
+
+
+async def test_the_unwritable_snapshot_report_is_throttled(monkeypatch):
+    """One line as soon as the fault is noticed, then at most one more per
+    stall_threshold after that - not one per inspection, which would flood a
+    log kept on an in-memory filesystem."""
+    from module import supervisor as supervisor_module
+
+    fake_time = _FakeMonotonic()
+    monkeypatch.setattr(supervisor_module, "time", fake_time)
+
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=0.0, snapshot=900.0)
+    sup = Supervisor(health, shutdown)
+
+    with _LogCapture() as log:
+
+        def report_count() -> int:
+            return len([r for r in log.records if "HEALTH_FILE" in r.getMessage()])
+
+        task = asyncio.create_task(
+            sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+        fake_time.advance(240.0)
+        for _ in range(_INERT_STEPS):
+            await asyncio.sleep(0)
+        assert report_count() == 1  # Noticed once, immediately.
+
+        # Well inside the throttle window: however many more times the
+        # watchdog inspects the same unwritable file, no second line yet.
+        fake_time.advance(239.0)
+        for _ in range(_INERT_STEPS):
+            await asyncio.sleep(0)
+        assert report_count() == 1
+
+        # The window has now elapsed: exactly one more line, not one per
+        # inspection since the first.
+        fake_time.advance(1.0)
+        for _ in range(_INERT_STEPS):
+            await asyncio.sleep(0)
+        assert report_count() == 2
+
+        shutdown.set()
+        await task
+
+
+async def test_a_component_that_keeps_reconnecting_is_counted(tmp_path, monkeypatch):
+    """The failure both other criteria are blind to, driven end to end.
+
+    Each session is judged stable before it fails, which is the whole shape of
+    this failure: that judgement re-stamps every clock the other two criteria
+    measure from, so a component doing this for ever leaves down_duration() and
+    stall_duration() both reading as if it had just come back.
+
+    Synchronised on the supervisor's own mark_up rather than on elapsed time,
+    so the session really has been judged stable before it ends, and the test
+    terminates on a condition it controls.
+
+    One half of a pair: the sibling below drives the same component through the
+    same failure without ever letting a session reach that judgement, and
+    requires the opposite result. Between them they say that what is counted is
+    the judgement, not the connection that preceded it.
+    """
+    clock = _ManualClock()
+    judged_stable = asyncio.Event()
+
+    class SignallingHealth(HealthState):
+        """The real HealthState, announcing the moment a session is accepted."""
+
+        def mark_up(self, name):
+            super().mark_up(name)
+            judged_stable.set()
+
+    health = SignallingHealth(
+        ["device", "telegram"],
+        health_file=str(tmp_path / "healthy"),
+        clock=clock,
+        churn_window=10_000.0,
+    )
+    # The window is what the session has to outlast to be accepted; zero makes
+    # the acceptance happen on the next scheduling round instead of in a minute.
+    monkeypatch.setattr(config, "SERVICE_STABLE_SECONDS", 0.0)
+
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+    supervisor.backoff_factory = lambda: Backoff(minimum=0.0, maximum=0.0)
+
+    sessions = 0
+
+    class Flapper:
+        name = "device"
+
+        async def connect_once(self):
+            return None
+
+        async def run(self):
+            nonlocal sessions
+            sessions += 1
+            judged_stable.clear()
+            await judged_stable.wait()
+            if sessions >= 4:
+                shutdown.set()
+            raise RuntimeError("the modem stopped answering")
+
+        async def teardown(self):
+            return None
+
+    await asyncio.wait_for(supervisor.run_service(Flapper()), timeout=_FAILSAFE)
+    assert sessions == 4
+    assert health.reconnect_counts()["device"] == 4
+    assert health.churning(threshold=4) == "device"
+
+
+async def test_a_session_that_fails_before_it_is_judged_stable_is_not_counted(
+    tmp_path, monkeypatch
+):
+    """The other half of the pair above, and what the criterion means.
+
+    Connecting is not recovering. A session that ends before it has lasted
+    SERVICE_STABLE_SECONDS never reaches mark_up, so it re-stamps nothing and
+    the component's down clock goes on running across every one of these
+    cycles - here from process start, because no session in this scenario ever
+    reaches mark_up; in general from the last recovery, since mark_down
+    re-stamps a component that was up. That is the criterion the failure
+    belongs to, with the hour of tolerance chosen for it, and the known
+    limitation beside WATCHDOG_CHURN_SESSIONS in config.py covers what a
+    component that alternates between the two leaves behind.
+
+    Counting these as well would put a second, far shorter ceiling underneath
+    that hour - the count would reach its threshold inside one backoff ladder -
+    and the process would exit and be restarted every few minutes for a fault
+    that is already being measured, tearing down every other component with it
+    on each pass.
+
+    No real time passes either way: the session always ends on its own failure,
+    so the stable window is never waited out, however long it is set to.
+    """
+    clock = _ManualClock()
+    health = HealthState(
+        ["device", "telegram"],
+        health_file=str(tmp_path / "healthy"),
+        clock=clock,
+        churn_window=10_000.0,
+    )
+    monkeypatch.setattr(config, "SERVICE_STABLE_SECONDS", 3600.0)
+
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+    supervisor.backoff_factory = lambda: Backoff(minimum=0.0, maximum=0.0)
+
+    sessions = 0
+
+    class FailsBeforeItSettles:
+        name = "device"
+
+        async def connect_once(self):
+            return None
+
+        async def run(self):
+            nonlocal sessions
+            sessions += 1
+            # The clock moves only where this test moves it, and it moves here
+            # so the criterion that does cover this shape has something to
+            # accumulate.
+            clock.advance(10.0)
+            if sessions >= 20:
+                shutdown.set()
+            raise RuntimeError("the API rejected the poll")
+
+        async def teardown(self):
+            return None
+
+    await asyncio.wait_for(
+        supervisor.run_service(FailsBeforeItSettles()), timeout=_FAILSAFE
+    )
+    assert sessions == 20
+    assert health.reconnect_counts()["device"] == 0
+    assert health.churning(threshold=2) is None
+    # Twenty sessions ended and the down clock never lost a second of them,
+    # which is what makes not counting them safe rather than merely quieter.
+    assert health.down_duration() == 200.0
+
+
+async def test_a_component_that_never_connects_is_never_counted(tmp_path):
+    """The safety property this criterion stands on.
+
+    A USB modem can appear minutes after the container does, and connect_once()
+    fails on every attempt until it does. Counting those would put a ceiling on
+    how long this process may wait for its hardware - which is the startup
+    deadline this project exists to remove, arrived at from a new direction.
+    """
+    clock = _ManualClock()
+    health = HealthState(
+        ["device", "telegram"],
+        health_file=str(tmp_path / "healthy"),
+        clock=clock,
+        churn_window=10_000.0,
+    )
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+    supervisor.backoff_factory = lambda: Backoff(minimum=0.0, maximum=0.0)
+
+    attempts = 0
+
+    class NeverArrives:
+        name = "device"
+
+        async def connect_once(self):
+            nonlocal attempts
+            attempts += 1
+            if attempts >= 50:
+                shutdown.set()
+            raise FileNotFoundError("the port is not present yet")
+
+        async def run(self):  # pragma: no cover - never reached
+            raise AssertionError("run must not be reached")
+
+        async def teardown(self):
+            return None
+
+    await asyncio.wait_for(supervisor.run_service(NeverArrives()), timeout=_FAILSAFE)
+    assert attempts >= 50
+    assert health.reconnect_counts()["device"] == 0
+    assert health.churning(threshold=2) is None
+
+
+async def test_the_watchdog_exits_on_a_churning_component():
+    shutdown = asyncio.Event()
+    health = _StallHealth(
+        down=0.0, stall=0.0, churner="device", reconnects={"device": 5}
+    )
+    sup = Supervisor(health, shutdown)
+    with _LogCapture() as log:
+        await asyncio.wait_for(
+            sup.watchdog_loop(
+                threshold=3600.0,
+                interval=0.0,
+                stall_threshold=240.0,
+                churn_sessions=5,
+            ),
+            timeout=_FAILSAFE,
+        )
+    assert sup.exit_reason == "churning"
+    assert "device" in log.text
+
+
+async def test_the_watchdog_holds_fire_below_the_churn_threshold():
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=0.0, churner=None)
+    sup = Supervisor(health, shutdown)
+    task = asyncio.create_task(
+        sup.watchdog_loop(
+            threshold=3600.0, interval=0.0, stall_threshold=240.0, churn_sessions=5
+        )
+    )
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    assert not task.done()
+    assert sup.exit_reason is None
+    assert health.churn_reads >= _MIN_INSPECTIONS
+    shutdown.set()
+    await task
+
+
+async def test_the_churn_line_names_the_count_it_tripped_on():
+    """The number printed beside the threshold has to be the number the
+    threshold was compared against, exactly as
+    test_the_stall_line_names_the_figure_it_tripped_on requires of the sibling
+    line.
+
+    The watchdog only inspects every WATCHDOG_CHECK_INTERVAL, so a component
+    flapping faster than that can end several sessions between two looks and
+    the count is then well above the threshold. Printing the threshold in the
+    count's place understates by an unbounded amount, and tells an operator the
+    component reconnected the minimum number of times that would have tripped
+    it rather than what it actually did.
+    """
+    shutdown = asyncio.Event()
+    health = _StallHealth(
+        down=0.0, stall=0.0, churner="device", reconnects={"device": 9}
+    )
+    sup = Supervisor(health, shutdown)
+    with _LogCapture() as log:
+        await asyncio.wait_for(
+            sup.watchdog_loop(
+                threshold=3600.0,
+                interval=0.0,
+                stall_threshold=240.0,
+                churn_sessions=5,
+            ),
+            timeout=_FAILSAFE,
+        )
+    assert sup.exit_reason == "churning"
+    assert "9 connected sessions" in log.text
+    # The threshold still has to be there to read the count against - it is
+    # just no longer standing in for it.
+    assert "threshold 5" in log.text
+
+
+async def test_the_churn_line_does_not_diagnose_the_other_two_clocks():
+    """Every counted session was judged recovered, so each one did re-stamp the
+    other two clocks - but a component that churns spends the gaps between its
+    sessions down, and this inspection can land in one of them, which is the
+    state set up here. A line announcing that the other two clocks read zero
+    would then be false at the moment it was printed, about the very fault
+    being debugged, so the line states the criterion instead.
+    """
+    shutdown = asyncio.Event()
+    health = _StallHealth(
+        down=120.0, stall=0.0, churner="device", reconnects={"device": 5}
+    )
+    sup = Supervisor(health, shutdown)
+    with _LogCapture() as log:
+        await asyncio.wait_for(
+            sup.watchdog_loop(
+                threshold=3600.0,
+                interval=0.0,
+                stall_threshold=240.0,
+                churn_sessions=5,
+            ),
+            timeout=_FAILSAFE,
+        )
+    assert sup.exit_reason == "churning"
+    assert "down clock" not in log.text
+    assert "stall clock" not in log.text

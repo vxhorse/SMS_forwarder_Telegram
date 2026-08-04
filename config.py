@@ -10,7 +10,9 @@ import os
 CLAMP_NOTICES: list = []
 
 
-def _clamped(name: str, requested, low=None, high=None):
+def _clamped(
+    name: str, requested, low=None, high=None, low_label=None, high_label=None
+):
     """Apply a floor and/or a ceiling to an operator-supplied setting.
 
     Returns the value actually in force. When a bound moves the value away
@@ -18,6 +20,23 @@ def _clamped(name: str, requested, low=None, high=None):
     setting, what was asked for, and what is running instead - an operator
     who tunes a setting outside its allowed range gets told, rather than
     left believing it took effect.
+
+    Which bound gets blamed is decided from what was requested, not from
+    what came out: if the request was above the ceiling, the ceiling is what
+    cut it, otherwise the floor did. That stays correct even where the two
+    bounds happen to coincide - a derived ceiling that lands exactly on the
+    floor is still the ceiling, and a request above it is still a request
+    above the ceiling, not a floor violation.
+
+    low_label / high_label let a derived bound name where it came from,
+    instead of the bare number it works out to - e.g. a ceiling built from
+    another setting can say so and give that setting's value, which is what
+    an operator actually needs to act on the notice. Left unset, the bound's
+    own value is reported, which is already correct for a bound that is
+    just a fixed number. Like `name`, a label is a literal built at the call
+    site out of other settings' names and values - never out of arbitrary
+    operator-controlled text - so a notice still cannot be made to carry a
+    credential.
 
     Only ever called below with a numeric setting and a literal name typed
     at the call site, never with an arbitrary key - so it has no way to be
@@ -30,10 +49,17 @@ def _clamped(name: str, requested, low=None, high=None):
     if high is not None:
         applied = min(high, applied)
     if applied != requested:
-        if low is not None and applied == low:
-            reason = f"floor is {low:g}"
+        if high is not None and requested > high:
+            bound = high_label if high_label is not None else f"{high:g}"
+            reason = f"ceiling is {bound}"
         else:
-            reason = f"ceiling is {high:g}"
+            # Reachable only when low moved the value, so low is never None
+            # here given how every call site below pairs its bounds - kept
+            # explicit anyway, so a future call site that broke that pairing
+            # fails loudly here rather than crashing on the format below.
+            assert low is not None, f"{name} changed with no bound to blame it on"
+            bound = low_label if low_label is not None else f"{low:g}"
+            reason = f"floor is {bound}"
         CLAMP_NOTICES.append(
             f"{name} was requested as {requested:g} but is running as "
             f"{applied:g} ({reason})"
@@ -95,7 +121,15 @@ HEALTH_STALE_SECONDS = _clamped(
 WATCHDOG_DOWN_SECONDS = int(os.getenv("WATCHDOG_DOWN_SECONDS", "3600"))
 # Exponential backoff bounds for component reconnection, in seconds.
 RECONNECT_BACKOFF_MIN = float(os.getenv("RECONNECT_BACKOFF_MIN", "1.0"))
-RECONNECT_BACKOFF_MAX = float(os.getenv("RECONNECT_BACKOFF_MAX", "30.0"))
+# Floored at RECONNECT_BACKOFF_MIN: a maximum below the minimum would make
+# each retry's backoff shrink instead of grow, the opposite of what an
+# exponential backoff is for.
+RECONNECT_BACKOFF_MAX = _clamped(
+    "RECONNECT_BACKOFF_MAX",
+    float(os.getenv("RECONNECT_BACKOFF_MAX", "30.0")),
+    low=RECONNECT_BACKOFF_MIN,
+    low_label=f"RECONNECT_BACKOFF_MIN={RECONNECT_BACKOFF_MIN:g}",
+)
 # How long a connected session must last before it counts as a recovery.
 # Supervisor._serve_session states what this buys and why; in short, a component
 # that connects and then fails immediately is still broken.
@@ -114,6 +148,48 @@ WATCHDOG_CHECK_INTERVAL = _clamped(
     float(os.getenv("WATCHDOG_CHECK_INTERVAL", "30.0")),
     low=1.0,
 )
+
+# Every clock the watchdog reads measures from a recovery, and a component
+# cannot reach its first one until it has connected and then held for
+# SERVICE_STABLE_SECONDS. Until that moment it is marked down, and has been
+# since the process started - so a down tolerance shorter than that window plus
+# one inspection interval exits before any component could possibly be marked
+# up. That is a permanent restart loop on hardware that is working perfectly,
+# announced by a line about a component being down, which is true and describes
+# nothing an operator can act on.
+#
+# Reported rather than clamped, and the reported part is deliberately less than
+# the whole relationship. What has to hold is
+#
+#     connect time + SERVICE_STABLE_SECONDS + WATCHDOG_CHECK_INTERVAL
+#         < WATCHDOG_DOWN_SECONDS
+#
+# and the connect time is a property of the hardware - port discovery, the
+# open, the AT handshake, the SIM setup - which nothing in this file can know.
+# So the two terms that are knowable are checked here, and the third is stated
+# where a human can apply it: the same division docker-compose.example.yml
+# makes for the healthcheck's start_period, which has to clear the same window
+# plus the same unknowable time.
+#
+# Nothing is clamped because there is nothing safe to clamp to. Raising
+# WATCHDOG_DOWN_SECONDS would overrule the operator's stated tolerance for
+# losing a component, and lowering SERVICE_STABLE_SECONDS would loosen what
+# counts as a recovery to fit a watchdog - which is the judgement three other
+# guards are built on.
+if (
+    SERVICE_STABLE_SECONDS + WATCHDOG_CHECK_INTERVAL
+    >= float(WATCHDOG_DOWN_SECONDS)
+):
+    CLAMP_NOTICES.append(
+        f"WATCHDOG_DOWN_SECONDS ({WATCHDOG_DOWN_SECONDS:g}) is not above "
+        f"SERVICE_STABLE_SECONDS ({SERVICE_STABLE_SECONDS:g}) plus "
+        f"WATCHDOG_CHECK_INTERVAL ({WATCHDOG_CHECK_INTERVAL:g}): a component "
+        "is marked down until a session of its has held for the stable window, "
+        "so the watchdog can now exit before any component reaches its first "
+        "recovery, on working hardware, for ever. Raise WATCHDOG_DOWN_SECONDS "
+        "above those two together plus however long this hardware takes to "
+        "connect, or shorten SERVICE_STABLE_SECONDS."
+    )
 # Deadline for one outward component-state notification, in seconds.
 #
 # Sending a notification retries several times with a delay between attempts, so
@@ -125,16 +201,23 @@ WATCHDOG_CHECK_INTERVAL = _clamped(
 # notification before it was attempted, and capped because an over-large value
 # reinstates exactly the stall the deadline exists to prevent.
 #
-# There is nothing in this process to clamp the cap against: the stop grace
-# period is chosen by whatever starts the container and is not visible from in
-# here. Ten seconds is the shortest one in common use, so a notification that
-# could outlast that is one that could outlast the whole stop.
-NOTIFY_TIMEOUT_CEILING = 10.0
+# The whole shutdown path's budget, in seconds.
+#
+# There is nothing in this process to measure it against: the stop grace period
+# is chosen by whatever starts the container and is not visible from in here.
+# Ten seconds is the shortest one in common use, so anything on the way out that
+# could outlast that is something that could outlast the whole stop.
+#
+# It bounds the path rather than any one deadline on it, because the device
+# teardown awaits two of them one after the other - the serial close and the
+# outward notification - and two deadlines each inside the budget can still add
+# up to more than it.
+STOP_BUDGET_SECONDS = 10.0
 NOTIFY_TIMEOUT = _clamped(
     "NOTIFY_TIMEOUT",
     float(os.getenv("NOTIFY_TIMEOUT", "5.0")),
     low=1.0,
-    high=NOTIFY_TIMEOUT_CEILING,
+    high=STOP_BUDGET_SECONDS,
 )
 
 # Root of the device tree to scan. Inside a container this points at the
@@ -161,12 +244,42 @@ AT_SLOW_COMMAND_TIMEOUT = float(os.getenv("AT_SLOW_COMMAND_TIMEOUT", "10.0"))
 # out an hour later.
 #
 # Past the deadline the transport is aborted instead, which discards the buffer
-# and forces the close through. Floored because zero would abort every ordinary
-# disconnect before the transport had a chance to flush, and an abort throws
-# away whatever was still queued.
+# and forces the close through.
+#
+# Floored because zero would abort every ordinary disconnect before the
+# transport had a chance to flush, and an abort throws away whatever was still
+# queued. Capped by whatever the notification deadline leaves of the shutdown
+# budget, because both are awaited on the same way out: a close alone that
+# outlives the grace period turns a clean stop into a kill, and the snapshot
+# then keeps claiming this process is healthy until it ages out.
+SERIAL_CLOSE_TIMEOUT_FLOOR = 1.0
+_serial_close_ceiling = STOP_BUDGET_SECONDS - NOTIFY_TIMEOUT
 SERIAL_CLOSE_TIMEOUT = _clamped(
-    "SERIAL_CLOSE_TIMEOUT", float(os.getenv("SERIAL_CLOSE_TIMEOUT", "5.0")), low=1.0
+    "SERIAL_CLOSE_TIMEOUT",
+    float(os.getenv("SERIAL_CLOSE_TIMEOUT", "5.0")),
+    low=SERIAL_CLOSE_TIMEOUT_FLOOR,
+    # Where the derived ceiling and the floor collide, max() picks the floor
+    # value, and the collision notice below says so. Zero here would abort
+    # every disconnect outright, which is a worse answer to a tight budget
+    # than overrunning it.
+    high=max(SERIAL_CLOSE_TIMEOUT_FLOOR, _serial_close_ceiling),
+    # Listed as inputs rather than as the subtraction they feed, because the
+    # two can collide - max() above then reports the floor's value, not the
+    # subtraction's, and an expression here would state a number the notice
+    # does not actually put in force.
+    high_label=(
+        f"STOP_BUDGET_SECONDS={STOP_BUDGET_SECONDS:g}, "
+        f"NOTIFY_TIMEOUT={NOTIFY_TIMEOUT:g}"
+    ),
 )
+if _serial_close_ceiling < SERIAL_CLOSE_TIMEOUT_FLOOR:
+    CLAMP_NOTICES.append(
+        f"SERIAL_CLOSE_TIMEOUT floor ({SERIAL_CLOSE_TIMEOUT_FLOOR:g}) leaves "
+        f"NOTIFY_TIMEOUT ({NOTIFY_TIMEOUT:g}) and the close together above "
+        f"STOP_BUDGET_SECONDS ({STOP_BUDGET_SECONDS:g}): a teardown can now "
+        "outlast the shortest stop grace period in common use, and a teardown "
+        "that does is killed rather than finished."
+    )
 
 # Modem liveness probe (AT+CSQ): interval, response deadline, and how many
 # consecutive misses trigger a reconnect.
@@ -184,11 +297,62 @@ MODEM_PROBE_INTERVAL = _clamped(
     float(os.getenv("MODEM_PROBE_INTERVAL", "30.0")),
     low=1.0,
     high=HEALTH_STALE_SECONDS / 2,
+    high_label=f"half of HEALTH_STALE_SECONDS={HEALTH_STALE_SECONDS:g}",
+)
+# Consecutive misses that trigger a reconnect. Floored at one: the loop raises
+# once the count reaches this figure, so zero behaves exactly as one while
+# reading like an off switch, and a number that looks like a switch and is not
+# one is what MODEM_REGISTRATION_CHECK exists separately to avoid.
+MODEM_PROBE_FAILURES = _clamped(
+    "MODEM_PROBE_FAILURES", int(os.getenv("MODEM_PROBE_FAILURES", "3")), low=1
 )
 # Also governs the AT handshake performed right after the port opens: both ask
 # the same question, which is how long the modem gets to answer a probe.
-MODEM_PROBE_TIMEOUT = float(os.getenv("MODEM_PROBE_TIMEOUT", "5.0"))
-MODEM_PROBE_FAILURES = int(os.getenv("MODEM_PROBE_FAILURES", "3"))
+#
+# Capped against the staleness window the container healthcheck reads. The
+# longest gap this loop can legitimately leave between two refreshes is
+# WATCHDOG_REFRESH_BUDGET below, which in closed form is
+#
+#     F x I + (F + 1) x T
+#
+# so keeping that inside HEALTH_STALE_SECONDS means
+#
+#     T <= (HEALTH_STALE_SECONDS - F x I) / (F + 1)
+#
+# which is seven and a half seconds at the values this file ships. Raising the
+# reply deadline is exactly what one does for a modem that answers slowly, and
+# past this bound it fails the healthcheck on a process that is working.
+# MODEM_PROBE_INTERVAL is clamped for the same reason: both terms make up the
+# same closed-form gap, and bounding only one of them would leave the window
+# guarantee holding only for settings nobody has tuned.
+#
+# Floored because a deadline of zero abandons every probe before the modem
+# could answer it, which fails the connection on the first round for ever.
+MODEM_PROBE_TIMEOUT_FLOOR = 1.0
+_probe_timeout_ceiling = (
+    HEALTH_STALE_SECONDS - MODEM_PROBE_FAILURES * MODEM_PROBE_INTERVAL
+) / (MODEM_PROBE_FAILURES + 1)
+MODEM_PROBE_TIMEOUT = _clamped(
+    "MODEM_PROBE_TIMEOUT",
+    float(os.getenv("MODEM_PROBE_TIMEOUT", "5.0")),
+    low=MODEM_PROBE_TIMEOUT_FLOOR,
+    high=max(MODEM_PROBE_TIMEOUT_FLOOR, _probe_timeout_ceiling),
+    high_label=(
+        f"HEALTH_STALE_SECONDS={HEALTH_STALE_SECONDS:g}, "
+        f"MODEM_PROBE_INTERVAL={MODEM_PROBE_INTERVAL:g}, "
+        f"MODEM_PROBE_FAILURES={MODEM_PROBE_FAILURES:g}"
+    ),
+)
+if _probe_timeout_ceiling < MODEM_PROBE_TIMEOUT_FLOOR:
+    CLAMP_NOTICES.append(
+        f"MODEM_PROBE_TIMEOUT floor ({MODEM_PROBE_TIMEOUT_FLOOR:g}) leaves the "
+        f"worst refresh gap above HEALTH_STALE_SECONDS "
+        f"({HEALTH_STALE_SECONDS:g}): {MODEM_PROBE_FAILURES:g} probes "
+        f"{MODEM_PROBE_INTERVAL:g}s apart already fill that window, so the "
+        "container healthcheck can fail a process that is working. Lower "
+        "MODEM_PROBE_INTERVAL or MODEM_PROBE_FAILURES, or raise "
+        "HEALTH_STALE_SECONDS."
+    )
 
 # Consecutive heartbeat readings of "not on the network" before the connection
 # counts as failed.
@@ -227,13 +391,20 @@ MODEM_REGISTRATION_FAILURES = _clamped(
 # MODEM_REGISTRATION_FAILURES misses spaced MODEM_PROBE_INTERVAL apart, which
 # at the values above is longer than SERVICE_STABLE_SECONDS - so every cycle
 # reaches the point where the session counts as recovered before the point
-# where it fails. Each recovery re-stamps the health record, which is what both
-# watchdog criteria measure from, so neither the down clock nor the stall clock
-# accumulates across cycles and the loop is invisible to both. The snapshot
-# goes stale for only the width of one teardown, so the container healthcheck
-# stays green through it too. Meanwhile every cycle reinitialises the radio and
-# rewrites the modem's stored profile. A guard whose false positive cannot be
-# seen by anything watching is not one to ship enabled.
+# where it fails. Each recovery re-stamps the health record, so neither the down
+# clock nor the stall clock accumulates across cycles, and the snapshot goes
+# stale for only the width of one teardown, so the container healthcheck stays
+# green through it too. Meanwhile every cycle reinitialises the radio and
+# rewrites the modem's stored profile.
+#
+# WATCHDOG_CHURN_SESSIONS below does see that loop, because it counts ended
+# sessions rather than reading a clock each recovery resets: at the values above
+# the process exits roughly ten cycles in rather than repeating for ever. That
+# makes the fault a restart loop instead of an unbounded one, which is easier to
+# find and no better to run - on a network where the question has no true
+# answer, the readings stay false and the radio is reinitialised for them
+# either way. A guard that acts on a question its own reading cannot answer is
+# not one to ship enabled.
 #
 # Turning it on is a decision to take once the answer is known for the SIM and
 # the network in use, and costs nothing to defer: setup asks the modem to
@@ -279,13 +450,12 @@ MODEM_REGISTRATION_CHECK = os.getenv(
 # bound and no exception, and a send stuck mid-transaction holds the AT lock the
 # probe needs, so the worst gap was unbounded rather than large.
 #
-# The margin no floor here protects is the one against HEALTH_STALE_SECONDS,
-# which the container healthcheck reads: 120 seconds against a worst gap of 110.
-# At the default interval and retry count the gap is 90 + 4T, so it passes the
-# window once MODEM_PROBE_TIMEOUT exceeds seven and a half seconds - and that
-# setting is neither capped nor clamped against the window, so a generous reply
-# deadline can fail the healthcheck on a process that is working.
-# MODEM_PROBE_INTERVAL is clamped for exactly this reason; the deadline is not.
+# The margin this protects is the one against HEALTH_STALE_SECONDS, which the
+# container healthcheck reads: 120 seconds against a worst gap of 110 at the
+# values this file ships. Both terms it is built from are now bounded so that
+# the gap cannot leave that window silently - MODEM_PROBE_INTERVAL against half
+# of it, MODEM_PROBE_TIMEOUT against what the interval and the retry count
+# leave of it - and where those bounds cannot both hold, a notice above says so.
 WATCHDOG_REFRESH_BUDGET = (
     max(0, MODEM_PROBE_FAILURES - 1) * (MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT)
     + MODEM_PROBE_INTERVAL
@@ -393,4 +563,211 @@ if WATCHDOG_STALL_FLOOR > WATCHDOG_DOWN_SECONDS:
         "This is intentional - delaying a restart beats restarting a component "
         "that is still working - but the documented invariant no longer holds "
         "for this configuration."
+    )
+
+# How many connected sessions one component may end inside WATCHDOG_CHURN_WINDOW
+# before the process exits and lets the container runtime start a fresh one.
+#
+# This is the criterion for the failures neither of the two above can see. A
+# session counts as recovered once it has lasted SERVICE_STABLE_SECONDS, and
+# that recovery re-stamps every clock the other two criteria measure from - so
+# any failure that takes longer than that window to raise reaches the point
+# where it looks recovered before the point where it fails, and repeats for
+# ever with the down clock and the stall clock both reading zero. The liveness
+# probe is one such failure at the values this file ships: a modem that opens
+# and answers the handshake but then stops answering AT+CSQ takes
+# WATCHDOG_REFRESH_BUDGET to raise, which is longer than
+# SERVICE_STABLE_SECONDS.
+#
+# Only sessions that reached that recovery are counted, which is the same
+# sentence read backwards: what hides such a loop from the other two criteria
+# is exactly what makes it visible here. A session that ends before it
+# re-stamps nothing, so the down clock goes on running and
+# WATCHDOG_DOWN_SECONDS is already measuring that failure - counting those here
+# as well would put a second ceiling underneath it, shorter by an order of
+# magnitude, and the process would exit for a fault that was being measured
+# perfectly well. Both failures this criterion was built for clear the window
+# by construction at the values this file ships: the liveness probe takes
+# MODEM_PROBE_FAILURES x (MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT) to raise,
+# and the registration check at least MODEM_REGISTRATION_FAILURES x
+# MODEM_PROBE_INTERVAL, which are 105 and 90 seconds against a 60-second window.
+# WATCHDOG_RAISE_FLOOR, defined below with the churn window's own derivations
+# because it is built from the same probe settings, is that figure, and reports
+# a configuration where it stops holding.
+#
+# Known limitation: the two criteria overlap only for a component that stays in
+# one shape. "The down clock goes on running" means from the last recovery, not
+# from process start - HealthState.mark_down re-stamps a component that was up,
+# so one recovered session resets it. A component that alternates, failing
+# repeatedly inside the stable window and then holding one session past it,
+# therefore hands the down clock a reset it never earned enough of to trip
+# anything, while contributing only that one session to this count. Neither
+# reading reaches its threshold, the stall clock is not consulted at all while
+# anything is down, and the process runs on. Nothing in this file detects that,
+# and nothing here is a proxy for it: a fifth criterion would need its own
+# design, not a constant.
+#
+# What an operator sees depends on how long each down phase runs. The snapshot
+# is refreshed only while every component is up (HealthState.refresh_file), so
+# its mtime stops advancing from the failure until the next recovery - a gap
+# that always includes SERVICE_STABLE_SECONDS, since nothing is marked up
+# before that. But healthcheck.py compares that gap against
+# HEALTH_STALE_SECONDS, so only a down phase longer than that window turns the
+# container unhealthy: a cycle short enough to stay inside it produces no
+# signal there at all, and the reconnects counts in the snapshot are the only
+# reading that moves. Nothing acts on either by itself: a container runtime
+# does not restart on a failing healthcheck.
+#
+# Counting reconnections rather than lengthening the stable window is what
+# makes this cover the failures nobody has enumerated yet. It does not ask what
+# broke; it asks whether this component keeps connecting and disconnecting,
+# which is the one thing every such loop has in common.
+#
+# One threshold covers both components, so it has to clear the noisier of the
+# two, and they are noisy in quite different amounts. The device component
+# absorbs its whole not-ready phase inside connect_once() - port discovery, the
+# open, the handshake, the SIM setup - so a session of its own only ends once
+# something that was working stopped. The Telegram polling loop deliberately
+# does not retry anything, because a second backoff policy inside the loop
+# would compound with the supervisor's own, so every transient HTTP error ends
+# a connected session - and a bot that has been polling for longer than the
+# stable window, which is the ordinary state of one, ends a recovered session
+# and counts here. On an intermittent link, or behind a
+# proxy that comes and goes, a handful of those in half an hour says nothing is
+# wrong: messages are still being forwarded between them. Ten is chosen to sit
+# above that noise while still bounding detection of a real loop to roughly ten
+# cycles - about twenty minutes for the slowest failure this criterion is for,
+# against the window below. That is a margin of a few hundred seconds, not a
+# comfortable one, which is exactly why the window carries the derived floor it
+# does: the same arithmetic that makes the margin narrow is what raises the
+# window when a longer backoff or a slower probe schedule would otherwise close
+# it altogether.
+#
+# Floored at two for the same reason as MODEM_REGISTRATION_FAILURES: one
+# reconnection is not a pattern, and at zero or one a single transient failure
+# ends the process.
+WATCHDOG_CHURN_SESSIONS = _clamped(
+    "WATCHDOG_CHURN_SESSIONS", int(os.getenv("WATCHDOG_CHURN_SESSIONS", "10")), low=2
+)
+# The window those sessions are counted in, in seconds.
+#
+# Floored so that it can hold WATCHDOG_CHURN_SESSIONS of the slowest cycle
+# there is - a full backoff followed by the longest a component can take to
+# raise. Under that floor the count can never reach the threshold and the
+# criterion is simply switched off while looking enabled. It is a floor against
+# a false negative, unlike most of the bounds in this file.
+#
+# The "longest to raise" term is the heartbeat's, because that loop is where a
+# session ends by counting rather than by one event, and both of the ways it
+# does so are longer than anything else a session can do:
+#
+#   - the liveness path raises after MODEM_PROBE_FAILURES unanswered rounds,
+#     each costing an interval and a deadline. WATCHDOG_REFRESH_BUDGET is that
+#     figure plus one more deadline, so it covers this path as it stands.
+#   - the registration path raises only once MODEM_REGISTRATION_FAILURES rounds
+#     have been answered and found the modem off the network, and one answered
+#     probe clears the liveness count, so up to MODEM_PROBE_FAILURES - 1
+#     unanswered rounds fit in front of each of them without ending the session
+#     first. That is the refresh budget again, once per required reading:
+#     MODEM_REGISTRATION_FAILURES x WATCHDOG_REFRESH_BUDGET.
+#
+# So the count multiplies the slowest cycle whenever the check is on, and it
+# appears in no other bound in this file. Left out, a patient count puts the
+# slowest cycle past what the floor models, the window is then too short to
+# hold the threshold's worth of them, and the criterion is off while the
+# documentation says it is on.
+#
+# Counted only when MODEM_REGISTRATION_CHECK is on, unlike the second deadline
+# inside the refresh budget, which is counted either way. The two figures are
+# bounding opposite things: the budget is compared against the staleness
+# window, where assuming the longer round for every configuration is the
+# conservative direction, and this one widens a window that decides when the
+# process exits, where assuming a multiplier that is not in force would make
+# the criterion hungrier than the configuration warrants.
+WATCHDOG_RAISE_BUDGET = WATCHDOG_REFRESH_BUDGET * (
+    MODEM_REGISTRATION_FAILURES if MODEM_REGISTRATION_CHECK else 1
+)
+
+# The same loop read for its shortest failure rather than its longest, which is
+# what decides whether such a failure can be counted at all.
+#
+# A session that ends before SERVICE_STABLE_SECONDS is never judged recovered
+# and never counted, so a stable window wider than this figure switches the
+# criterion off for the component it was built around - silently, and while the
+# documentation still describes it as covering exactly this. Coverage is not
+# lost, because a session that never counted as recovered leaves the down clock
+# running, but detection moves from the churn threshold to WATCHDOG_DOWN_SECONDS
+# and its far longer tolerance.
+#
+# An unanswered liveness probe always spends its whole deadline, so that path
+# costs MODEM_PROBE_FAILURES x (I + T) however fast the modem is. The
+# registration path can have both of its probes answered the instant they are
+# asked, so its floor is the intervals alone - which is why the check being on
+# lowers this figure while raising the one above.
+#
+# The margin is 45 seconds at the values this file ships (105 against 60), and
+# closable by one ordinary tuning from either side, which is why it is reported
+# rather than left as a property of the defaults.
+_liveness_raise = MODEM_PROBE_FAILURES * (MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT)
+_registration_raise = (
+    MODEM_REGISTRATION_FAILURES * MODEM_PROBE_INTERVAL
+    if MODEM_REGISTRATION_CHECK
+    else float("inf")
+)
+WATCHDOG_RAISE_FLOOR = min(_liveness_raise, _registration_raise)
+# Reported rather than clamped, for the same reason as the down tolerance
+# above: lowering SERVICE_STABLE_SECONDS to fit a probe schedule would loosen
+# what counts as a recovery, and that judgement is what three other guards rest
+# on. Compared with >= because a window equal to the raise time makes the
+# session end and the judgement land in the same instant, which is a race and
+# not a guarantee.
+#
+# The figure is the faster of two paths, so the notice names which one reached
+# it and says the slower one is unaffected. Both can be true at once - the
+# registration check at its own floor of 2 raises in two intervals while the
+# liveness probe still takes MODEM_PROBE_FAILURES rounds and is still counted -
+# and a notice reading as though the criterion were off altogether would
+# describe a guard that is still doing its job.
+if SERVICE_STABLE_SECONDS >= WATCHDOG_RAISE_FLOOR:
+    _raise_floor_source = (
+        "the registration check: MODEM_REGISTRATION_FAILURES x "
+        "MODEM_PROBE_INTERVAL"
+        if _registration_raise < _liveness_raise
+        else "the liveness probe: MODEM_PROBE_FAILURES x (MODEM_PROBE_INTERVAL "
+        "+ MODEM_PROBE_TIMEOUT)"
+    )
+    CLAMP_NOTICES.append(
+        f"SERVICE_STABLE_SECONDS ({SERVICE_STABLE_SECONDS:g}) is not below the "
+        f"shortest time one of the modem's heartbeat failures takes to raise "
+        f"({WATCHDOG_RAISE_FLOOR:g}, from {_raise_floor_source}): a session "
+        "ending on that failure is over before it counts as a recovery, so "
+        "WATCHDOG_CHURN_SESSIONS never counts one and that fault is left to "
+        f"WATCHDOG_DOWN_SECONDS ({WATCHDOG_DOWN_SECONDS:g}) and its far longer "
+        "tolerance. Any slower failure is still counted. Lower "
+        "SERVICE_STABLE_SECONDS, or lengthen the schedule this is read against."
+    )
+#
+# Deliberately unbounded above. Widening it only makes the criterion more eager,
+# in proportion to what the operator asked for, and no value of it disables a
+# guard or reinstates a failure - which is what every ceiling in this file is
+# for. The absence of one here is a decision, not an oversight.
+WATCHDOG_CHURN_WINDOW_FLOOR = WATCHDOG_CHURN_SESSIONS * (
+    RECONNECT_BACKOFF_MAX + WATCHDOG_RAISE_BUDGET
+)
+_churn_window_env = os.environ.get("WATCHDOG_CHURN_WINDOW")
+_churn_window_requested = (
+    float(_churn_window_env) if _churn_window_env is not None else 1800.0
+)
+WATCHDOG_CHURN_WINDOW = max(WATCHDOG_CHURN_WINDOW_FLOOR, _churn_window_requested)
+
+# Reported only for a window the operator actually set, on the same reasoning
+# as WATCHDOG_STALL_SECONDS above: the shipped default clears the floor on its
+# own, and announcing arithmetic nobody asked about on every start is the noise
+# an operator learns to stop reading.
+if _churn_window_env is not None and WATCHDOG_CHURN_WINDOW != _churn_window_requested:
+    CLAMP_NOTICES.append(
+        f"WATCHDOG_CHURN_WINDOW was requested as {_churn_window_requested:g} but "
+        f"is running as {WATCHDOG_CHURN_WINDOW:g} (floor is "
+        f"{WATCHDOG_CHURN_WINDOW_FLOOR:g}, which is "
+        f"{WATCHDOG_CHURN_SESSIONS:g} worst-case reconnection cycles)"
     )

@@ -199,7 +199,7 @@ def test_the_notify_deadline_is_clamped_at_both_ends(monkeypatch):
         assert importlib.reload(config).NOTIFY_TIMEOUT >= 1.0
         monkeypatch.setenv("NOTIFY_TIMEOUT", "600")
         reloaded = importlib.reload(config)
-        assert reloaded.NOTIFY_TIMEOUT <= reloaded.NOTIFY_TIMEOUT_CEILING
+        assert reloaded.NOTIFY_TIMEOUT <= reloaded.STOP_BUDGET_SECONDS
     finally:
         monkeypatch.undo()
         importlib.reload(config)
@@ -438,6 +438,12 @@ async def test_a_stalled_process_exits_one(monkeypatch, tmp_path):
     monkeypatch.setattr(supervisor, "watchdog_loop", trip)
 
     assert await asyncio.wait_for(main.run(), timeout=_FAILSAFE) == 1
+
+
+def test_a_churning_component_asks_for_a_restart():
+    """Same request as the other two watchdog reasons, so the same code. The
+    logs say which of the three it was."""
+    assert main.EXIT_CODES["churning"] == main.EXIT_FAILURE
 
 
 async def test_a_configuration_error_exits_two(monkeypatch, tmp_path):

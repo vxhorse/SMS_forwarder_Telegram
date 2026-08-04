@@ -25,14 +25,15 @@ EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_CONFIG = 2
 
-# Keyed by the supervisor's recorded reason for stopping. Both watchdog reasons
-# share a code on purpose: a component that stopped answering and a snapshot
-# that stopped being refreshed are the same request, which is to be restarted.
-# The logs say which of the two it was.
+# Keyed by the supervisor's recorded reason for stopping. All three watchdog
+# reasons share a code on purpose: a component that stopped answering, one that
+# stopped advancing, and one that keeps reconnecting are the same request,
+# which is to be restarted. The logs say which of the three it was.
 EXIT_CODES = {
     None: EXIT_OK,
     "watchdog": EXIT_FAILURE,
     "stalled": EXIT_FAILURE,
+    "churning": EXIT_FAILURE,
     "fatal_config": EXIT_CONFIG,
 }
 
