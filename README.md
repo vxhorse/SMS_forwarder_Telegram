@@ -247,10 +247,11 @@ The biggest mover is `MODEM_REGISTRATION_CHECK=1`, which puts the floor at 3600
 and is the only one that clears 1800 at otherwise-stock values: that check ends a
 session after `MODEM_REGISTRATION_FAILURES` readings rather than one, so it
 multiplies the slowest cycle instead of adding to it. `RECONNECT_BACKOFF_MAX=90`
-puts the floor at 2000, and nothing else in the file reacts to it. A slower probe schedule does the same — `MODEM_PROBE_INTERVAL=50`
-puts it at 1840, `=60` at 2140 — though those two are not quiet configurations
-overall: each also collapses `MODEM_PROBE_TIMEOUT`'s ceiling, clamping it to 1
-and reporting that the worst refresh gap no longer fits `HEALTH_STALE_SECONDS`.
+puts the floor at 2000, and nothing else in the file reacts to it. A slower
+probe schedule does the same — `MODEM_PROBE_INTERVAL=50` puts it at 1840, `=60`
+at 2140 — though those two are not quiet configurations overall: each also
+collapses `MODEM_PROBE_TIMEOUT`'s ceiling, clamping it to 1 and reporting that
+the worst refresh gap no longer fits `HEALTH_STALE_SECONDS`.
 What is running is safe in every case, because the floor wins. What is silent is
 only the churn window itself, and only when it is left unset: anyone who set it
 — which includes everyone who copied `.env.example` — gets a startup notice
@@ -422,8 +423,8 @@ Three states are worth recognising:
     count as a recovery are counted here, which is what makes this criterion
     mean what it says: a session that ends sooner re-stamps neither clock
     above, so the first of them goes on measuring it from the last recovery,
-    with the hour of tolerance chosen for it. A modem that has not been plugged in yet never
-    reaches a session at all and is still waited for indefinitely.
+    with the hour of tolerance chosen for it. A modem that has not been plugged
+    in yet never reaches a session at all and is still waited for indefinitely.
 - **`healthy`** — the snapshot is fresh and every component is up.
 
 One shape falls between those three criteria, and it is written down here rather
@@ -431,13 +432,24 @@ than guarded against. The down clock runs from a component's **last recovery**,
 not from process start, so a component that alternates — several failures inside
 `SERVICE_STABLE_SECONDS`, then one session that outlasts it — resets that clock
 with the recovery while adding just one to the churn count. Neither reading
-reaches its threshold and the process keeps running. What you see instead is the
-container flapping between `healthy` and `unhealthy`: the snapshot is written
-only while every component is up, so its mtime stops advancing for the whole of
-every down phase, and messages arriving during one are not delivered. Nothing
-restarts on that by itself — a failing healthcheck triggers no restart. Watch
-the `reconnects` counts in the snapshot alongside the container's health
-transitions if you suspect it.
+reaches its threshold and the process keeps running.
+
+What you see depends on how long each down phase lasts. The snapshot is written
+only while every component is up, so its mtime stops advancing from the failure
+until the next recovery — a gap that always includes `SERVICE_STABLE_SECONDS`,
+since nothing is marked up before that. Once the gap passes
+`HEALTH_STALE_SECONDS` the container goes `unhealthy` and flaps; a cycle short
+enough to stay inside that window never trips it at all, and the `reconnects`
+counts in the snapshot are then the only reading that moves. Nothing restarts on
+either by itself — a failing healthcheck triggers no restart. Watch those counts
+alongside the container's health transitions if you suspect this shape.
+
+Messages survive one of the two cases and not the other. While the modem
+component is down the modem stores what arrives, and the next setup drains the
+store before erasing it, so those messages are delivered late rather than lost.
+While the Telegram component is down the modem is up and `AT+CNMI=2,2,0,0,0`
+hands each message straight to this process, which then has nowhere to forward
+it.
 
 One failure deliberately does **not** restart anything: a snapshot file that
 cannot be written. The container goes `unhealthy`, because `healthcheck.py`

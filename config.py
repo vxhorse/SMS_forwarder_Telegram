@@ -590,9 +590,10 @@ if WATCHDOG_STALL_FLOOR > WATCHDOG_DOWN_SECONDS:
 # by construction at the values this file ships: the liveness probe takes
 # MODEM_PROBE_FAILURES x (MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT) to raise,
 # and the registration check at least MODEM_REGISTRATION_FAILURES x
-# MODEM_PROBE_INTERVAL, which are 105 and 90 seconds against a 60-second window;
-# WATCHDOG_RAISE_FLOOR above is that figure, and reports a configuration where
-# it stops holding.
+# MODEM_PROBE_INTERVAL, which are 105 and 90 seconds against a 60-second window.
+# WATCHDOG_RAISE_FLOOR, defined below with the churn window's own derivations
+# because it is built from the same probe settings, is that figure, and reports
+# a configuration where it stops holding.
 #
 # Known limitation: the two criteria overlap only for a component that stays in
 # one shape. "The down clock goes on running" means from the last recovery, not
@@ -606,12 +607,16 @@ if WATCHDOG_STALL_FLOOR > WATCHDOG_DOWN_SECONDS:
 # and nothing here is a proxy for it: a fifth criterion would need its own
 # design, not a constant.
 #
-# What an operator does see is the health snapshot. It is refreshed only while
-# every component is up (HealthState.refresh_file), so the file's mtime stops
-# advancing for the whole of every down phase and the container healthcheck
-# fails throughout each one - the fault is visible as a container flapping
-# between healthy and unhealthy rather than as a restart. Nothing acts on that
-# by itself: a container runtime does not restart on a failing healthcheck.
+# What an operator sees depends on how long each down phase runs. The snapshot
+# is refreshed only while every component is up (HealthState.refresh_file), so
+# its mtime stops advancing from the failure until the next recovery - a gap
+# that always includes SERVICE_STABLE_SECONDS, since nothing is marked up
+# before that. But healthcheck.py compares that gap against
+# HEALTH_STALE_SECONDS, so only a down phase longer than that window turns the
+# container unhealthy: a cycle short enough to stay inside it produces no
+# signal there at all, and the reconnects counts in the snapshot are the only
+# reading that moves. Nothing acts on either by itself: a container runtime
+# does not restart on a failing healthcheck.
 #
 # Counting reconnections rather than lengthening the stable window is what
 # makes this cover the failures nobody has enumerated yet. It does not ask what
