@@ -204,12 +204,17 @@ class Supervisor:
         why the count is recorded here rather than by the caller. Only a
         session that reached the point above is counted, because only that
         point re-stamps the clocks the other two criteria measure from: a
-        session that ends before it resets nothing, and its component's down
-        clock has been running since the process started and goes on running.
-        That failure is the down criterion's, with the tolerance chosen for it,
-        and counting it here as well would put a far shorter ceiling
-        underneath. Keeping the flag and the count in one method is also what
-        keeps this independent of when the caller marks the component down.
+        session that ends before it resets nothing, so its component's down
+        clock goes on running from wherever the last recovery left it - from
+        process start for a component that has never had one. That failure is
+        the down criterion's, with the tolerance chosen for it, and counting it
+        here as well would put a far shorter ceiling underneath. Keeping the
+        flag and the count in one method is also what keeps this independent of
+        when the caller marks the component down.
+
+        "From the last recovery" is the whole of the guarantee, and a component
+        that alternates between the two falls between them: see the known
+        limitation recorded beside WATCHDOG_CHURN_SESSIONS in config.py.
 
         This is what covers the waiting state as well. A component whose
         dependency has not appeared yet fails inside connect_once(), never
@@ -311,10 +316,13 @@ class Supervisor:
         Only recovered sessions are counted, and the two statements above are
         the same statement: what makes such a loop invisible to the first
         criterion is exactly what makes it visible to this one. A session that
-        ends sooner re-stamps nothing, so the down clock has been running
-        throughout and the first criterion is already measuring it - counting
-        those here as well would hand the same failure a second ceiling, orders
-        of magnitude shorter than the tolerance chosen for it.
+        ends sooner re-stamps nothing, so the down clock keeps running from the
+        last recovery and the first criterion is already measuring it -
+        counting those here as well would hand the same failure a second
+        ceiling, orders of magnitude shorter than the tolerance chosen for it.
+        A component that mixes the two shapes is measured fully by neither; the
+        known limitation beside WATCHDOG_CHURN_SESSIONS in config.py says what
+        that leaves visible.
 
         A snapshot that stops being written while every component loop keeps
         advancing is caught by snapshot_age, but only reported: the loops are

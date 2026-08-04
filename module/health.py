@@ -128,8 +128,12 @@ class HealthState:
 
         Which is also why the caller reports only the sessions that reached
         that recovery. A session that ended before it did reset nothing, so
-        the evidence of it is still there in the down clock, and the count is
-        for what leaves no other trace.
+        the evidence of it is still in the down clock - which runs from the
+        last recovery, since mark_down re-stamps only a component that was up -
+        and the count is for what leaves no other trace. A component that
+        alternates between the two shapes is therefore measured fully by
+        neither: see the known limitation beside WATCHDOG_CHURN_SESSIONS in
+        config.py.
         """
         ends = self._session_ends.get(name)
         if ends is None:
