@@ -516,11 +516,14 @@ async def test_watchdog_stays_quiet_while_components_are_up():
 class _StallHealth:
     """Minimal health double: answers only what the watchdog asks."""
 
-    def __init__(self, down=0.0, stall=None, snapshot=None, churner=None):
+    def __init__(
+        self, down=0.0, stall=None, snapshot=None, churner=None, reconnects=None
+    ):
         self.down = down
         self.stall = stall
         self.snapshot = snapshot
         self.churner = churner
+        self.reconnects = reconnects if reconnects is not None else {}
         # Read by the watchdog's own log line, so the double has to carry it
         # exactly as the real HealthState does.
         self.churn_window = config.WATCHDOG_CHURN_WINDOW
@@ -547,6 +550,9 @@ class _StallHealth:
     def churning(self, threshold):
         self.churn_reads += 1
         return self.churner
+
+    def reconnect_counts(self):
+        return self.reconnects
 
 
 # The watchdog is driven with interval=0, so every scheduling step below is one
@@ -1234,7 +1240,9 @@ async def test_a_component_that_never_connects_is_never_counted(tmp_path):
 
 async def test_the_watchdog_exits_on_a_churning_component():
     shutdown = asyncio.Event()
-    health = _StallHealth(down=0.0, stall=0.0, churner="device")
+    health = _StallHealth(
+        down=0.0, stall=0.0, churner="device", reconnects={"device": 5}
+    )
     sup = Supervisor(health, shutdown)
     with _LogCapture() as log:
         await asyncio.wait_for(
@@ -1266,3 +1274,65 @@ async def test_the_watchdog_holds_fire_below_the_churn_threshold():
     assert health.churn_reads >= _MIN_INSPECTIONS
     shutdown.set()
     await task
+
+
+async def test_the_churn_line_names_the_count_it_tripped_on():
+    """The number printed beside the threshold has to be the number the
+    threshold was compared against, exactly as
+    test_the_stall_line_names_the_figure_it_tripped_on requires of the sibling
+    line.
+
+    The watchdog only inspects every WATCHDOG_CHECK_INTERVAL, so a component
+    flapping faster than that can end several sessions between two looks and
+    the count is then well above the threshold. Printing the threshold in the
+    count's place understates by an unbounded amount, and tells an operator the
+    component reconnected the minimum number of times that would have tripped
+    it rather than what it actually did.
+    """
+    shutdown = asyncio.Event()
+    health = _StallHealth(
+        down=0.0, stall=0.0, churner="device", reconnects={"device": 9}
+    )
+    sup = Supervisor(health, shutdown)
+    with _LogCapture() as log:
+        await asyncio.wait_for(
+            sup.watchdog_loop(
+                threshold=3600.0,
+                interval=0.0,
+                stall_threshold=240.0,
+                churn_sessions=5,
+            ),
+            timeout=_FAILSAFE,
+        )
+    assert sup.exit_reason == "churning"
+    assert "9 connected sessions" in log.text
+    # The threshold still has to be there to read the count against - it is
+    # just no longer standing in for it.
+    assert "threshold 5" in log.text
+
+
+async def test_the_churn_line_does_not_diagnose_the_other_two_clocks():
+    """A component that fails inside SERVICE_STABLE_SECONDS is never marked up,
+    so its down clock has been accumulating the whole time - churn simply
+    reaches its threshold first. A line claiming neither other clock ever
+    accumulated would then be telling an operator something false about the
+    fault they are debugging, so the line states the criterion instead.
+    """
+    shutdown = asyncio.Event()
+    health = _StallHealth(
+        down=120.0, stall=0.0, churner="device", reconnects={"device": 5}
+    )
+    sup = Supervisor(health, shutdown)
+    with _LogCapture() as log:
+        await asyncio.wait_for(
+            sup.watchdog_loop(
+                threshold=3600.0,
+                interval=0.0,
+                stall_threshold=240.0,
+                churn_sessions=5,
+            ),
+            timeout=_FAILSAFE,
+        )
+    assert sup.exit_reason == "churning"
+    assert "down clock" not in log.text
+    assert "stall clock" not in log.text

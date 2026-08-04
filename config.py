@@ -534,11 +534,25 @@ if WATCHDOG_STALL_FLOOR > WATCHDOG_DOWN_SECONDS:
 # broke; it asks whether this component keeps connecting and disconnecting,
 # which is the one thing every such loop has in common.
 #
+# One threshold covers both components, so it has to clear the noisier of the
+# two, and they are noisy in quite different amounts. The device component
+# absorbs its whole not-ready phase inside connect_once() - port discovery, the
+# open, the handshake, the SIM setup - so a session of its own only ends once
+# something that was working stopped. The Telegram polling loop deliberately
+# does not retry anything, because a second backoff policy inside the loop
+# would compound with the supervisor's own, so every transient HTTP error ends
+# a connected session and counts here. On an intermittent link, or behind a
+# proxy that comes and goes, a handful of those in half an hour says nothing is
+# wrong: messages are still being forwarded between them. Ten is chosen to sit
+# above that noise while still bounding detection of a real loop to roughly ten
+# cycles - about twenty minutes for the slowest failure this criterion is for,
+# well inside the window below.
+#
 # Floored at two for the same reason as MODEM_REGISTRATION_FAILURES: one
 # reconnection is not a pattern, and at zero or one a single transient failure
 # ends the process.
 WATCHDOG_CHURN_SESSIONS = _clamped(
-    "WATCHDOG_CHURN_SESSIONS", int(os.getenv("WATCHDOG_CHURN_SESSIONS", "5")), low=2
+    "WATCHDOG_CHURN_SESSIONS", int(os.getenv("WATCHDOG_CHURN_SESSIONS", "10")), low=2
 )
 # The window those sessions are counted in, in seconds.
 #
