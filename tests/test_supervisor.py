@@ -516,14 +516,16 @@ async def test_watchdog_stays_quiet_while_components_are_up():
 class _StallHealth:
     """Minimal health double: answers only what the watchdog asks."""
 
-    def __init__(self, down=0.0, stall=None):
+    def __init__(self, down=0.0, stall=None, snapshot=None):
         self.down = down
         self.stall = stall
+        self.snapshot = snapshot
         # Counts the inspections so a test can tell "the watchdog looked and
         # held its fire" apart from "the watchdog never got as far as looking",
         # which would otherwise satisfy the same assertions.
         self.down_reads = 0
         self.stall_reads = 0
+        self.snapshot_reads = 0
 
     def down_duration(self):
         self.down_reads += 1
@@ -532,6 +534,10 @@ class _StallHealth:
     def stall_duration(self):
         self.stall_reads += 1
         return self.stall
+
+    def snapshot_age(self):
+        self.snapshot_reads += 1
+        return self.snapshot
 
 
 # The watchdog is driven with interval=0, so every scheduling step below is one
@@ -994,3 +1000,48 @@ def test_the_stall_floor_outranks_the_ceiling(monkeypatch):
     finally:
         monkeypatch.undo()
         importlib.reload(config)
+
+
+async def test_an_unwritable_snapshot_is_reported_but_does_not_exit():
+    """A file that cannot be written is not a reason to restart: the loops are
+    demonstrably running - that is what the fresh progress stamps say - and a
+    restart cannot make the path writable. It repeats the whole startup every
+    few minutes instead, which is a worse outcome than the fault. The
+    healthcheck still fails on the file's own mtime, so the fault stays
+    visible without anything being restarted for it.
+    """
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=0.0, snapshot=900.0)
+    sup = Supervisor(health, shutdown)
+    with _LogCapture() as log:
+        task = asyncio.create_task(
+            sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+        )
+        for _ in range(_INERT_STEPS):
+            await asyncio.sleep(0)
+        assert not task.done()
+        assert sup.exit_reason is None
+        assert health.snapshot_reads >= _MIN_INSPECTIONS
+        shutdown.set()
+        await task
+    assert "HEALTH_FILE" in log.text
+    assert any(record.levelno >= logging.ERROR for record in log.records)
+
+
+async def test_the_unwritable_snapshot_report_is_throttled():
+    """It is checked every interval and the condition persists, so reporting it
+    on every inspection would fill the log with one line per cycle - and on
+    hosts that keep logs in memory that volume is itself a fault."""
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=0.0, snapshot=900.0)
+    sup = Supervisor(health, shutdown)
+    with _LogCapture() as log:
+        task = asyncio.create_task(
+            sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
+        )
+        for _ in range(_INERT_STEPS):
+            await asyncio.sleep(0)
+        shutdown.set()
+        await task
+    reports = [r for r in log.records if "HEALTH_FILE" in r.getMessage()]
+    assert 0 < len(reports) < health.snapshot_reads

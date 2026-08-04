@@ -160,33 +160,22 @@ class HealthState:
         self._last_refresh = self._clock()
 
     def stall_duration(self) -> Optional[float]:
-        """Seconds since the least recently advanced thing last advanced.
+        """Seconds since the least recently advanced component loop advanced.
 
-        Two kinds of thing are measured and the longest of them is returned:
-
-        - every component that is up, from the last time its own loop reported
-          progress. This is the reading that attributes a stall to a component.
-          A loop blocked on something that never returns raises nothing, so the
-          component stays marked up and no other reading in this process
-          changes at all.
-        - the snapshot file, from the last time it was written or the moment
-          the system last became whole, whichever is later. It says nothing
-          about any single component, because either component loop writes it
-          for both, and is kept only because it is also the reading that fails
-          when HEALTH_FILE itself can no longer be written.
-
-        The snapshot is not written at all while a component is down, so the
-        age it carries at the moment of a recovery measures the outage rather
-        than anything that is wrong now, and reading that as a stall would
-        restart the process for having reconnected. Measuring from the recovery
-        instead is what discounts it, and doing so here rather than downstream
-        is what makes it exact: this is where the moment is known. It expires
-        by itself, because the time since the recovery grows while the outage
-        it discounts does not, so an old outage cannot shorten a later stall.
+        This is the reading that attributes a stall to a component. A loop
+        blocked on something that never returns raises nothing, so the
+        component stays marked up and no other reading in this process changes
+        at all; its own progress stamp is the only thing that stops moving.
 
         A component that is down is not measured here. Its loop is not running,
         so of course it is not advancing; that state belongs to down_duration()
         and the far longer tolerance chosen for it.
+
+        The snapshot file is deliberately not part of this reading. It is
+        written by whichever loop reaches the call first, so it says nothing
+        about any single component - and, more to the point, the one failure
+        that makes it age on its own is a file that cannot be written, which
+        restarting the process cannot fix. See snapshot_age().
 
         None means the system has not yet been fully up even once, which is a
         legitimate waiting state - hardware can appear long after the process
@@ -196,6 +185,38 @@ class HealthState:
         if self._all_up_since is None:
             return None
         now = self._clock()
+        ages = [
+            now - service["progress"]
+            for service in self._services.values()
+            if service["up"]
+        ]
+        return max(ages) if ages else None
+
+    def snapshot_age(self) -> Optional[float]:
+        """Seconds since the snapshot was last written, or since the system
+        last became whole, whichever is later.
+
+        Kept apart from stall_duration() because the two need different
+        answers. A snapshot that stops being written while every component
+        loop keeps reporting progress means the loops are fine and the file is
+        not - the write is the step that failed - and restarting the process
+        cannot make an unwritable path writable. What it can do is repeat the
+        whole startup every few minutes for ever, which is worse than the fault
+        it is reacting to: an unhealthy container that keeps forwarding
+        messages beats one that stops to reinitialise the modem on a timer.
+
+        The snapshot is not written at all while a component is down, so the
+        age it carries at the moment of a recovery measures the outage rather
+        than anything that is wrong now. Measuring from the recovery instead is
+        what discounts it, and doing so here rather than downstream is what
+        makes it exact: this is where the moment is known. It expires by
+        itself, because the time since the recovery grows while the outage it
+        discounts does not.
+
+        None means the system has not yet been fully up even once.
+        """
+        if self._all_up_since is None:
+            return None
         # A snapshot that has never been written has no age of its own, and the
         # absence of one is not a reason to stop measuring: a process that
         # cannot write HEALTH_FILE at all is one whose healthcheck will never
@@ -203,15 +224,7 @@ class HealthState:
         written = self._all_up_since
         if self._last_refresh is not None and self._last_refresh > written:
             written = self._last_refresh
-        ages = [now - written]
-        # Anything reported up has a progress stamp: mark_up is the only way to
-        # become up, and it writes one.
-        ages.extend(
-            now - service["progress"]
-            for service in self._services.values()
-            if service["up"]
-        )
-        return max(ages)
+        return self._clock() - written
 
     def clear_file(self) -> None:
         """Remove the snapshot file. Safe to call repeatedly."""
