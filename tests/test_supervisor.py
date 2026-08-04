@@ -547,7 +547,15 @@ _INERT_STEPS = 50
 _MIN_INSPECTIONS = 5
 
 
-async def test_watchdog_exits_when_the_snapshot_stops_being_refreshed():
+async def test_watchdog_exits_when_the_stall_reading_crosses_its_threshold():
+    """Renamed from ...when_the_snapshot_stops_being_refreshed: that is no
+    longer true. `_StallHealth` sets `stall` directly, bypassing HealthState
+    entirely, so this exercises the watchdog's own comparison against
+    stall_duration() - a component loop gone quiet - not the file, which
+    cannot produce this exit any more. See
+    test_an_unwritable_snapshot_is_reported_but_does_not_exit for what an
+    unwritable snapshot now does instead: reported, not exited on.
+    """
     shutdown = asyncio.Event()
     health = _StallHealth(down=0.0, stall=300.0)
     sup = Supervisor(health, shutdown)
@@ -596,10 +604,11 @@ async def test_watchdog_holds_fire_below_the_stall_threshold():
 
 
 async def test_a_component_down_past_its_threshold_is_reported_as_down():
-    """A component that is down stops the snapshot being refreshed too, so both
-    ages are large at once. The reason recorded has to be the one that names
-    what actually happened, or the logs send an operator looking for a block
-    that is not there.
+    """A component down and a stall can be reported at once - modelled here
+    with a double that sets both readings directly, since a real HealthState
+    keeps the stall reading gated on nothing being down. The reason recorded
+    has to be the one that names what actually happened, or the logs send an
+    operator looking for a block that is not there.
 
     This does not pin the order of the two checks: the stall check is gated on
     nothing being reported down, so with a component down it cannot fire
@@ -1002,7 +1011,30 @@ def test_the_stall_floor_outranks_the_ceiling(monkeypatch):
         importlib.reload(config)
 
 
-async def test_an_unwritable_snapshot_is_reported_but_does_not_exit():
+class _FakeMonotonic:
+    """Stand-in for the `time` module as `_LogThrottle` uses it - only
+    `.monotonic()` is ever called on it, and only this advances it, never a
+    real clock.
+
+    `_StallHealth`'s condition is a constant the test sets directly, unlike
+    the real HealthState, whose age cannot cross a threshold before real time
+    has covered the same span. Patching the module's `time` name lets a test
+    reproduce that span deterministically instead of needing an actual wait,
+    without adding a clock parameter to `_LogThrottle` itself - which is used
+    elsewhere and has no other reason to take one.
+    """
+
+    def __init__(self, now: float = 0.0):
+        self._now = now
+
+    def monotonic(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+async def test_an_unwritable_snapshot_is_reported_but_does_not_exit(monkeypatch):
     """A file that cannot be written is not a reason to restart: the loops are
     demonstrably running - that is what the fresh progress stamps say - and a
     restart cannot make the path writable. It repeats the whole startup every
@@ -1010,6 +1042,11 @@ async def test_an_unwritable_snapshot_is_reported_but_does_not_exit():
     healthcheck still fails on the file's own mtime, so the fault stays
     visible without anything being restarted for it.
     """
+    from module import supervisor as supervisor_module
+
+    fake_time = _FakeMonotonic()
+    monkeypatch.setattr(supervisor_module, "time", fake_time)
+
     shutdown = asyncio.Event()
     health = _StallHealth(down=0.0, stall=0.0, snapshot=900.0)
     sup = Supervisor(health, shutdown)
@@ -1017,6 +1054,13 @@ async def test_an_unwritable_snapshot_is_reported_but_does_not_exit():
         task = asyncio.create_task(
             sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
         )
+        # Let the loop construct its throttle - seeding it from the clock -
+        # before that clock moves, the same order production runs in: the
+        # throttle always exists well before the condition it gates could
+        # ever be true.
+        for _ in range(3):
+            await asyncio.sleep(0)
+        fake_time.advance(240.0)
         for _ in range(_INERT_STEPS):
             await asyncio.sleep(0)
         assert not task.done()
@@ -1028,20 +1072,47 @@ async def test_an_unwritable_snapshot_is_reported_but_does_not_exit():
     assert any(record.levelno >= logging.ERROR for record in log.records)
 
 
-async def test_the_unwritable_snapshot_report_is_throttled():
-    """It is checked every interval and the condition persists, so reporting it
-    on every inspection would fill the log with one line per cycle - and on
-    hosts that keep logs in memory that volume is itself a fault."""
+async def test_the_unwritable_snapshot_report_is_throttled(monkeypatch):
+    """One line as soon as the fault is noticed, then at most one more per
+    stall_threshold after that - not one per inspection, which would flood a
+    log kept on an in-memory filesystem."""
+    from module import supervisor as supervisor_module
+
+    fake_time = _FakeMonotonic()
+    monkeypatch.setattr(supervisor_module, "time", fake_time)
+
     shutdown = asyncio.Event()
     health = _StallHealth(down=0.0, stall=0.0, snapshot=900.0)
     sup = Supervisor(health, shutdown)
+
     with _LogCapture() as log:
+
+        def report_count() -> int:
+            return len([r for r in log.records if "HEALTH_FILE" in r.getMessage()])
+
         task = asyncio.create_task(
             sup.watchdog_loop(threshold=3600.0, interval=0.0, stall_threshold=240.0)
         )
+        for _ in range(3):
+            await asyncio.sleep(0)
+        fake_time.advance(240.0)
         for _ in range(_INERT_STEPS):
             await asyncio.sleep(0)
+        assert report_count() == 1  # Noticed once, immediately.
+
+        # Well inside the throttle window: however many more times the
+        # watchdog inspects the same unwritable file, no second line yet.
+        fake_time.advance(239.0)
+        for _ in range(_INERT_STEPS):
+            await asyncio.sleep(0)
+        assert report_count() == 1
+
+        # The window has now elapsed: exactly one more line, not one per
+        # inspection since the first.
+        fake_time.advance(1.0)
+        for _ in range(_INERT_STEPS):
+            await asyncio.sleep(0)
+        assert report_count() == 2
+
         shutdown.set()
         await task
-    reports = [r for r in log.records if "HEALTH_FILE" in r.getMessage()]
-    assert 0 < len(reports) < health.snapshot_reads

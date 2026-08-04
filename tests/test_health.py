@@ -151,7 +151,11 @@ def test_stall_duration_is_none_before_the_first_healthy_moment(tmp_path):
     assert health.stall_duration() is None
 
 
-def test_stall_duration_starts_after_the_first_successful_refresh(tmp_path):
+def test_stall_duration_starts_once_every_component_is_up(tmp_path):
+    """mark_up() is what starts this reading now, not refresh_file() - the
+    file plays no part in stall_duration() any more. refresh_file() is still
+    called here to match what a real cycle does, but removing it would not
+    change the number below."""
     health, clock, _ = _make(tmp_path)
     health.mark_up("device")
     health.mark_up("telegram")
@@ -160,7 +164,13 @@ def test_stall_duration_starts_after_the_first_successful_refresh(tmp_path):
     assert health.stall_duration() == 30.0
 
 
-def test_stall_duration_survives_a_component_going_down(tmp_path):
+def test_snapshot_age_survives_a_component_going_down(tmp_path):
+    """Redirected from stall_duration(): the file term this test exercises -
+    refresh_file() turning into a no-op the moment a component goes down - no
+    longer reaches that reading at all. Telegram never calls record_progress()
+    here, so its stamp from mark_up() would coincidentally also read 50.0,
+    which is exactly the kind of accidental agreement the split exists to stop
+    relying on."""
     health, clock, _ = _make(tmp_path)
     health.mark_up("device")
     health.mark_up("telegram")
@@ -170,7 +180,7 @@ def test_stall_duration_survives_a_component_going_down(tmp_path):
     # refresh_file() is now a no-op, so the age keeps growing. That is the
     # point: a component that is down stops the file being refreshed.
     health.refresh_file()
-    assert health.stall_duration() == 50.0
+    assert health.snapshot_age() == 50.0
 
 
 def test_a_completed_cycle_resets_the_stall_age(tmp_path):
@@ -345,9 +355,12 @@ def test_a_snapshot_that_stays_unwritten_after_a_recovery_is_still_caught(tmp_pa
 
 
 def test_an_old_outage_does_not_shorten_a_later_stall(tmp_path):
-    """The discount lasts until the reading no longer contains the outage, and
-    no longer. Subtracting the outage from a stall that starts afterwards would
-    leave a blind spot as long as the outage was."""
+    """stall_duration() carries no outage discount at all any more - it reads
+    only the progress stamps mark_up() and record_progress() leave, so an
+    outage that ended long ago cannot leave any residue in it. The number
+    below is a plain progress age. See
+    test_an_old_outage_does_not_shorten_a_later_snapshot_age for the
+    equivalent guard on the reading that does still carry a discount."""
     health, clock = _recover_after_an_outage(tmp_path)
     clock.advance(20.0)
     health.record_progress("device")
@@ -356,6 +369,22 @@ def test_an_old_outage_does_not_shorten_a_later_stall(tmp_path):
 
     clock.advance(240.0)
     assert health.stall_duration() == 240.0
+
+
+def test_an_old_outage_does_not_shorten_a_later_snapshot_age(tmp_path):
+    """The discount snapshot_age() applies at a recovery lasts only until the
+    reading no longer contains the outage. A later refresh moves the baseline
+    forward; subtracting the old, by-then-irrelevant outage from an age that
+    starts after that refresh would leave a blind spot as long as the outage
+    was."""
+    health, clock = _recover_after_an_outage(tmp_path)
+    clock.advance(20.0)
+    health.record_progress("device")
+    health.record_progress("telegram")
+    health.refresh_file()
+
+    clock.advance(240.0)
+    assert health.snapshot_age() == 240.0
 
 
 def test_a_snapshot_that_was_never_written_is_visible_as_its_own_age(tmp_path, monkeypatch):
