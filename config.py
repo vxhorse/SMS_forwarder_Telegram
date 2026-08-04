@@ -348,13 +348,20 @@ MODEM_REGISTRATION_FAILURES = _clamped(
 # MODEM_REGISTRATION_FAILURES misses spaced MODEM_PROBE_INTERVAL apart, which
 # at the values above is longer than SERVICE_STABLE_SECONDS - so every cycle
 # reaches the point where the session counts as recovered before the point
-# where it fails. Each recovery re-stamps the health record, which is what both
-# watchdog criteria measure from, so neither the down clock nor the stall clock
-# accumulates across cycles and the loop is invisible to both. The snapshot
-# goes stale for only the width of one teardown, so the container healthcheck
-# stays green through it too. Meanwhile every cycle reinitialises the radio and
-# rewrites the modem's stored profile. A guard whose false positive cannot be
-# seen by anything watching is not one to ship enabled.
+# where it fails. Each recovery re-stamps the health record, so neither the down
+# clock nor the stall clock accumulates across cycles, and the snapshot goes
+# stale for only the width of one teardown, so the container healthcheck stays
+# green through it too. Meanwhile every cycle reinitialises the radio and
+# rewrites the modem's stored profile.
+#
+# WATCHDOG_CHURN_SESSIONS below does see that loop, because it counts ended
+# sessions rather than reading a clock each recovery resets: at the values above
+# the process exits roughly ten cycles in rather than repeating for ever. That
+# makes the fault a restart loop instead of an unbounded one, which is easier to
+# find and no better to run - on a network where the question has no true
+# answer, the readings stay false and the radio is reinitialised for them
+# either way. A guard that acts on a question its own reading cannot answer is
+# not one to ship enabled.
 #
 # Turning it on is a decision to take once the answer is known for the SIM and
 # the network in use, and costs nothing to defer: setup asks the modem to

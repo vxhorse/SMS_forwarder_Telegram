@@ -199,9 +199,12 @@ working `.env` only needs `BOT_TOKEN` and `CHAT_ID`. Durations are in seconds.
 
 The **Bounds** column is part of the contract, not a footnote. A setting whose
 value would disable the guard it exists for, or reinstate the failure that guard
-prevents, is clamped, and the startup log names every setting a bound moved. A
-setting with no ceiling says so and says why, so an absent bound can never be
-read as a forgotten one.
+prevents, is clamped, and the startup log names every setting a bound moved away
+from a value you actually set. A derived default that the bounds then move is
+not announced — that would be arithmetic nobody asked about on every start — so
+a quiet startup means nothing you set was overridden, not that nothing was
+clamped. A setting with no ceiling says so and says why, so an absent bound can
+never be read as a forgotten one.
 
 | Variable | Default | Purpose | Bounds |
 | --- | --- | --- | --- |
@@ -233,17 +236,23 @@ read as a forgotten one.
 | `WATCHDOG_CHURN_SESSIONS` | `10` | Exit once one component has ended this many connected sessions inside the window below | Floored at 2: one reconnection is not a pattern, and at zero or one a single transient failure ends the process. Unbounded above, deliberately — a higher threshold only makes the criterion less eager, and `WATCHDOG_CHURN_WINDOW`'s floor is multiplied by it, so the window cannot fall behind the count it has to hold |
 | `WATCHDOG_CHURN_WINDOW` | `1800.0` | The window those sessions are counted in | Floored at `WATCHDOG_CHURN_SESSIONS × (RECONNECT_BACKOFF_MAX + the worst time a component can take to raise)`, which is **1400 as shipped**. Below that the count can never reach the threshold and the criterion is switched off while looking enabled — a floor against a false negative, unlike every other one here. **Unbounded above, deliberately**: widening it only makes the criterion more eager, in proportion to what was asked for, and no value of it disables a guard or reinstates a failure, which is what every ceiling in this table exists to prevent |
 
-Two of those bounds are derived rather than fixed, so they move when a setting
-they are built from moves. `WATCHDOG_CHURN_WINDOW`'s floor is the one to watch:
-it is built from `WATCHDOG_CHURN_SESSIONS`, `RECONNECT_BACKOFF_MAX` and the
-modem probe schedule, and it can pass the shipped default of 1800 with less
-headroom than the numbers suggest. `MODEM_PROBE_INTERVAL=50`, well inside its own
-allowed range, puts the floor at 1840; `=60` puts it at 2140. What is running is
-still safe, because the floor wins, and anyone who set `WATCHDOG_CHURN_WINDOW`
-themselves — which includes everyone who copied `.env.example` — gets a startup
-notice naming the override. It is silent only for a `WATCHDOG_CHURN_WINDOW` left
-unset, where the value being raised is the default rather than something the
-operator asked for.
+Any bound written above as a formula, or as another setting's name, is derived
+rather than fixed: it moves whenever something it is built from moves. Most of
+the column is derived, so read a bound as a relationship, not as a number.
+
+`WATCHDOG_CHURN_WINDOW`'s floor is the one to watch, because it can pass the
+shipped default of 1800 with less headroom than the two numbers suggest, and
+because nothing about the setting an operator touched hints that it will.
+`RECONNECT_BACKOFF_MAX=90` puts the floor at 2000, and nothing else in the file
+reacts to it. A slower probe schedule does the same — `MODEM_PROBE_INTERVAL=50`
+puts it at 1840, `=60` at 2140 — though those two are not quiet configurations
+overall: each also collapses `MODEM_PROBE_TIMEOUT`'s ceiling, clamping it to 1
+and reporting that the worst refresh gap no longer fits `HEALTH_STALE_SECONDS`.
+What is running is safe in every case, because the floor wins. What is silent is
+only the churn window itself, and only when it is left unset: anyone who set it
+— which includes everyone who copied `.env.example` — gets a startup notice
+naming the override, because then it is their value being raised rather than a
+default.
 
 ### Serial port selection
 
@@ -377,9 +386,15 @@ Three states are worth recognising:
   anything by itself; the container runtime only records it. Recovery comes from
   the service reconnecting on its own, and failing that from the watchdog, which
   exits the process so the restart policy takes over. The watchdog has three
-  exit paths. They do not overlap, because each asks a different question: what
-  state is this component in now, is its loop still moving, and how often has it
-  been in that state lately.
+  exit paths, and each asks a different question — what state is this component
+  in now, is its loop still moving, and how often has it been in that state
+  lately — which is what makes a fault invisible to one of them visible to
+  another. The first two can never both be live, because the stall reading is
+  only taken while nothing is down. The third deliberately is not gated that
+  way: a component that keeps reconnecting is down for much of the time, so
+  waiting for a moment when nothing is would sample away the very thing it
+  looks for. Whichever threshold is reached first is the one that ends the
+  process.
   - A component that **failed loudly** is marked down, and the process exits once
     it has been down for `WATCHDOG_DOWN_SECONDS` — an hour by default. The log
     line reads `Watchdog tripped: a component has been down for ...`.
