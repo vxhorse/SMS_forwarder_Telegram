@@ -1206,10 +1206,14 @@ async def test_a_session_that_fails_before_it_is_judged_stable_is_not_counted(
     """The other half of the pair above, and what the criterion means.
 
     Connecting is not recovering. A session that ends before it has lasted
-    SERVICE_STABLE_SECONDS never reaches mark_up, so it re-stamps nothing: the
-    component's down clock has been running since the process started and goes
-    on running across every one of these cycles. That is the criterion the
-    failure belongs to, with the hour of tolerance chosen for it.
+    SERVICE_STABLE_SECONDS never reaches mark_up, so it re-stamps nothing and
+    the component's down clock goes on running across every one of these
+    cycles - here from process start, because no session in this scenario ever
+    reaches mark_up; in general from the last recovery, since mark_down
+    re-stamps a component that was up. That is the criterion the failure
+    belongs to, with the hour of tolerance chosen for it, and the known
+    limitation beside WATCHDOG_CHURN_SESSIONS in config.py covers what a
+    component that alternates between the two leaves behind.
 
     Counting these as well would put a second, far shorter ceiling underneath
     that hour - the count would reach its threshold inside one backoff ladder -
