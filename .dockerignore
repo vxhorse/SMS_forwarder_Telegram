@@ -33,9 +33,12 @@ docker-compose.example.yml
 # Backups of the local compose file carry the same credentials it does, and
 # .gitignore already keeps them out of the repository. The entries above do not
 # cover them, because there is no implicit prefix matching here either: a name
-# that merely begins with docker-compose.yml is not excluded by it. Without
-# these three lines COPY . . places a file full of live credentials inside a
-# published image, where docker history or docker save will hand it to anyone.
+# that merely begins with docker-compose.yml is not excluded by it. The image
+# no longer depends on these three lines - the Dockerfile copies a named
+# allow-list - but the whole context is still uploaded to the daemon before
+# any COPY runs, so without them a file full of live credentials is handed to
+# whatever performs the build, including any remote or CI builder the context
+# is sent to.
 **/docker-compose.*.bak-*
 **/*.bak
 **/*.bak-*

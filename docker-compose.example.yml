@@ -6,14 +6,21 @@ services:
     image: vxhorse/sms-forwarder:latest
     container_name: sms-forwarder
     restart: unless-stopped
+    # The container shares the host's network namespace, which is what lets
+    # PROXY_URL name a proxy running on the host as 127.0.0.1. Under bridge
+    # networking that address is the container itself and the Telegram component
+    # never connects.
     network_mode: "host"
     stop_signal: SIGTERM
-    # The shutdown path inside the process is bounded at ten seconds:
-    # NOTIFY_TIMEOUT and SERIAL_CLOSE_TIMEOUT are awaited one after the other on
-    # the way out, and config.py clamps the two to share that one budget. Thirty
-    # seconds here is generous against it. Cutting it below ten is not: a
-    # teardown the grace period ends early is a kill rather than a clean stop,
-    # and the port is then released by the kernel rather than by the process.
+    # The shutdown path inside the process is meant to fit ten seconds:
+    # SERIAL_CLOSE_TIMEOUT and NOTIFY_TIMEOUT are awaited one after the other on
+    # the way out - the port is released first, then the notification is sent -
+    # and config.py caps each against that budget. Where the close's floor and
+    # the budget collide the pair can still reach eleven, and config.py reports
+    # that at startup rather than clamping further. Thirty seconds here is
+    # generous against either. Cutting it to ten is not: a teardown the grace
+    # period ends early is a kill rather than a clean stop, and the port is then
+    # released by the kernel rather than by the process.
     stop_grace_period: 30s
     volumes:
       # A bind mount rather than devices:, so that container creation does not
@@ -21,15 +28,19 @@ services:
       # over /dev so the container keeps its own pts, shm and null.
       # See "Why not devices:" in README.md.
       - /dev:/hostdev
+      # Log timestamps, and the fallback stamp on a message that arrived without
+      # one of its own, are rendered with the local clock. Without this the
+      # image is UTC and both shift by the host's offset.
       - /etc/localtime:/etc/localtime:ro
     device_cgroup_rules:
       - 'c 188:* rmw'      # USB serial adapters (ttyUSB*)
       - 'c 166:* rmw'      # CDC-ACM devices (ttyACM*)
     env_file:
       # Copy .env.example to .env first. Without that file Compose refuses to
-      # parse this one and starts nothing at all, which is the better failure:
-      # a container that came up with no credentials would look like a working
-      # deployment and forward nothing.
+      # start anything, which is the better failure: it names the file that is
+      # missing. A container started with the placeholder credentials instead
+      # ends during startup with exit code 2 and is restarted for ever by the
+      # policy above - the same fault, read off a restart loop.
       - .env
     environment:
       # Overrides whatever .env says, because it describes this compose file's
@@ -40,7 +51,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      # Must exceed SERVICE_STABLE_SECONDS plus the time the modem needs to
-      # enumerate; raise it if yours is slower. See "Reading the health check"
-      # in README.md.
+      # Must exceed SERVICE_STABLE_SECONDS plus however long the slower of the
+      # two components takes to connect - the modem enumerating, or the Telegram
+      # API becoming reachable through whatever proxy is in front of it. The
+      # snapshot is not written until both are up. Raise it if either is slow
+      # here. See "Reading the health check" in README.md.
       start_period: 180s

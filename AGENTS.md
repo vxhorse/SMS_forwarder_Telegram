@@ -17,6 +17,7 @@ not a cosmetic one.
 ## Commands
 
 ```bash
+uv venv                                                            # .venv/ is gitignored: a fresh clone has none
 uv pip install --python .venv/bin/python -r requirements-dev.txt   # setup (no pip in this venv)
 .venv/bin/python -m pytest                                          # run the suite
 .venv/bin/python -m pytest tests/test_supervisor.py -v              # one file
@@ -27,7 +28,9 @@ interpreter must be the one in `.venv/`.
 
 ## Architecture
 
-`main.py` wires four things and then gets out of the way:
+`main.py` builds four components — `HealthState`, `Supervisor`, `DeviceManager`
+and `TelegramBot` — wires them to each other and then gets out of the way. The
+last module below is reached through one of them, not from `main.py`:
 
 - **`module/supervisor.py`** — `Supervisor` owns every component's lifecycle.
   It enforces a three-way split that the rest of the design depends on:
@@ -65,9 +68,11 @@ timeout reappears around the supervisory wait.
 
 **All durations use `time.monotonic()`.** These boards often have no RTC
 battery, so the wall clock reads years in the past until NTP corrects it, then
-jumps forward. The single permitted wall-clock use in the whole project is the
-health-file mtime comparison in `healthcheck.py`. A carrier-supplied message
-timestamp is message data, not a duration — that is not a violation.
+jumps forward. The only wall-clock reading any duration is built from is the
+health-file mtime comparison in `healthcheck.py`. A message timestamp is
+message data, not a duration — that is not a violation: `device_manager.py`
+prints the carrier's service-centre timestamp, and falls back to
+`datetime.now()` for a PDU that carries none.
 
 **`run()` must never return under normal operation.** A returning body is
 treated as a failure. Loop inside it. How long a session lasts feeds two
@@ -104,9 +109,13 @@ never a specific deployment or past incident.
 **Documentation that describes the same fact in more than one file moves
 together.** A user-facing change moves `README.md` and its three translations
 (`README_CN.md`, `README_JP.md`, `README_FA.md`) together; a settings change
-also moves `config.py` and `.env.example`; a change to the AT command set also
-moves `doc/README.md`, whose tables claim to cover every command this project
-issues. Nothing checks this, so it is on the author.
+also moves `config.py`, `.env.example` and `docker-compose.example.yml`, whose
+`stop_grace_period` and `start_period` comments state the relationships between
+`STOP_BUDGET_SECONDS`, `NOTIFY_TIMEOUT`, `SERIAL_CLOSE_TIMEOUT` and
+`SERVICE_STABLE_SECONDS` in the terms an operator acts on — `config.py`
+delegates half of one invariant to that file by name; a change to the AT
+command set also moves `doc/README.md`, whose tables claim to cover every
+command this project issues. Nothing checks this, so it is on the author.
 
 ## Testing
 
@@ -130,8 +139,11 @@ attribution of any kind** — no co-author trailers, no "generated with" lines.
 
 ## Things that will catch you out
 
-- `docker-compose.yml` is gitignored and holds real credentials. Only
-  `docker-compose.example.yml` is tracked. Never read the local one into output.
+- `.env` holds the live credentials — `BOT_TOKEN`, `CHAT_ID`, `PROXY_URL`. It is
+  gitignored; only `.env.example` is tracked. Never read it into output.
+- `docker-compose.yml` is gitignored too, and a local copy may diverge from the
+  example in ways specific to one machine. Only `docker-compose.example.yml` is
+  tracked. Never read the local one into output either.
 - The compose file bind-mounts `/dev` to `/hostdev` instead of using `devices:`.
   See "Why not `devices:`" in `README.md` for the reason. Do not "simplify"
   this back.
@@ -141,7 +153,14 @@ attribution of any kind** — no co-author trailers, no "generated with" lines.
   child**, not the container's main PID — the entrypoint is `tini`:
   ```bash
   PY=$(pgrep -P "$(docker inspect -f '{{.State.Pid}}' sms-forwarder)" | head -1)
-  ls -l /proc/$PY/fd | grep ttyUSB
+  ls -l /proc/$PY/fd | grep -E 'ttyUSB|ttyACM'
   ```
 - `doc/README.md` maps every AT command this project issues to its purpose, so
   you can find the right section of the vendor manual without reading all of it.
+- The `Dockerfile` copies a named allow-list, not `COPY . .`. A new file at the
+  repository root must be added to
+  `COPY main.py logger.py config.py healthcheck.py LICENSE ./` or it is absent
+  from the image. Nothing catches that: `docker build` never runs Python, and
+  the suite runs against the source tree, so the first sign is an `ImportError`
+  in a container someone has already pulled. Anything new under `module/` is
+  already covered by `COPY module/ ./module/`.
