@@ -367,7 +367,9 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
     抓住它的不是计时而是计数：单个组件在 `WATCHDOG_CHURN_WINDOW` 之内结束了
     `WATCHDOG_CHURN_SESSIONS` 次已连接的会话，按当前默认是半小时内十次。日志为
     `Watchdog tripped: component <name> has ended N connected sessions within ...`。
-    只有真正连上过的会话才计数，所以尚未插入的模块依旧会被无限期等待。
+    只有连上之后又持续到算作恢复的会话才计入，这也正是这条判据得以名副其实的原因：
+    更早结束的会话没有重置上面任何一个计时，第一条判据连同为它选定的一小时容忍度
+    一直在量它。尚未插入的模块根本到不了会话这一步，依旧会被无限期等待。
 - **`healthy`**——快照是新鲜的，且全部组件均已就绪。
 
 有一种故障**故意不**触发任何重启：快照文件写不出去。容器会变为 `unhealthy`，
