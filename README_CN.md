@@ -206,7 +206,7 @@ docker compose logs -f     # 跟踪启动过程
 | `NOTIFY_TIMEOUT` | `5.0` | 单次状态通知的时限 | 下限 1，上限为十秒的关停预算——它与 `SERIAL_CLOSE_TIMEOUT` 共用这一份预算：关停路径上先后等待这两者，两者之和不得超过常见运行时中最短的那个停机宽限期 |
 | `RECONNECT_BACKOFF_MIN` | `1.0` | 重连退避的最小间隔 | 无界。这一对的次序由另一侧保证——被钳制的是 `RECONNECT_BACKOFF_MAX` |
 | `RECONNECT_BACKOFF_MAX` | `30.0` | 重连退避的最大间隔 | 下限为 `RECONNECT_BACKOFF_MIN`：最大值低于最小值会让每次重试的等待越缩越短，而不是越拉越长。故意不设上限——等得更久只是推迟重连，而 `WATCHDOG_CHURN_WINDOW` 的下限会随之增大，重连频次判据因此不会掉队 |
-| `SERVICE_STABLE_SECONDS` | `60.0` | 会话持续多久才算恢复 | 下限 5：取零时，连上的那一瞬间就算恢复，而这正是本设置要防的事。不设上限，但并非没有代价：在一次会话持续这么久之前，没有任何组件会被标记为就绪，所以它与 `WATCHDOG_CHECK_INTERVAL` 之和必须小于 `WATCHDOG_DOWN_SECONDS`，否则启动通知会点明 |
+| `SERVICE_STABLE_SECONDS` | `60.0` | 会话持续多久才算恢复 | 下限 5：取零时，连上的那一瞬间就算恢复，而这正是本设置要防的事。不设上限，但并非没有代价，而且被两个方向的关系夹住，而不是被某个数字。在一次会话持续这么久之前，没有任何组件会被标记为就绪，所以它与 `WATCHDOG_CHECK_INTERVAL` 之和必须小于 `WATCHDOG_DOWN_SECONDS`；而只有算作恢复的会话才计数，所以它还必须小于探测计划能抛错的最快时间——`MODEM_PROBE_FAILURES × (MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT)`，**当前默认为 105**，对应 60 秒的窗口——否则模块自身的故障根本到不了 `WATCHDOG_CHURN_SESSIONS`。两者中的任何一条不成立，启动通知都会点明 |
 | `MODEM_PROBE_INTERVAL` | `30.0` | 心跳探测间隔 | 下限 1，上限为 `HEALTH_STALE_SECONDS` 的一半（当前默认 60）。刷新快照的正是这个探测，所以仅凭这一条循环也必须能让文件保持新鲜 |
 | `MODEM_PROBE_TIMEOUT` | `5.0` | 模块应答一次探测的时限 | 下限 1，上限为 `(HEALTH_STALE_SECONDS − MODEM_PROBE_FAILURES × MODEM_PROBE_INTERVAL) / (MODEM_PROBE_FAILURES + 1)`，**当前默认为 7.5**。模块应答慢时正是要调大它，而一旦越过该值，两次快照刷新之间最坏的间隔就会超出 `HEALTH_STALE_SECONDS`，健康检查会把正常工作的进程判为失败 |
 | `MODEM_PROBE_FAILURES` | `3` | 连续丢失多少次探测后触发重连 | 下限 1：计数达到该值时循环即抛错，所以取零与取一行为完全相同，却看起来像个开关。故意不设上限——更有耐心只是推迟重连，且 `MODEM_PROBE_TIMEOUT` 的上限会随它增大而收紧 |
