@@ -415,8 +415,12 @@ Three states are worth recognising:
     clock: `WATCHDOG_CHURN_SESSIONS` connected sessions ended by one component
     inside `WATCHDOG_CHURN_WINDOW`, ten in half an hour as shipped. The log line
     reads `Watchdog tripped: component <name> has ended N connected sessions
-    within ...`. Only sessions that actually connected are counted, so a modem
-    that has not been plugged in yet is still waited for indefinitely.
+    within ...`. Only sessions that connected and then held long enough to
+    count as a recovery are counted here, which is what makes this criterion
+    mean what it says: a session that ends sooner re-stamps neither clock
+    above, so the first of them has been measuring it all along, with the hour
+    of tolerance chosen for it. A modem that has not been plugged in yet never
+    reaches a session at all and is still waited for indefinitely.
 - **`healthy`** — the snapshot is fresh and every component is up.
 
 One failure deliberately does **not** restart anything: a snapshot file that

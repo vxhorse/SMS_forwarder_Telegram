@@ -1144,6 +1144,11 @@ async def test_a_component_that_keeps_reconnecting_is_counted(tmp_path, monkeypa
     Synchronised on the supervisor's own mark_up rather than on elapsed time,
     so the session really has been judged stable before it ends, and the test
     terminates on a condition it controls.
+
+    One half of a pair: the sibling below drives the same component through the
+    same failure without ever letting a session reach that judgement, and
+    requires the opposite result. Between them they say that what is counted is
+    the judgement, not the connection that preceded it.
     """
     clock = _ManualClock()
     judged_stable = asyncio.Event()
@@ -1193,6 +1198,72 @@ async def test_a_component_that_keeps_reconnecting_is_counted(tmp_path, monkeypa
     assert sessions == 4
     assert health.reconnect_counts()["device"] == 4
     assert health.churning(threshold=4) == "device"
+
+
+async def test_a_session_that_fails_before_it_is_judged_stable_is_not_counted(
+    tmp_path, monkeypatch
+):
+    """The other half of the pair above, and what the criterion means.
+
+    Connecting is not recovering. A session that ends before it has lasted
+    SERVICE_STABLE_SECONDS never reaches mark_up, so it re-stamps nothing: the
+    component's down clock has been running since the process started and goes
+    on running across every one of these cycles. That is the criterion the
+    failure belongs to, with the hour of tolerance chosen for it.
+
+    Counting these as well would put a second, far shorter ceiling underneath
+    that hour - the count would reach its threshold inside one backoff ladder -
+    and the process would exit and be restarted every few minutes for a fault
+    that is already being measured, tearing down every other component with it
+    on each pass.
+
+    No real time passes either way: the session always ends on its own failure,
+    so the stable window is never waited out, however long it is set to.
+    """
+    clock = _ManualClock()
+    health = HealthState(
+        ["device", "telegram"],
+        health_file=str(tmp_path / "healthy"),
+        clock=clock,
+        churn_window=10_000.0,
+    )
+    monkeypatch.setattr(config, "SERVICE_STABLE_SECONDS", 3600.0)
+
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+    supervisor.backoff_factory = lambda: Backoff(minimum=0.0, maximum=0.0)
+
+    sessions = 0
+
+    class FailsBeforeItSettles:
+        name = "device"
+
+        async def connect_once(self):
+            return None
+
+        async def run(self):
+            nonlocal sessions
+            sessions += 1
+            # The clock moves only where this test moves it, and it moves here
+            # so the criterion that does cover this shape has something to
+            # accumulate.
+            clock.advance(10.0)
+            if sessions >= 20:
+                shutdown.set()
+            raise RuntimeError("the API rejected the poll")
+
+        async def teardown(self):
+            return None
+
+    await asyncio.wait_for(
+        supervisor.run_service(FailsBeforeItSettles()), timeout=_FAILSAFE
+    )
+    assert sessions == 20
+    assert health.reconnect_counts()["device"] == 0
+    assert health.churning(threshold=2) is None
+    # Twenty sessions ended and the down clock never lost a second of them,
+    # which is what makes not counting them safe rather than merely quieter.
+    assert health.down_duration() == 200.0
 
 
 async def test_a_component_that_never_connects_is_never_counted(tmp_path):
@@ -1312,11 +1383,12 @@ async def test_the_churn_line_names_the_count_it_tripped_on():
 
 
 async def test_the_churn_line_does_not_diagnose_the_other_two_clocks():
-    """A component that fails inside SERVICE_STABLE_SECONDS is never marked up,
-    so its down clock has been accumulating the whole time - churn simply
-    reaches its threshold first. A line claiming neither other clock ever
-    accumulated would then be telling an operator something false about the
-    fault they are debugging, so the line states the criterion instead.
+    """Every counted session was judged recovered, so each one did re-stamp the
+    other two clocks - but a component that churns spends the gaps between its
+    sessions down, and this inspection can land in one of them, which is the
+    state set up here. A line announcing that the other two clocks read zero
+    would then be false at the moment it was printed, about the very fault
+    being debugged, so the line states the criterion instead.
     """
     shutdown = asyncio.Event()
     health = _StallHealth(

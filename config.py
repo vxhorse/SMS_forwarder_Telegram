@@ -536,6 +536,20 @@ if WATCHDOG_STALL_FLOOR > WATCHDOG_DOWN_SECONDS:
 # WATCHDOG_REFRESH_BUDGET to raise, which is longer than
 # SERVICE_STABLE_SECONDS.
 #
+# Only sessions that reached that recovery are counted, which is the same
+# sentence read backwards: what hides such a loop from the other two criteria
+# is exactly what makes it visible here. A session that ends before it
+# re-stamps nothing, so the down clock has been running throughout and
+# WATCHDOG_DOWN_SECONDS is already measuring that failure - counting those here
+# as well would put a second ceiling underneath it, shorter by an order of
+# magnitude, and the process would exit for a fault that was being measured
+# perfectly well. Both failures this criterion was built for clear the window
+# by construction at the values this file ships: the liveness probe takes
+# MODEM_PROBE_FAILURES x (MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT) to raise,
+# and the registration check at least MODEM_REGISTRATION_FAILURES x
+# MODEM_PROBE_INTERVAL, which are 105 and 90 seconds against a 60-second
+# window.
+#
 # Counting reconnections rather than lengthening the stable window is what
 # makes this cover the failures nobody has enumerated yet. It does not ask what
 # broke; it asks whether this component keeps connecting and disconnecting,
@@ -548,7 +562,9 @@ if WATCHDOG_STALL_FLOOR > WATCHDOG_DOWN_SECONDS:
 # something that was working stopped. The Telegram polling loop deliberately
 # does not retry anything, because a second backoff policy inside the loop
 # would compound with the supervisor's own, so every transient HTTP error ends
-# a connected session and counts here. On an intermittent link, or behind a
+# a connected session - and a bot that has been polling for longer than the
+# stable window, which is the ordinary state of one, ends a recovered session
+# and counts here. On an intermittent link, or behind a
 # proxy that comes and goes, a handful of those in half an hour says nothing is
 # wrong: messages are still being forwarded between them. Ten is chosen to sit
 # above that noise while still bounding detection of a real loop to roughly ten

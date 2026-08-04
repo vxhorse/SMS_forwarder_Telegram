@@ -54,10 +54,11 @@ class HealthState:
         # reinstate the startup deadline this project exists to remove.
         self._all_up_since: Optional[float] = None
         self.churn_window = churn_window
-        # When each component's connected sessions ended, most recent last.
-        # Only sessions that actually connected are recorded here - see
-        # Supervisor.run_service for why a component whose dependency has not
-        # appeared yet must never contribute to this.
+        # When each component's recovered sessions ended, most recent last.
+        # Only sessions that connected and then lasted long enough to be judged
+        # recovered are recorded here - see Supervisor._serve_session for why
+        # neither a component whose dependency has not appeared yet nor one
+        # that fails before that judgement may contribute to this.
         self._session_ends = {name: deque() for name in service_names}
 
     def mark_up(self, name: str) -> None:
@@ -117,13 +118,18 @@ class HealthState:
         service["progress"] = self._clock()
 
     def record_session_end(self, name: str) -> None:
-        """Record that one connected session of this component has ended.
+        """Record that one recovered session of this component has ended.
 
         Counted separately from mark_down because they answer different
         questions. mark_down says the component is not working now;
         this says it has stopped working again, which is the only evidence
         that survives a component whose every failure is followed by a
         recovery long enough to reset everything else.
+
+        Which is also why the caller reports only the sessions that reached
+        that recovery. A session that ended before it did reset nothing, so
+        the evidence of it is still there in the down clock, and the count is
+        for what leaves no other trace.
         """
         ends = self._session_ends.get(name)
         if ends is None:

@@ -146,17 +146,8 @@ class Supervisor:
 
         try:
             while not self.shutdown_event.is_set():
-                # Whether this attempt got as far as a connected session. Only
-                # those are counted as reconnections: a component whose
-                # dependency has not appeared yet fails inside connect_once()
-                # on every attempt, for as long as that takes, and that is a
-                # waiting state this project must never put a ceiling on.
-                # Something that has never connected is already covered by the
-                # down criterion and its far longer tolerance.
-                session_began = False
                 try:
                     await service.connect_once()
-                    session_began = True
                     await self._serve_session(service, backoff, throttle)
                 except FatalConfigError:
                     self.exit_reason = "fatal_config"
@@ -164,8 +155,6 @@ class Supervisor:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    if session_began:
-                        self.health.record_session_end(service.name)
                     self.health.mark_down(service.name, exc)
                     if throttle.should_log():
                         logger.warning(
@@ -211,6 +200,22 @@ class Supervisor:
         but must never call mark_up() there: reporting itself up once per cycle
         would defeat the rule from the inside.
 
+        The same judgement decides what the churn criterion counts, which is
+        why the count is recorded here rather than by the caller. Only a
+        session that reached the point above is counted, because only that
+        point re-stamps the clocks the other two criteria measure from: a
+        session that ends before it resets nothing, and its component's down
+        clock has been running since the process started and goes on running.
+        That failure is the down criterion's, with the tolerance chosen for it,
+        and counting it here as well would put a far shorter ceiling
+        underneath. Keeping the flag and the count in one method is also what
+        keeps this independent of when the caller marks the component down.
+
+        This is what covers the waiting state as well. A component whose
+        dependency has not appeared yet fails inside connect_once(), never
+        reaches here at all, and so can never be counted however long it
+        waits - which is the ceiling this project must never put on startup.
+
         Anything that ends the session is raised to the supervision loop, which
         treats it as a failed attempt.
         """
@@ -235,6 +240,14 @@ class Supervisor:
                 self.health.mark_up(service.name)
                 backoff.reset()
                 throttle.reset()
+        except Exception:
+            # A session that was never judged stable is not a reconnection.
+            # CancelledError is not caught here - it derives from
+            # BaseException - so a component stopped while healthy leaves no
+            # count behind either; nothing broke, the process is stopping.
+            if stable:
+                self.health.record_session_end(service.name)
+            raise
         finally:
             for task in (run_task, shutdown_task):
                 task.cancel()
@@ -294,6 +307,14 @@ class Supervisor:
         first two ask what state a component is in now; this one asks how many
         times it has been in that state lately, which is the only reading such
         a loop leaves behind.
+
+        Only recovered sessions are counted, and the two statements above are
+        the same statement: what makes such a loop invisible to the first
+        criterion is exactly what makes it visible to this one. A session that
+        ends sooner re-stamps nothing, so the down clock has been running
+        throughout and the first criterion is already measuring it - counting
+        those here as well would hand the same failure a second ceiling, orders
+        of magnitude shorter than the tolerance chosen for it.
 
         A snapshot that stops being written while every component loop keeps
         advancing is caught by snapshot_age, but only reported: the loops are
@@ -357,11 +378,12 @@ class Supervisor:
                 # same mapping churning() just read.
                 observed = self.health.reconnect_counts()[churner]
                 # States the criterion rather than diagnosing the other two.
-                # A component that fails inside SERVICE_STABLE_SECONDS is never
-                # marked up, so its down clock has been accumulating all along
-                # and this one merely reached its threshold first - a line
-                # claiming otherwise would describe a fault that is not the one
-                # being debugged.
+                # Every counted session was judged recovered, so each of them
+                # did re-stamp both other clocks - but a component that churns
+                # spends the gaps between its sessions down, and this reading
+                # can land in one of them. A line announcing that the other two
+                # clocks read zero would then be false at the moment it was
+                # printed, about the very fault being debugged.
                 logger.error(
                     f"Watchdog tripped: component {churner} has ended "
                     f"{observed} connected sessions within "
