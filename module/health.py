@@ -177,10 +177,13 @@ class HealthState:
         that makes it age on its own is a file that cannot be written, which
         restarting the process cannot fix. See snapshot_age().
 
-        None means the system has not yet been fully up even once, which is a
-        legitimate waiting state - hardware can appear long after the process
-        does. Only a system that was healthy and then stopped advancing is
-        stalled.
+        None means either that the system has not yet been fully up even once
+        - a legitimate waiting state, since hardware can appear long after the
+        process does - or that every component is currently down, which
+        leaves nothing here to measure; that second case is down_duration()'s
+        business, not this reading's. Only a system with at least one
+        component currently up, and that was healthy at some point before, is
+        ever stalled.
         """
         if self._all_up_since is None:
             return None

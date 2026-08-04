@@ -290,8 +290,13 @@ class Supervisor:
         here between two inspections.
         """
         # Seeded per loop rather than per process: the threshold it throttles
-        # against is a parameter of this loop.
-        snapshot_throttle = _LogThrottle(verbose_count=1, interval=stall_threshold)
+        # against is a parameter of this loop. verbose_count=0 rather than the
+        # usual burst: the condition below cannot turn true before real time
+        # since construction has already reached stall_threshold - the same
+        # span _LogThrottle would then require before letting a second message
+        # through - so a verbose first message would leave a second message
+        # right behind it, immediately, on the very next inspection.
+        snapshot_throttle = _LogThrottle(verbose_count=0, interval=stall_threshold)
 
         while not self.shutdown_event.is_set():
             try:
