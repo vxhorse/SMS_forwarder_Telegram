@@ -17,6 +17,15 @@ env/
 .venv/
 *.log
 logs/
+# A log is not always named .log - the pattern above matches the suffix, not
+# the contents - and an image saved with docker save is a whole prior image in
+# one file, carrying everything that was in it. Both are ordinary things to
+# leave lying in a working directory, and both are large, so excluding them
+# keeps them out of the context upload as well as out of any image.
+**/*.tar
+**/*.tar.gz
+**/*.tgz
+**/*log.txt
 Dockerfile
 docker-compose.yml
 docker-compose.yaml

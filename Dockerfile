@@ -19,7 +19,18 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Named files rather than COPY . ., so the image holds exactly this list and
+# nothing the build context happens to contain. The .dockerignore below it is a
+# deny-list, and a deny-list has to anticipate every kind of file that must not
+# ship; whatever it fails to anticipate is copied in and then published, where
+# it cannot be withdrawn - deleting a tag unlinks the name but leaves the layer
+# fetchable by digest. This project logs message data by nature, so the file it
+# fails to anticipate is likelier than not to be one carrying message data.
+# An allow-list can only fail the other way, and a file missing from here stops
+# the process on its first import instead of travelling to everyone who pulls.
+# LICENSE travels because MIT requires the notice to accompany the software.
+COPY main.py logger.py config.py healthcheck.py LICENSE ./
+COPY module/ ./module/
 
 # tini as init, so SIGTERM is delivered to the application rather than absorbed.
 ENTRYPOINT ["/usr/bin/tini", "--"]
