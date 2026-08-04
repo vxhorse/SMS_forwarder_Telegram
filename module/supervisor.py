@@ -204,13 +204,14 @@ class Supervisor:
         why the count is recorded here rather than by the caller. Only a
         session that reached the point above is counted, because only that
         point re-stamps the clocks the other two criteria measure from: a
-        session that ends before it resets nothing, so its component's down
-        clock goes on running from wherever the last recovery left it - from
-        process start for a component that has never had one. That failure is
-        the down criterion's, with the tolerance chosen for it, and counting it
-        here as well would put a far shorter ceiling underneath. Keeping the
-        flag and the count in one method is also what keeps this independent of
-        when the caller marks the component down.
+        session that ends before that point resets nothing, so its
+        component's down clock goes on running from wherever the last
+        recovery left it - from process start for a component that has never
+        had one. That failure is the down criterion's, with the tolerance
+        chosen for it, and counting it here as well would put a far shorter
+        ceiling underneath. Keeping the flag and the count in one method is
+        also what keeps this independent of when the caller marks the
+        component down.
 
         "From the last recovery" is the whole of the guarantee, and a component
         that alternates between the two falls between them: see the known
@@ -313,28 +314,20 @@ class Supervisor:
         times it has been in that state lately, which is the only reading such
         a loop leaves behind.
 
-        Only recovered sessions are counted, and the two statements above are
-        the same statement: what makes such a loop invisible to the first
-        criterion is exactly what makes it visible to this one. A session that
-        ends sooner re-stamps nothing, so the down clock keeps running from the
-        last recovery and the first criterion is already measuring it -
-        counting those here as well would hand the same failure a second
-        ceiling, orders of magnitude shorter than the tolerance chosen for it.
-        A component that mixes the two shapes is measured fully by neither; the
-        known limitation beside WATCHDOG_CHURN_SESSIONS in config.py says what
-        that leaves visible.
+        Only recovered sessions are counted, for the same reason
+        _serve_session gives for recording them there: see
+        Supervisor._serve_session for the judgement and its known limitation.
 
         A snapshot that stops being written while every component loop keeps
-        advancing is caught by snapshot_age, but only reported: the loops are
-        demonstrably running, so the write itself is what failed, and a
-        restart cannot make an unwritable path writable. It would instead
-        repeat the whole startup - reinitialising the modem and re-reading its
-        stored messages - every few minutes for ever, which is worse than the
-        fault it is reacting to. The healthcheck fails on the file's own mtime
-        regardless, so the fault stays visible without a restart.
+        advancing is caught by snapshot_age, and is reported rather than
+        acted on: see snapshot_age() for why a restart cannot fix an
+        unwritable path.
 
-        Both exit thresholds sit far above any normal cycle, so neither fires
-        on a component that is merely reconnecting.
+        Both duration thresholds sit far above any normal cycle. The churn
+        count is the one criterion that does act on repeated reconnection,
+        and only past WATCHDOG_CHURN_SESSIONS recovered sessions inside the
+        window - see WATCHDOG_CHURN_SESSIONS in config.py for why that
+        threshold is where it is.
 
         None of the readings is adjusted here. Each is measured by HealthState
         against its own clock, and the one correction a stall reading needs -
@@ -403,14 +396,11 @@ class Supervisor:
                 self.shutdown_event.set()
                 return
 
-            # Only asked while nothing is reported down, which down_duration
-            # reading zero is exactly the statement of. The snapshot is written
-            # only while every component is up, so anything that is down stops
-            # it being refreshed too; acting on the age in that state would put
-            # a second, far shorter ceiling on a component that is merely
-            # reconnecting, and would report it as the wrong kind of failure.
-            # What is down is already on the clock above, with the tolerance
-            # chosen for it.
+            # Only asked while nothing is reported down. A component that is
+            # down puts the system in a state the far longer down clock above
+            # is already measuring, with the tolerance chosen for it; exiting
+            # as "stalled" in that window would name the wrong failure for a
+            # component that is merely reconnecting.
             stalled = self.health.stall_duration() if duration == 0.0 else None
 
             # None means the system has not been fully up even once. That is a
@@ -428,14 +418,9 @@ class Supervisor:
                 return
 
             # Only reached when no component loop is behind, which is what
-            # makes this reading attributable: every loop is advancing and the
-            # snapshot still is not being written, so the write itself is what
-            # failed. Reported rather than acted on. Restarting cannot make an
-            # unwritable path writable, and doing it on a timer would repeat
-            # the whole startup - reinitialising the modem and re-reading its
-            # stored messages - every few minutes for ever, which is a worse
-            # outcome than the fault. The healthcheck fails on the file's own
-            # mtime regardless, so this stays visible without that.
+            # makes this reading attributable: every loop is advancing, so a
+            # snapshot that still is not being written means the write itself
+            # is what failed.
             age = self.health.snapshot_age() if duration == 0.0 else None
             if age is not None and age >= stall_threshold:
                 if snapshot_throttle.should_log():

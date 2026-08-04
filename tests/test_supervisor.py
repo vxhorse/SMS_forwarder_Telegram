@@ -656,11 +656,10 @@ async def test_the_down_reason_wins_when_both_criteria_are_met_at_once():
 
 
 async def test_a_component_that_is_down_is_not_also_reported_as_stalled():
-    """The snapshot is only written while every component is up, so anything
-    that is down stops it being refreshed as a matter of course. Treating that
-    age as a stall would put a second ceiling on a reconnecting component, one
-    fifteen times shorter than the tolerance chosen for it, and would blame a
-    block for a failure that is nothing of the kind.
+    """A component that is down puts the system in a state the far longer
+    down clock is already measuring, with the tolerance chosen for it.
+    Reporting it as stalled as well would name the wrong failure for a
+    component that is merely reconnecting.
     """
     shutdown = asyncio.Event()
     # Well past the stall threshold, well inside the down threshold: exactly
