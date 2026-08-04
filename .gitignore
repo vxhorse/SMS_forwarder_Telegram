@@ -13,8 +13,11 @@ venv/
 env/
 .venv/
 
-# Log files
+# Log files. A log is not always named .log, and this project's logs carry
+# message data, so the .txt spelling is named too rather than left to be
+# noticed by whoever runs git add -A next.
 *.log
+*log.txt
 logs/
 
 # Docker related
@@ -36,6 +39,10 @@ docker-compose.yaml.bak-*
 
 # Local workflow documents, not in repository
 docs/superpowers/
+# Named here rather than left to the .gitignore that the tooling writes inside
+# its own subdirectory: that file covers the subdirectory it sits in and
+# nothing else, so a note written one level up was never actually ignored.
+.superpowers/
 
 # Local deployment records name specific hosts
 docs/deployments/
