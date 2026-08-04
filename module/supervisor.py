@@ -123,8 +123,10 @@ class Supervisor:
     or in main.py:
       1. SIGTERM / SIGINT
       2. FatalConfigError, which restarting cannot fix but which must be visible
-      3. The watchdog, once a component has been down past the threshold or
-         the health snapshot has gone unrefreshed past its own
+      3. The watchdog, once a component has been down past its threshold or a
+         component loop has stopped advancing past its own. An unwritable
+         health snapshot is reported by the same watchdog but is not among
+         these three: restarting cannot fix an unwritable path.
     """
 
     def __init__(self, health: HealthState, shutdown_event: asyncio.Event):
@@ -258,7 +260,8 @@ class Supervisor:
         interval: float = config.WATCHDOG_CHECK_INTERVAL,
         stall_threshold: float = config.WATCHDOG_STALL_SECONDS,
     ) -> None:
-        """Exit the process on either of the two ways a component can be lost.
+        """Exit the process on either of the two ways a component can be lost;
+        report, without exiting, the one way the snapshot file can be lost.
 
         A component that fails loudly is caught by down_duration: it raised,
         the supervisor marked it down, and the clock has been running since.
@@ -268,15 +271,28 @@ class Supervisor:
         has stopped reporting that it advanced. Without this second check that
         failure is invisible and the process sits there forever.
 
-        Both thresholds sit far above any normal cycle, so neither fires on a
-        component that is merely reconnecting.
+        A snapshot that stops being written while every component loop keeps
+        advancing is caught by snapshot_age, but only reported: the loops are
+        demonstrably running, so the write itself is what failed, and a
+        restart cannot make an unwritable path writable. It would instead
+        repeat the whole startup - reinitialising the modem and re-reading its
+        stored messages - every few minutes for ever, which is worse than the
+        fault it is reacting to. The healthcheck fails on the file's own mtime
+        regardless, so the fault stays visible without a restart.
 
-        Neither reading is adjusted here. Both are measured by HealthState
+        Both exit thresholds sit far above any normal cycle, so neither fires
+        on a component that is merely reconnecting.
+
+        None of the readings is adjusted here. Each is measured by HealthState
         against its own clock, and the one correction a stall reading needs -
         discounting the age an outage leaves on the snapshot - is applied where
         the moment of the recovery is known exactly rather than sampled from
         here between two inspections.
         """
+        # Seeded per loop rather than per process: the threshold it throttles
+        # against is a parameter of this loop.
+        snapshot_throttle = _LogThrottle(verbose_count=1, interval=stall_threshold)
+
         while not self.shutdown_event.is_set():
             try:
                 await asyncio.wait_for(self.shutdown_event.wait(), timeout=interval)
@@ -310,13 +326,32 @@ class Supervisor:
             # killed for waiting.
             if stalled is not None and stalled >= stall_threshold:
                 logger.error(
-                    f"Watchdog tripped: nothing has made progress for "
+                    f"Watchdog tripped: a component loop has not advanced for "
                     f"{stalled:.0f}s (threshold {stall_threshold:.0f}s) while "
-                    f"every component still reports up. Either a component "
-                    f"loop has stopped advancing without failing, or "
-                    f"HEALTH_FILE can no longer be written; exiting so the "
-                    f"container runtime can restart everything"
+                    f"still reporting up; exiting so the container runtime can "
+                    f"restart everything"
                 )
                 self.exit_reason = "stalled"
                 self.shutdown_event.set()
                 return
+
+            # Only reached when no component loop is behind, which is what
+            # makes this reading attributable: every loop is advancing and the
+            # snapshot still is not being written, so the write itself is what
+            # failed. Reported rather than acted on. Restarting cannot make an
+            # unwritable path writable, and doing it on a timer would repeat
+            # the whole startup - reinitialising the modem and re-reading its
+            # stored messages - every few minutes for ever, which is a worse
+            # outcome than the fault. The healthcheck fails on the file's own
+            # mtime regardless, so this stays visible without that.
+            age = self.health.snapshot_age() if duration == 0.0 else None
+            if age is not None and age >= stall_threshold:
+                if snapshot_throttle.should_log():
+                    logger.error(
+                        f"HEALTH_FILE has not been written for {age:.0f}s "
+                        f"(threshold {stall_threshold:.0f}s) while every "
+                        f"component loop is still advancing: the snapshot "
+                        f"cannot be written. The container healthcheck will "
+                        f"fail until it can. Not restarting - a restart cannot "
+                        f"fix an unwritable path"
+                    )
