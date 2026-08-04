@@ -86,12 +86,12 @@ PROXY_URL = os.getenv("PROXY_URL") or None
 # The timings the Telegram polling loop is built from.
 #
 # Deliberately not settable from the environment, unlike almost everything else
-# here. WATCHDOG_STALL_FLOOR below is derived from them, and that floor is only
-# correct while it describes the loop it is measuring: lengthening a deadline
-# here without moving the floor would put the stall threshold underneath the
-# time one working iteration can legitimately take, and the watchdog would
-# restart a process that is doing its job. Keeping them together is what makes
-# that impossible to do by halves.
+# here. The relationship below - that the long poll has to stay under the
+# request deadline - is the one relationship in this file with no clamp and no
+# startup notice behind it, and it can do without either only while neither
+# side can be reached from the environment. WATCHDOG_STALL_FLOOR is derived
+# from the request deadline, the attempt count and the retry delay by name, so
+# it follows those three wherever they go.
 #
 # Deadline for one whole HTTP request to the API.
 TELEGRAM_REQUEST_TIMEOUT = 60.0
@@ -113,17 +113,33 @@ HEALTH_FILE = os.getenv("HEALTH_FILE", "/tmp/healthy")
 # shorter than the interval at which the file can possibly be rewritten, and
 # the healthcheck would fail a process that is working perfectly. Two seconds
 # is that bound.
+#
+# Deliberately unbounded above: this is the operator's stated tolerance for a
+# stale snapshot, and both probe bounds below are derived from it, so widening
+# it loosens them in step rather than leaving them behind.
 HEALTH_STALE_SECONDS = _clamped(
     "HEALTH_STALE_SECONDS", int(os.getenv("HEALTH_STALE_SECONDS", "120")), low=2
 )
 # Exit the process once any component has been down this long, letting the
 # container runtime restart everything as a last resort.
+#
+# Deliberately unbounded above: it is the operator's stated tolerance for
+# losing a component, and it is itself the ceiling on WATCHDOG_STALL_SECONDS,
+# so raising it loosens that in step. What it has from below is a relationship
+# rather than a number, stated with the notice for it further down.
 WATCHDOG_DOWN_SECONDS = int(os.getenv("WATCHDOG_DOWN_SECONDS", "3600"))
 # Exponential backoff bounds for component reconnection, in seconds.
 RECONNECT_BACKOFF_MIN = float(os.getenv("RECONNECT_BACKOFF_MIN", "1.0"))
-# Floored at RECONNECT_BACKOFF_MIN: a maximum below the minimum would make
-# each retry's backoff shrink instead of grow, the opposite of what an
-# exponential backoff is for.
+# The maximum bounds the base the backoff doubles toward, not the delay taken:
+# Backoff.next_delay multiplies it by 1 +/- 20% of jitter, which is what keeps
+# two components from retrying in lockstep, so the longest wait in practice is
+# a fifth above this figure.
+#
+# Floored at RECONNECT_BACKOFF_MIN: a maximum below the minimum would make each
+# retry's backoff shrink instead of grow, the opposite of what an exponential
+# backoff is for. Deliberately unbounded above: a longer wait only delays a
+# reconnection, and WATCHDOG_CHURN_WINDOW's floor grows with it, so the churn
+# criterion keeps pace.
 RECONNECT_BACKOFF_MAX = _clamped(
     "RECONNECT_BACKOFF_MAX",
     float(os.getenv("RECONNECT_BACKOFF_MAX", "30.0")),
@@ -225,12 +241,19 @@ NOTIFY_TIMEOUT = _clamped(
 # bind-mounted host /dev; running directly on a host it is just /dev.
 SMS_DEV_ROOT = os.getenv("SMS_DEV_ROOT", "/dev")
 # How long a candidate port has to answer AT during discovery, in seconds.
+# Deliberately unbounded: discovery runs before any session exists, and waiting
+# for hardware is not a wait this service cuts short.
 PORT_PROBE_TIMEOUT = float(os.getenv("PORT_PROBE_TIMEOUT", "3.0"))
 
-# Timeout for a single AT command to produce a terminating response, in seconds.
+# Timeout for a single AT command to produce a terminating response, in
+# seconds. Deliberately unbounded: it bounds one command rather than the loop,
+# and a command that outlasts the liveness probe's own deadline is caught by
+# that probe and the reconnect it forces.
 AT_COMMAND_TIMEOUT = float(os.getenv("AT_COMMAND_TIMEOUT", "3.0"))
 # Longer timeout for commands the modem processes slowly (AT&F, AT+CFUN, AT&W,
-# and the stored-message listing AT+CMGL=4).
+# and the stored-message listing AT+CMGL=4). Deliberately unbounded for the
+# same reason, and because these run during setup, which is a wait this service
+# never puts a ceiling on.
 AT_SLOW_COMMAND_TIMEOUT = float(os.getenv("AT_SLOW_COMMAND_TIMEOUT", "10.0"))
 
 # How long the serial transport gets to flush what it is still holding when the
@@ -304,7 +327,10 @@ MODEM_PROBE_INTERVAL = _clamped(
 # Consecutive misses that trigger a reconnect. Floored at one: the loop raises
 # once the count reaches this figure, so zero behaves exactly as one while
 # reading like an off switch, and a number that looks like a switch and is not
-# one is what MODEM_REGISTRATION_CHECK exists separately to avoid.
+# one is what MODEM_REGISTRATION_CHECK exists separately to avoid. Deliberately
+# unbounded above: more patience only delays a reconnect, and
+# MODEM_PROBE_TIMEOUT's ceiling tightens as this count grows, so the refresh
+# gap cannot widen behind it.
 MODEM_PROBE_FAILURES = _clamped(
     "MODEM_PROBE_FAILURES", int(os.getenv("MODEM_PROBE_FAILURES", "3")), low=1
 )
@@ -396,10 +422,15 @@ MODEM_REGISTRATION_FAILURES = _clamped(
 # at the values above is longer than SERVICE_STABLE_SECONDS - so every cycle
 # reaches the point where the session counts as recovered before the point
 # where it fails. Each recovery re-stamps the health record, so neither the down
-# clock nor the stall clock accumulates across cycles, and the snapshot goes
-# stale for only the width of one teardown, so the container healthcheck stays
-# green through it too. Meanwhile every cycle reinitialises the radio and
-# rewrites the modem's stored profile.
+# clock nor the stall clock accumulates across cycles. The snapshot is not
+# re-stamped with them: it is written only while every component is up, so its
+# mtime stops advancing from the failure until the next recovery - a gap that
+# always includes SERVICE_STABLE_SECONDS, since nothing is marked up before
+# that, on top of one probe interval and however long this hardware takes to
+# connect. The container healthcheck stays green through a cycle only while
+# that sum stays inside HEALTH_STALE_SECONDS, which at the values this file
+# ships leaves the connect time about half a minute. Meanwhile every cycle
+# reinitialises the radio and rewrites the modem's stored profile.
 #
 # WATCHDOG_CHURN_SESSIONS below does see that loop, because it counts ended
 # sessions rather than reading a clock each recovery resets: at the values above
@@ -413,14 +444,14 @@ MODEM_REGISTRATION_FAILURES = _clamped(
 # Turning it on is a decision to take once the answer is known for the SIM and
 # the network in use, and costs nothing to defer: setup asks the modem to
 # report registration changes unasked, so the state is still parsed, still
-# published in the health snapshot and still logged with this off. What is
-# deferred is only whether a run of unregistered readings ends the session.
-# Read the registration field of the snapshot over a period that includes
-# ordinary message traffic; if it settles on 1 or 5 - or on 6 or 7, registered
-# for messages alone - then the question has a true answer on that network and
-# MODEM_REGISTRATION_CHECK=1 buys the detection it was built for. If it sits at
-# 0 or 2 while messages keep arriving, leave it off: that is the network this
-# check cannot describe.
+# published in the health snapshot and, at LOG_LEVEL=DEBUG, still logged with
+# this off. What is deferred is only whether a run of unregistered readings
+# ends the session. Read the registration field of the snapshot over a period
+# that includes ordinary message traffic; if it settles on 1 or 5 - or on 6 or
+# 7, registered for messages alone - then the question has a true answer on
+# that network and MODEM_REGISTRATION_CHECK=1 buys the detection it was built
+# for. If it sits at 0 or 2 while messages keep arriving, leave it off: that is
+# the network this check cannot describe.
 MODEM_REGISTRATION_CHECK = os.getenv(
     "MODEM_REGISTRATION_CHECK", "0"
 ).strip().lower() not in ("0", "false", "no", "off")
@@ -635,16 +666,16 @@ if WATCHDOG_STALL_FLOOR > WATCHDOG_DOWN_SECONDS:
 # would compound with the supervisor's own, so every transient HTTP error ends
 # a connected session - and a bot that has been polling for longer than the
 # stable window, which is the ordinary state of one, ends a recovered session
-# and counts here. On an intermittent link, or behind a
-# proxy that comes and goes, a handful of those in half an hour says nothing is
-# wrong: messages are still being forwarded between them. Ten is chosen to sit
-# above that noise while still bounding detection of a real loop to roughly ten
-# cycles - about twenty minutes for the slowest failure this criterion is for,
-# against the window below. That is a margin of a few hundred seconds, not a
-# comfortable one, which is exactly why the window carries the derived floor it
-# does: the same arithmetic that makes the margin narrow is what raises the
-# window when a longer backoff or a slower probe schedule would otherwise close
-# it altogether.
+# and counts here. On an intermittent link, or behind a proxy that comes and
+# goes, a handful of those in half an hour says nothing is wrong: messages are
+# still being forwarded between them. Ten is chosen to sit above that noise
+# while still bounding detection of a real loop to roughly ten cycles - about
+# twenty minutes for the slowest failure this criterion is for, against the
+# window below. That is a margin of a few hundred seconds, not a comfortable
+# one, which is exactly why the window carries the derived floor it does: the
+# same arithmetic that makes the margin narrow is what raises the window when a
+# longer backoff or a slower probe schedule would otherwise close it
+# altogether.
 #
 # Floored at two for the same reason as MODEM_REGISTRATION_FAILURES: one
 # reconnection is not a pattern, and at zero or one a single transient failure
@@ -659,6 +690,10 @@ WATCHDOG_CHURN_SESSIONS = _clamped(
 # raise. Under that floor the count can never reach the threshold and the
 # criterion is simply switched off while looking enabled. It is a floor against
 # a false negative, unlike most of the bounds in this file.
+#
+# The backoff term is the setting rather than the wait actually taken, which
+# jitter puts up to a fifth above it, so the floor comes close to the slowest
+# cycle rather than bounding it exactly.
 #
 # The "longest to raise" term is the heartbeat's, because that loop is where a
 # session ends by counting rather than by one event, and both of the ways it
