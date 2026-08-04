@@ -53,6 +53,11 @@ def _clamped(
             bound = high_label if high_label is not None else f"{high:g}"
             reason = f"ceiling is {bound}"
         else:
+            # Reachable only when low moved the value, so low is never None
+            # here given how every call site below pairs its bounds - kept
+            # explicit anyway, so a future call site that broke that pairing
+            # fails loudly here rather than crashing on the format below.
+            assert low is not None, f"{name} changed with no bound to blame it on"
             bound = low_label if low_label is not None else f"{low:g}"
             reason = f"floor is {bound}"
         CLAMP_NOTICES.append(
@@ -216,8 +221,12 @@ SERIAL_CLOSE_TIMEOUT = _clamped(
     # every disconnect outright, which is a worse answer to a tight budget
     # than overrunning it.
     high=max(SERIAL_CLOSE_TIMEOUT_FLOOR, _serial_close_ceiling),
+    # Listed as inputs rather than as the subtraction they feed, because the
+    # two can collide - max() above then reports the floor's value, not the
+    # subtraction's, and an expression here would state a number the notice
+    # does not actually put in force.
     high_label=(
-        f"STOP_BUDGET_SECONDS={STOP_BUDGET_SECONDS:g} minus "
+        f"STOP_BUDGET_SECONDS={STOP_BUDGET_SECONDS:g}, "
         f"NOTIFY_TIMEOUT={NOTIFY_TIMEOUT:g}"
     ),
 )

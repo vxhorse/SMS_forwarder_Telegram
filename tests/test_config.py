@@ -144,14 +144,20 @@ def test_a_notify_deadline_that_eats_the_whole_budget_is_reported(monkeypatch):
     """With nothing left for the close, the floor wins - aborting every
     disconnect before the transport could flush would be worse than overrunning
     the budget. The invariant no longer holds for that configuration, and
-    saying so is the only thing that keeps it from being a silent one."""
+    saying so is the only thing that keeps it from being a silent one.
+
+    SERIAL_CLOSE_TIMEOUT is pinned at its own floor here rather than left at
+    the default: requested then equals applied, so _clamped's own notice
+    never fires, and the only thing left that can catch the broken budget is
+    the dedicated collision notice this test is named after."""
     monkeypatch.setenv("NOTIFY_TIMEOUT", "10")
+    monkeypatch.setenv("SERIAL_CLOSE_TIMEOUT", "1")
     reloaded = importlib.reload(config_module)
     assert reloaded.SERIAL_CLOSE_TIMEOUT == reloaded.SERIAL_CLOSE_TIMEOUT_FLOOR
-    assert any(
-        "SERIAL_CLOSE_TIMEOUT" in notice and "NOTIFY_TIMEOUT" in notice
-        for notice in reloaded.CLAMP_NOTICES
-    ), reloaded.CLAMP_NOTICES
+    matches = _notices_for(reloaded, "SERIAL_CLOSE_TIMEOUT")
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "NOTIFY_TIMEOUT" in matches[0]
+    assert "STOP_BUDGET_SECONDS" in matches[0]
 
 
 def test_the_probe_deadline_is_capped_against_the_staleness_window(monkeypatch):
@@ -171,14 +177,20 @@ def test_the_probe_deadline_is_capped_against_the_staleness_window(monkeypatch):
 def test_a_probe_schedule_with_no_room_left_for_a_deadline_is_reported(monkeypatch):
     """F * I alone can fill the window, leaving no positive T at all. The floor
     wins, because a deadline of zero abandons every probe before it is
-    attempted, and the notice says the window no longer holds."""
+    attempted, and the notice says the window no longer holds.
+
+    MODEM_PROBE_TIMEOUT is pinned at its own floor here rather than left at
+    the default: requested then equals applied, so _clamped's own notice
+    never fires, and the only thing left that can catch the broken window is
+    the dedicated collision notice this test is named after."""
     monkeypatch.setenv("MODEM_PROBE_INTERVAL", "40")
+    monkeypatch.setenv("MODEM_PROBE_TIMEOUT", "1")
     reloaded = importlib.reload(config_module)
     assert reloaded.MODEM_PROBE_TIMEOUT == reloaded.MODEM_PROBE_TIMEOUT_FLOOR
-    assert any(
-        "MODEM_PROBE_TIMEOUT" in notice and "HEALTH_STALE_SECONDS" in notice
-        for notice in reloaded.CLAMP_NOTICES
-    ), reloaded.CLAMP_NOTICES
+    matches = _notices_for(reloaded, "MODEM_PROBE_TIMEOUT")
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "worst refresh gap" in matches[0]
+    assert "HEALTH_STALE_SECONDS" in matches[0]
 
 
 # --- A clamp notice names the setting a derived bound came from, not just --
@@ -215,6 +227,19 @@ def test_the_plain_probe_ceiling_notice_names_its_origin(monkeypatch):
     matches = _notices_for(reloaded, "MODEM_PROBE_TIMEOUT")
     assert len(matches) == 1, reloaded.CLAMP_NOTICES
     assert "HEALTH_STALE_SECONDS" in matches[0]
+
+
+def test_the_backoff_floor_notice_names_reconnect_backoff_min(monkeypatch):
+    """RECONNECT_BACKOFF_MAX's floor is RECONNECT_BACKOFF_MIN, not a fixed
+    number - the notice has to say so, or an operator who set a ceiling below
+    the floor has nothing telling them which other setting to look at."""
+    monkeypatch.setenv("RECONNECT_BACKOFF_MIN", "10")
+    monkeypatch.setenv("RECONNECT_BACKOFF_MAX", "5")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.RECONNECT_BACKOFF_MAX == reloaded.RECONNECT_BACKOFF_MIN
+    matches = _notices_for(reloaded, "RECONNECT_BACKOFF_MAX")
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "RECONNECT_BACKOFF_MIN=10" in matches[0]
 
 
 # --- WATCHDOG_STALL_SECONDS: two derived bounds instead of two fixed ones ----
@@ -351,6 +376,11 @@ _TUNINGS = [
     # staleness window. Only the dedicated collision notice below catches
     # this one; nothing else in CLAMP_NOTICES mentions the setting at all.
     {"MODEM_PROBE_INTERVAL": "40", "MODEM_PROBE_TIMEOUT": "1"},
+    # The same shape on the shutdown path: requesting the close deadline at
+    # exactly its own floor leaves _clamped silent there too, even though
+    # NOTIFY_TIMEOUT alone already consumes the whole budget. Only the
+    # dedicated collision notice below catches this one.
+    {"NOTIFY_TIMEOUT": "10", "SERIAL_CLOSE_TIMEOUT": "1"},
 ]
 
 
