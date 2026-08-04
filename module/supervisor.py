@@ -123,8 +123,11 @@ class Supervisor:
     or in main.py:
       1. SIGTERM / SIGINT
       2. FatalConfigError, which restarting cannot fix but which must be visible
-      3. The watchdog, once a component has been down past the threshold or
-         the health snapshot has gone unrefreshed past its own
+      3. The watchdog, once a component has been down past its threshold, a
+         component loop has stopped advancing past its own, or a component has
+         ended too many connected sessions inside the churn window. An
+         unwritable health snapshot is reported by the same watchdog but is not
+         among these three: restarting cannot fix an unwritable path.
     """
 
     def __init__(self, health: HealthState, shutdown_event: asyncio.Event):
@@ -197,6 +200,27 @@ class Supervisor:
         but must never call mark_up() there: reporting itself up once per cycle
         would defeat the rule from the inside.
 
+        The same judgement decides what the churn criterion counts, which is
+        why the count is recorded here rather than by the caller. Only a
+        session that reached the point above is counted, because only that
+        point re-stamps the clocks the other two criteria measure from: a
+        session that ends before it resets nothing, so its component's down
+        clock goes on running from wherever the last recovery left it - from
+        process start for a component that has never had one. That failure is
+        the down criterion's, with the tolerance chosen for it, and counting it
+        here as well would put a far shorter ceiling underneath. Keeping the
+        flag and the count in one method is also what keeps this independent of
+        when the caller marks the component down.
+
+        "From the last recovery" is the whole of the guarantee, and a component
+        that alternates between the two falls between them: see the known
+        limitation recorded beside WATCHDOG_CHURN_SESSIONS in config.py.
+
+        This is what covers the waiting state as well. A component whose
+        dependency has not appeared yet fails inside connect_once(), never
+        reaches here at all, and so can never be counted however long it
+        waits - which is the ceiling this project must never put on startup.
+
         Anything that ends the session is raised to the supervision loop, which
         treats it as a failed attempt.
         """
@@ -221,6 +245,14 @@ class Supervisor:
                 self.health.mark_up(service.name)
                 backoff.reset()
                 throttle.reset()
+        except Exception:
+            # A session that was never judged stable is not a reconnection.
+            # CancelledError is not caught here - it derives from
+            # BaseException - so a component stopped while healthy leaves no
+            # count behind either; nothing broke, the process is stopping.
+            if stable:
+                self.health.record_session_end(service.name)
+            raise
         finally:
             for task in (run_task, shutdown_task):
                 task.cancel()
@@ -257,8 +289,10 @@ class Supervisor:
         threshold: float = config.WATCHDOG_DOWN_SECONDS,
         interval: float = config.WATCHDOG_CHECK_INTERVAL,
         stall_threshold: float = config.WATCHDOG_STALL_SECONDS,
+        churn_sessions: int = config.WATCHDOG_CHURN_SESSIONS,
     ) -> None:
-        """Exit the process on either of the two ways a component can be lost.
+        """Exit the process on any of the three ways a component can be lost;
+        report, without exiting, the one way the snapshot file can be lost.
 
         A component that fails loudly is caught by down_duration: it raised,
         the supervisor marked it down, and the clock has been running since.
@@ -268,15 +302,55 @@ class Supervisor:
         has stopped reporting that it advanced. Without this second check that
         failure is invisible and the process sits there forever.
 
-        Both thresholds sit far above any normal cycle, so neither fires on a
-        component that is merely reconnecting.
+        A component that fails, recovers, and fails again for ever is caught by
+        churning, and is invisible to both of the above by construction. A
+        session counts as recovered once it has lasted SERVICE_STABLE_SECONDS,
+        and that judgement re-stamps every clock the first two measure from -
+        so any failure taking longer than that window to raise reaches the
+        point where it looks recovered before the point where it fails, and
+        repeats with the down clock at zero and the stall clock at zero. The
+        first two ask what state a component is in now; this one asks how many
+        times it has been in that state lately, which is the only reading such
+        a loop leaves behind.
 
-        Neither reading is adjusted here. Both are measured by HealthState
+        Only recovered sessions are counted, and the two statements above are
+        the same statement: what makes such a loop invisible to the first
+        criterion is exactly what makes it visible to this one. A session that
+        ends sooner re-stamps nothing, so the down clock keeps running from the
+        last recovery and the first criterion is already measuring it -
+        counting those here as well would hand the same failure a second
+        ceiling, orders of magnitude shorter than the tolerance chosen for it.
+        A component that mixes the two shapes is measured fully by neither; the
+        known limitation beside WATCHDOG_CHURN_SESSIONS in config.py says what
+        that leaves visible.
+
+        A snapshot that stops being written while every component loop keeps
+        advancing is caught by snapshot_age, but only reported: the loops are
+        demonstrably running, so the write itself is what failed, and a
+        restart cannot make an unwritable path writable. It would instead
+        repeat the whole startup - reinitialising the modem and re-reading its
+        stored messages - every few minutes for ever, which is worse than the
+        fault it is reacting to. The healthcheck fails on the file's own mtime
+        regardless, so the fault stays visible without a restart.
+
+        Both exit thresholds sit far above any normal cycle, so neither fires
+        on a component that is merely reconnecting.
+
+        None of the readings is adjusted here. Each is measured by HealthState
         against its own clock, and the one correction a stall reading needs -
         discounting the age an outage leaves on the snapshot - is applied where
         the moment of the recovery is known exactly rather than sampled from
         here between two inspections.
         """
+        # Seeded per loop rather than per process: the threshold it throttles
+        # against is a parameter of this loop. verbose_count=0 rather than the
+        # usual burst: the condition below cannot turn true before real time
+        # since construction has already reached stall_threshold - the same
+        # span _LogThrottle would then require before letting a second message
+        # through - so a verbose first message would leave a second message
+        # right behind it, immediately, on the very next inspection.
+        snapshot_throttle = _LogThrottle(verbose_count=0, interval=stall_threshold)
+
         while not self.shutdown_event.is_set():
             try:
                 await asyncio.wait_for(self.shutdown_event.wait(), timeout=interval)
@@ -295,6 +369,40 @@ class Supervisor:
                 self.shutdown_event.set()
                 return
 
+            # Not gated on the down reading, unlike the two below. A component
+            # that keeps reconnecting spends much of its time down, so waiting
+            # for a moment when nothing is would mean sampling exactly the
+            # phase this criterion is looking for and missing it. The count is
+            # a history rather than an instantaneous reading, so it is
+            # meaningful whatever the component happens to be doing right now.
+            churner = self.health.churning(churn_sessions)
+            if churner is not None:
+                # The observed count, not the threshold it cleared. This loop
+                # only looks every `interval`, so a component flapping faster
+                # than that ends several sessions between two inspections and
+                # the count is then well above the threshold; printing the
+                # threshold here would understate what happened by an amount
+                # nothing bounds. The key is always present - it comes from the
+                # same mapping churning() just read.
+                observed = self.health.reconnect_counts()[churner]
+                # States the criterion rather than diagnosing the other two.
+                # Every counted session was judged recovered, so each of them
+                # did re-stamp both other clocks - but a component that churns
+                # spends the gaps between its sessions down, and this reading
+                # can land in one of them. A line announcing that the other two
+                # clocks read zero would then be false at the moment it was
+                # printed, about the very fault being debugged.
+                logger.error(
+                    f"Watchdog tripped: component {churner} has ended "
+                    f"{observed} connected sessions within "
+                    f"{self.health.churn_window:.0f}s (threshold "
+                    f"{churn_sessions}); exiting so the container runtime can "
+                    f"restart everything"
+                )
+                self.exit_reason = "churning"
+                self.shutdown_event.set()
+                return
+
             # Only asked while nothing is reported down, which down_duration
             # reading zero is exactly the statement of. The snapshot is written
             # only while every component is up, so anything that is down stops
@@ -310,13 +418,32 @@ class Supervisor:
             # killed for waiting.
             if stalled is not None and stalled >= stall_threshold:
                 logger.error(
-                    f"Watchdog tripped: nothing has made progress for "
+                    f"Watchdog tripped: a component loop has not advanced for "
                     f"{stalled:.0f}s (threshold {stall_threshold:.0f}s) while "
-                    f"every component still reports up. Either a component "
-                    f"loop has stopped advancing without failing, or "
-                    f"HEALTH_FILE can no longer be written; exiting so the "
-                    f"container runtime can restart everything"
+                    f"still reporting up; exiting so the container runtime can "
+                    f"restart everything"
                 )
                 self.exit_reason = "stalled"
                 self.shutdown_event.set()
                 return
+
+            # Only reached when no component loop is behind, which is what
+            # makes this reading attributable: every loop is advancing and the
+            # snapshot still is not being written, so the write itself is what
+            # failed. Reported rather than acted on. Restarting cannot make an
+            # unwritable path writable, and doing it on a timer would repeat
+            # the whole startup - reinitialising the modem and re-reading its
+            # stored messages - every few minutes for ever, which is a worse
+            # outcome than the fault. The healthcheck fails on the file's own
+            # mtime regardless, so this stays visible without that.
+            age = self.health.snapshot_age() if duration == 0.0 else None
+            if age is not None and age >= stall_threshold:
+                if snapshot_throttle.should_log():
+                    logger.error(
+                        f"HEALTH_FILE has not been written for {age:.0f}s "
+                        f"(threshold {stall_threshold:.0f}s) while every "
+                        f"component loop is still advancing: the snapshot "
+                        f"cannot be written. The container healthcheck will "
+                        f"fail until it can. Not restarting - a restart cannot "
+                        f"fix an unwritable path"
+                    )

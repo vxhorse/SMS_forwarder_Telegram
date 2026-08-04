@@ -117,6 +117,9 @@ def test_file_written_when_all_up(tmp_path):
         "services": {"device": True, "telegram": True},
         "rssi": 21,
         "registration": 5,
+        # Counts only, and zero here: nothing has reconnected. The healthcheck
+        # ignores this field; it is carried for an operator reading the file.
+        "reconnects": {"device": 0, "telegram": 0},
     }
 
 
@@ -151,7 +154,11 @@ def test_stall_duration_is_none_before_the_first_healthy_moment(tmp_path):
     assert health.stall_duration() is None
 
 
-def test_stall_duration_starts_after_the_first_successful_refresh(tmp_path):
+def test_stall_duration_starts_once_every_component_is_up(tmp_path):
+    """mark_up() is what starts this reading now, not refresh_file() - the
+    file plays no part in stall_duration() any more. refresh_file() is still
+    called here to match what a real cycle does, but removing it would not
+    change the number below."""
     health, clock, _ = _make(tmp_path)
     health.mark_up("device")
     health.mark_up("telegram")
@@ -160,7 +167,13 @@ def test_stall_duration_starts_after_the_first_successful_refresh(tmp_path):
     assert health.stall_duration() == 30.0
 
 
-def test_stall_duration_survives_a_component_going_down(tmp_path):
+def test_snapshot_age_survives_a_component_going_down(tmp_path):
+    """Redirected from stall_duration(): the file term this test exercises -
+    refresh_file() turning into a no-op the moment a component goes down - no
+    longer reaches that reading at all. Telegram never calls record_progress()
+    here, so its stamp from mark_up() would coincidentally also read 50.0,
+    which is exactly the kind of accidental agreement the split exists to stop
+    relying on."""
     health, clock, _ = _make(tmp_path)
     health.mark_up("device")
     health.mark_up("telegram")
@@ -170,7 +183,7 @@ def test_stall_duration_survives_a_component_going_down(tmp_path):
     # refresh_file() is now a no-op, so the age keeps growing. That is the
     # point: a component that is down stops the file being refreshed.
     health.refresh_file()
-    assert health.stall_duration() == 50.0
+    assert health.snapshot_age() == 50.0
 
 
 def test_a_completed_cycle_resets_the_stall_age(tmp_path):
@@ -206,7 +219,10 @@ def test_a_failed_write_does_not_count_as_a_refresh(tmp_path, monkeypatch):
     health.refresh_file()
     # The write failed, so the healthcheck still sees the old file. Pretending
     # it was refreshed would hide exactly that.
-    assert health.stall_duration() == 10.0
+    assert health.snapshot_age() == 10.0
+    # The two readings now say two different things: both loops advanced, so
+    # the component reading is unaffected by the file that did not write.
+    assert health.stall_duration() == 0.0
 
 
 def test_a_component_that_stops_advancing_is_stalled_while_the_other_advances(tmp_path):
@@ -274,7 +290,12 @@ def test_a_component_that_is_down_does_not_count_as_stalled(tmp_path):
 
     clock.advance(10.0)
     health.record_progress("telegram")
-    assert health.stall_duration() == 10.0
+    # The only up component just progressed, so the component reading is zero:
+    # the down device's own 610s-old stamp is excluded rather than dragged in.
+    assert health.stall_duration() == 0.0
+    # The file was last written just before the device went down, and a down
+    # component does not freeze that age either - it keeps growing on its own.
+    assert health.snapshot_age() == 10.0
 
 
 def test_progress_from_an_unregistered_component_is_ignored(tmp_path):
@@ -315,9 +336,9 @@ def test_the_snapshot_age_does_not_outlive_the_outage_that_caused_it(tmp_path):
     applying.
     """
     health, clock = _recover_after_an_outage(tmp_path)
-    assert health.stall_duration() == 0.0
+    assert health.snapshot_age() == 0.0
     clock.advance(5.0)
-    assert health.stall_duration() == 5.0
+    assert health.snapshot_age() == 5.0
 
 
 def test_a_snapshot_that_stays_unwritten_after_a_recovery_is_still_caught(tmp_path):
@@ -333,13 +354,16 @@ def test_a_snapshot_that_stays_unwritten_after_a_recovery_is_still_caught(tmp_pa
         clock.advance(25.0)
         health.record_progress("device")
         health.record_progress("telegram")
-    assert health.stall_duration() == 250.0
+    assert health.snapshot_age() == 250.0
 
 
 def test_an_old_outage_does_not_shorten_a_later_stall(tmp_path):
-    """The discount lasts until the reading no longer contains the outage, and
-    no longer. Subtracting the outage from a stall that starts afterwards would
-    leave a blind spot as long as the outage was."""
+    """stall_duration() carries no outage discount at all any more - it reads
+    only the progress stamps mark_up() and record_progress() leave, so an
+    outage that ended long ago cannot leave any residue in it. The number
+    below is a plain progress age. See
+    test_an_old_outage_does_not_shorten_a_later_snapshot_age for the
+    equivalent guard on the reading that does still carry a discount."""
     health, clock = _recover_after_an_outage(tmp_path)
     clock.advance(20.0)
     health.record_progress("device")
@@ -350,7 +374,23 @@ def test_an_old_outage_does_not_shorten_a_later_stall(tmp_path):
     assert health.stall_duration() == 240.0
 
 
-def test_a_snapshot_that_was_never_written_does_not_hide_a_stall(tmp_path, monkeypatch):
+def test_an_old_outage_does_not_shorten_a_later_snapshot_age(tmp_path):
+    """The discount snapshot_age() applies at a recovery lasts only until the
+    reading no longer contains the outage. A later refresh moves the baseline
+    forward; subtracting the old, by-then-irrelevant outage from an age that
+    starts after that refresh would leave a blind spot as long as the outage
+    was."""
+    health, clock = _recover_after_an_outage(tmp_path)
+    clock.advance(20.0)
+    health.record_progress("device")
+    health.record_progress("telegram")
+    health.refresh_file()
+
+    clock.advance(240.0)
+    assert health.snapshot_age() == 240.0
+
+
+def test_a_snapshot_that_was_never_written_is_visible_as_its_own_age(tmp_path, monkeypatch):
     """A file that cannot be written at all has no timestamp to age, and the
     absence of one used to mean the same thing as never having been healthy.
     Measured from the moment the system became whole, the two are told apart:
@@ -369,7 +409,7 @@ def test_a_snapshot_that_was_never_written_does_not_hide_a_stall(tmp_path, monke
         health.record_progress("device")
         health.record_progress("telegram")
         health.refresh_file()
-    assert health.stall_duration() == 300.0
+    assert health.snapshot_age() == 300.0
 
 
 def test_a_progressing_component_does_not_start_the_stall_clock_on_its_own(tmp_path):
@@ -384,3 +424,114 @@ def test_a_progressing_component_does_not_start_the_stall_clock_on_its_own(tmp_p
         health.record_progress("telegram")
         health.refresh_file()
     assert health.stall_duration() is None
+
+
+def test_an_unwritable_file_is_not_a_stall_while_both_loops_advance(tmp_path, monkeypatch):
+    """The regression this split exists for. A component loop that is still
+    reporting progress is a loop that is still running, whatever the file is
+    doing, and restarting the process cannot make a read-only filesystem
+    writable - so it restarts every few minutes for ever, re-running the modem
+    initialisation and re-reading the stored messages each time."""
+    health, clock, _ = _make(tmp_path)
+
+    def explode(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr("module.health.os.replace", explode)
+    health.mark_up("device")
+    health.mark_up("telegram")
+    for _ in range(20):
+        clock.advance(30.0)
+        health.record_progress("device")
+        health.record_progress("telegram")
+        health.refresh_file()
+
+    # The loops advanced 600 seconds' worth of rounds between them.
+    assert health.stall_duration() == 0.0
+    # And the file has not been written once in all that time, which is a real
+    # fault and has to remain visible - just not as a reason to restart.
+    assert health.snapshot_age() == 600.0
+
+
+def test_snapshot_age_is_none_before_the_first_healthy_moment(tmp_path):
+    health, clock, _ = _make(tmp_path)
+    clock.advance(9999.0)
+    assert health.snapshot_age() is None
+
+
+def test_snapshot_age_is_measured_from_the_later_of_write_and_recovery(tmp_path):
+    """The snapshot is not written while a component is down, so the age it
+    carries at the moment of a recovery measures the outage. Reading that as a
+    fault of its own would report one every time a component reconnects."""
+    health, clock = _recover_after_an_outage(tmp_path)
+    assert health.snapshot_age() == 0.0
+    clock.advance(45.0)
+    assert health.snapshot_age() == 45.0
+    health.refresh_file()
+    assert health.snapshot_age() == 0.0
+
+
+def _churn(tmp_path, window=1000.0):
+    clock = FakeClock()
+    health = HealthState(
+        ["device", "telegram"],
+        health_file=str(tmp_path / "healthy"),
+        clock=clock,
+        churn_window=window,
+    )
+    return health, clock
+
+
+def test_reconnect_counts_start_at_zero(tmp_path):
+    health, _ = _churn(tmp_path)
+    assert health.reconnect_counts() == {"device": 0, "telegram": 0}
+
+
+def test_churning_names_the_component_that_reached_the_threshold(tmp_path):
+    health, clock = _churn(tmp_path)
+    for _ in range(3):
+        clock.advance(100.0)
+        health.record_session_end("device")
+    assert health.churning(threshold=4) is None
+    clock.advance(100.0)
+    health.record_session_end("device")
+    assert health.churning(threshold=4) == "device"
+
+
+def test_sessions_older_than_the_window_stop_counting(tmp_path):
+    """A component that reconnected a few times last week is not churning now.
+    Without the window the count only ever grows and every long-lived process
+    eventually trips."""
+    health, clock = _churn(tmp_path, window=1000.0)
+    for _ in range(4):
+        health.record_session_end("device")
+        clock.advance(600.0)
+    # Three of the four are now outside the window.
+    assert health.reconnect_counts()["device"] == 1
+    assert health.churning(threshold=4) is None
+
+
+def test_each_component_is_counted_on_its_own(tmp_path):
+    """Two components each reconnecting occasionally is not one component
+    churning, and restarting for the sum would blame neither."""
+    health, clock = _churn(tmp_path)
+    for _ in range(3):
+        clock.advance(10.0)
+        health.record_session_end("device")
+        health.record_session_end("telegram")
+    assert health.churning(threshold=4) is None
+
+
+def test_the_snapshot_publishes_the_counts(tmp_path):
+    """The only place an operator can see this before the container restarts.
+    Counts only: nothing here may carry message data."""
+    health, clock = _churn(tmp_path)
+    clock.advance(10.0)
+    health.record_session_end("device")
+    assert health.snapshot()["reconnects"] == {"device": 1, "telegram": 0}
+
+
+def test_a_session_end_from_an_unregistered_component_is_ignored(tmp_path):
+    health, _ = _churn(tmp_path)
+    health.record_session_end("nonexistent")
+    assert health.churning(threshold=1) is None

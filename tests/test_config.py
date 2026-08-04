@@ -48,13 +48,21 @@ def test_stock_configuration_has_no_notices():
 
 def test_a_fully_specified_but_legal_configuration_has_no_notices(monkeypatch):
     """Tuning every clamped setting to a value inside its allowed range must
-    not be mistaken for tuning it outside."""
+    not be mistaken for tuning it outside.
+
+    The values here have to satisfy the derived bounds as well as the fixed
+    ones: the two deadlines on the shutdown path have to fit inside
+    STOP_BUDGET_SECONDS together, the probe schedule has to leave the worst
+    refresh gap inside HEALTH_STALE_SECONDS, and the stable window has to stay
+    under the fastest failure that schedule can raise - which at an interval of
+    25 is 3 x (25 + 5) = 90, so the window is 80 rather than a rounder number.
+    """
     monkeypatch.setenv("HEALTH_STALE_SECONDS", "120")
-    monkeypatch.setenv("SERVICE_STABLE_SECONDS", "90")
+    monkeypatch.setenv("SERVICE_STABLE_SECONDS", "80")
     monkeypatch.setenv("WATCHDOG_CHECK_INTERVAL", "15")
     monkeypatch.setenv("NOTIFY_TIMEOUT", "8")
-    monkeypatch.setenv("SERIAL_CLOSE_TIMEOUT", "3")
-    monkeypatch.setenv("MODEM_PROBE_INTERVAL", "40")
+    monkeypatch.setenv("SERIAL_CLOSE_TIMEOUT", "2")
+    monkeypatch.setenv("MODEM_PROBE_INTERVAL", "25")
     monkeypatch.setenv("MODEM_REGISTRATION_FAILURES", "4")
     monkeypatch.setenv("WATCHDOG_DOWN_SECONDS", "3600")
     monkeypatch.setenv("WATCHDOG_STALL_SECONDS", "1200")
@@ -75,6 +83,8 @@ def test_a_fully_specified_but_legal_configuration_has_no_notices(monkeypatch):
         ("SERIAL_CLOSE_TIMEOUT", "0", 1.0),
         ("MODEM_PROBE_INTERVAL", "0", 1.0),
         ("MODEM_REGISTRATION_FAILURES", "0", 2),
+        ("MODEM_PROBE_TIMEOUT", "0", 1.0),
+        ("MODEM_PROBE_FAILURES", "0", 1),
     ],
 )
 def test_a_floored_setting_is_reported(monkeypatch, env_name, low_value, floor):
@@ -94,11 +104,11 @@ def test_a_floored_setting_is_reported(monkeypatch, env_name, low_value, floor):
 def test_notify_timeout_ceiling_is_reported(monkeypatch):
     monkeypatch.setenv("NOTIFY_TIMEOUT", "600")
     reloaded = importlib.reload(config_module)
-    assert reloaded.NOTIFY_TIMEOUT == reloaded.NOTIFY_TIMEOUT_CEILING
+    assert reloaded.NOTIFY_TIMEOUT == reloaded.STOP_BUDGET_SECONDS
     matches = _notices_for(reloaded, "NOTIFY_TIMEOUT")
     assert len(matches) == 1
     assert "600" in matches[0]
-    assert f"{reloaded.NOTIFY_TIMEOUT_CEILING:g}" in matches[0]
+    assert f"{reloaded.STOP_BUDGET_SECONDS:g}" in matches[0]
 
 
 def test_modem_probe_interval_ceiling_tracks_health_stale_seconds(monkeypatch):
@@ -112,6 +122,129 @@ def test_modem_probe_interval_ceiling_tracks_health_stale_seconds(monkeypatch):
     matches = _notices_for(reloaded, "MODEM_PROBE_INTERVAL")
     assert len(matches) == 1
     assert "100" in matches[0]
+    # And says which setting it came from, not just the number it works out
+    # to - a bare "ceiling is 10" leaves an operator nothing to act on.
+    assert "HEALTH_STALE_SECONDS" in matches[0]
+
+
+def test_the_shutdown_path_fits_inside_one_stop_grace_period(monkeypatch):
+    """NOTIFY_TIMEOUT and SERIAL_CLOSE_TIMEOUT are both awaited on the way out,
+    one after the other. Bounding them separately lets their sum outlast the
+    grace period either of them was bounded against, and a teardown that
+    outlives the grace period is killed rather than finished - so the process
+    never reaches the point where it stops claiming to be healthy."""
+    monkeypatch.setenv("NOTIFY_TIMEOUT", "6")
+    monkeypatch.setenv("SERIAL_CLOSE_TIMEOUT", "60")
+    reloaded = importlib.reload(config_module)
+    assert (
+        reloaded.NOTIFY_TIMEOUT + reloaded.SERIAL_CLOSE_TIMEOUT
+        <= reloaded.STOP_BUDGET_SECONDS
+    )
+    matches = _notices_for(reloaded, "SERIAL_CLOSE_TIMEOUT")
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "60" in matches[0]
+
+
+def test_a_notify_deadline_that_eats_the_whole_budget_is_reported(monkeypatch):
+    """With nothing left for the close, the floor wins - aborting every
+    disconnect before the transport could flush would be worse than overrunning
+    the budget. The invariant no longer holds for that configuration, and
+    saying so is the only thing that keeps it from being a silent one.
+
+    SERIAL_CLOSE_TIMEOUT is pinned at its own floor here rather than left at
+    the default: requested then equals applied, so _clamped's own notice
+    never fires, and the only thing left that can catch the broken budget is
+    the dedicated collision notice this test is named after."""
+    monkeypatch.setenv("NOTIFY_TIMEOUT", "10")
+    monkeypatch.setenv("SERIAL_CLOSE_TIMEOUT", "1")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.SERIAL_CLOSE_TIMEOUT == reloaded.SERIAL_CLOSE_TIMEOUT_FLOOR
+    matches = _notices_for(reloaded, "SERIAL_CLOSE_TIMEOUT")
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "NOTIFY_TIMEOUT" in matches[0]
+    assert "STOP_BUDGET_SECONDS" in matches[0]
+
+
+def test_the_probe_deadline_is_capped_against_the_staleness_window(monkeypatch):
+    """The worst legitimate gap between two refreshes is F*I + (F+1)*T, and
+    raising T is exactly what one does for a slow modem. Past the window the
+    healthcheck fails a process that is working perfectly."""
+    monkeypatch.setenv("MODEM_PROBE_TIMEOUT", "30")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.WATCHDOG_REFRESH_BUDGET <= reloaded.HEALTH_STALE_SECONDS
+    matches = _notices_for(reloaded, "MODEM_PROBE_TIMEOUT")
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "30" in matches[0]
+    # The documented figure at the shipped defaults.
+    assert reloaded.MODEM_PROBE_TIMEOUT == 7.5
+
+
+def test_a_probe_schedule_with_no_room_left_for_a_deadline_is_reported(monkeypatch):
+    """F * I alone can fill the window, leaving no positive T at all. The floor
+    wins, because a deadline of zero abandons every probe before it is
+    attempted, and the notice says the window no longer holds.
+
+    MODEM_PROBE_TIMEOUT is pinned at its own floor here rather than left at
+    the default: requested then equals applied, so _clamped's own notice
+    never fires, and the only thing left that can catch the broken window is
+    the dedicated collision notice this test is named after."""
+    monkeypatch.setenv("MODEM_PROBE_INTERVAL", "40")
+    monkeypatch.setenv("MODEM_PROBE_TIMEOUT", "1")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.MODEM_PROBE_TIMEOUT == reloaded.MODEM_PROBE_TIMEOUT_FLOOR
+    matches = _notices_for(reloaded, "MODEM_PROBE_TIMEOUT")
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "worst refresh gap" in matches[0]
+    assert "HEALTH_STALE_SECONDS" in matches[0]
+
+
+# --- A clamp notice names the setting a derived bound came from, not just --
+# --- the number it works out to ----------------------------------------------
+
+
+def test_a_ceiling_that_coincides_with_the_floor_still_blames_the_ceiling(
+    monkeypatch,
+):
+    """NOTIFY_TIMEOUT=9 puts SERIAL_CLOSE_TIMEOUT's derived ceiling exactly on
+    its fixed floor (10 - 9 == 1). The invariant still holds at 9 + 1 == 10, so
+    there is no floor/ceiling collision to report - but the operator asked for
+    more than the ceiling allowed, and the notice has to blame the ceiling
+    (and name NOTIFY_TIMEOUT as where it came from), not the floor that only
+    happens to sit at the same value."""
+    monkeypatch.setenv("NOTIFY_TIMEOUT", "9")
+    monkeypatch.setenv("SERIAL_CLOSE_TIMEOUT", "9")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.SERIAL_CLOSE_TIMEOUT == 1.0
+    matches = _notices_for(reloaded, "SERIAL_CLOSE_TIMEOUT")
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "ceiling" in matches[0]
+    assert "NOTIFY_TIMEOUT=9" in matches[0]
+
+
+def test_the_plain_probe_ceiling_notice_names_its_origin(monkeypatch):
+    """The common case - an operator raising MODEM_PROBE_TIMEOUT for a slow
+    modem, with no floor collision anywhere in sight - must still say where
+    the resulting ceiling comes from. A bare 'ceiling is 7.5' gives the
+    operator nothing to act on."""
+    monkeypatch.setenv("MODEM_PROBE_TIMEOUT", "15")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.MODEM_PROBE_TIMEOUT == 7.5
+    matches = _notices_for(reloaded, "MODEM_PROBE_TIMEOUT")
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "HEALTH_STALE_SECONDS" in matches[0]
+
+
+def test_the_backoff_floor_notice_names_reconnect_backoff_min(monkeypatch):
+    """RECONNECT_BACKOFF_MAX's floor is RECONNECT_BACKOFF_MIN, not a fixed
+    number - the notice has to say so, or an operator who set a ceiling below
+    the floor has nothing telling them which other setting to look at."""
+    monkeypatch.setenv("RECONNECT_BACKOFF_MIN", "10")
+    monkeypatch.setenv("RECONNECT_BACKOFF_MAX", "5")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.RECONNECT_BACKOFF_MAX == reloaded.RECONNECT_BACKOFF_MIN
+    matches = _notices_for(reloaded, "RECONNECT_BACKOFF_MAX")
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "RECONNECT_BACKOFF_MIN=10" in matches[0]
 
 
 # --- WATCHDOG_STALL_SECONDS: two derived bounds instead of two fixed ones ----
@@ -168,6 +301,369 @@ def test_watchdog_down_seconds_comfortably_above_the_floor_is_silent(monkeypatch
     monkeypatch.setenv("WATCHDOG_DOWN_SECONDS", "10000")
     reloaded = importlib.reload(config_module)
     assert reloaded.CLAMP_NOTICES == []
+
+
+def test_a_down_tolerance_under_the_first_recovery_is_reported(monkeypatch):
+    """Every clock in this file measures from a recovery, and a component
+    cannot reach its first one until it has connected and then held for
+    SERVICE_STABLE_SECONDS. Until then it is marked down, and has been since
+    the process started.
+
+    So a down tolerance under that window plus one inspection interval exits
+    before any component could possibly be marked up: a permanent restart loop
+    on hardware that is working, reported by a line about a component being
+    down for an hour's worth of reasons that do not apply. Nothing can clamp
+    this - the connect time is a property of the hardware and unknowable from
+    here - so the part that is knowable is reported instead.
+    """
+    monkeypatch.setenv("WATCHDOG_DOWN_SECONDS", "60")
+    reloaded = importlib.reload(config_module)
+    matches = [
+        notice
+        for notice in reloaded.CLAMP_NOTICES
+        if "SERVICE_STABLE_SECONDS" in notice and "WATCHDOG_DOWN_SECONDS" in notice
+    ]
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "WATCHDOG_CHECK_INTERVAL" in matches[0]
+
+
+@pytest.mark.parametrize(
+    "tuning, path",
+    [
+        ({"SERVICE_STABLE_SECONDS": "120"}, "liveness probe"),
+        ({"MODEM_PROBE_INTERVAL": "15"}, "liveness probe"),
+        (
+            {"MODEM_REGISTRATION_CHECK": "1", "MODEM_REGISTRATION_FAILURES": "2"},
+            "registration check",
+        ),
+    ],
+)
+def test_a_stable_window_wider_than_the_fastest_failure_is_reported(
+    monkeypatch, tuning, path
+):
+    """The churn criterion counts only sessions judged recovered, so a stable
+    window wider than the fastest a heartbeat failure can raise means the
+    modem's own failures end every session before the judgement and are never
+    counted at all - the criterion switched off for the component it was built
+    around, while the settings table still says it is on.
+
+    Reachable from either side and at the shipped values by a margin of 45
+    seconds: by lengthening the window, by shortening the probe schedule, or by
+    turning the registration check on at its own floor. Coverage is not lost in
+    the pure case - the down clock does accumulate - but detection falls from
+    roughly twenty minutes to an hour, and nothing said so.
+
+    The figure is the faster of two paths, so the notice has to name which one
+    reached it. The third case here is exactly why: the registration check at
+    its own floor of 2 raises in 60 seconds while the liveness probe still
+    takes 105 and is still counted, so a notice reading as though nothing were
+    counted any more would describe a guard that is still doing its job.
+    """
+    for name, value in tuning.items():
+        monkeypatch.setenv(name, value)
+    reloaded = importlib.reload(config_module)
+    assert reloaded.SERVICE_STABLE_SECONDS >= _fastest_raise_seconds(reloaded)
+    matches = [
+        notice
+        for notice in reloaded.CLAMP_NOTICES
+        if "SERVICE_STABLE_SECONDS" in notice and "WATCHDOG_CHURN_SESSIONS" in notice
+    ]
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert path in matches[0]
+
+
+def test_a_stable_window_inside_the_fastest_failure_is_silent(monkeypatch):
+    """The shipped values clear it, and so must a schedule tuned in the safe
+    direction - a notice on a configuration that is fine is how an operator
+    learns to stop reading them."""
+    monkeypatch.setenv("SERVICE_STABLE_SECONDS", "100")
+    monkeypatch.setenv("MODEM_PROBE_INTERVAL", "40")
+    monkeypatch.setenv("MODEM_PROBE_TIMEOUT", "1")
+    reloaded = importlib.reload(config_module)
+    # 3 x (40 + 1) = 123 against a 100-second window.
+    assert not [
+        notice
+        for notice in reloaded.CLAMP_NOTICES
+        if "SERVICE_STABLE_SECONDS" in notice
+    ], reloaded.CLAMP_NOTICES
+
+
+def test_a_down_tolerance_that_clears_the_first_recovery_is_silent(monkeypatch):
+    """The bound is only the part that can be computed, so it has to stay quiet
+    for a configuration that satisfies it - including one tuned right up to the
+    edge, or every operator who shortens the tolerance deliberately learns to
+    ignore the line that matters."""
+    monkeypatch.setenv("WATCHDOG_DOWN_SECONDS", "3000")
+    # Under the stock probe schedule's fastest failure, 105 seconds, so the
+    # only relationship this test can trip is the one it is about.
+    monkeypatch.setenv("SERVICE_STABLE_SECONDS", "90")
+    monkeypatch.setenv("WATCHDOG_CHECK_INTERVAL", "10")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.CLAMP_NOTICES == []
+
+
+# --- WATCHDOG_CHURN_*: a fixed floor, and a window with a derived one --------
+
+
+def test_the_churn_threshold_has_a_floor(monkeypatch):
+    """One reconnect is not a pattern. At zero or one, a single transient
+    failure ends the process."""
+    monkeypatch.setenv("WATCHDOG_CHURN_SESSIONS", "1")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.WATCHDOG_CHURN_SESSIONS == 2
+    assert len(_notices_for(reloaded, "WATCHDOG_CHURN_SESSIONS")) == 1
+
+
+def test_the_churn_window_must_hold_that_many_worst_case_cycles(monkeypatch):
+    """A window shorter than the threshold's worth of slowest cycles can never
+    reach the threshold, so the criterion would simply never fire."""
+    monkeypatch.setenv("WATCHDOG_CHURN_WINDOW", "60")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.WATCHDOG_CHURN_WINDOW == reloaded.WATCHDOG_CHURN_WINDOW_FLOOR
+    matches = _notices_for(reloaded, "WATCHDOG_CHURN_WINDOW")
+    assert len(matches) == 1
+    assert "60" in matches[0]
+
+
+@pytest.mark.parametrize("failures", ["2", "3", "8"])
+def test_the_churn_window_floor_holds_a_registration_driven_cycle(
+    monkeypatch, failures
+):
+    """The registration check ends a session after a run of readings, not after
+    one, so the slowest cycle the window has to hold is multiplied by
+    MODEM_REGISTRATION_FAILURES - a setting that appears in no other bound.
+
+    Left out of the floor, a patient count makes the window too short to hold
+    the threshold's worth of cycles, the count can never reach the threshold,
+    and the criterion is switched off while the settings table still says it is
+    on. That is a false negative, which for a criterion whose whole purpose is
+    seeing what nothing else sees is the dangerous direction.
+    """
+    monkeypatch.setenv("MODEM_REGISTRATION_CHECK", "1")
+    monkeypatch.setenv("MODEM_REGISTRATION_FAILURES", failures)
+    reloaded = importlib.reload(config_module)
+    cycle = reloaded.RECONNECT_BACKOFF_MAX + _worst_session_seconds(reloaded)
+    assert (
+        reloaded.WATCHDOG_CHURN_WINDOW >= reloaded.WATCHDOG_CHURN_SESSIONS * cycle
+    ), reloaded.WATCHDOG_CHURN_WINDOW_FLOOR
+
+
+def test_the_churn_window_floor_ignores_the_registration_count_when_off(monkeypatch):
+    """The multiplier belongs to the check, not to the count. With the check
+    off the count decides nothing at all, and a floor that grew with it anyway
+    would widen the window - and with it the criterion's appetite - for a
+    setting that is not in force."""
+    monkeypatch.setenv("MODEM_REGISTRATION_FAILURES", "8")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.WATCHDOG_CHURN_WINDOW_FLOOR == 1400.0
+    assert reloaded.CLAMP_NOTICES == []
+
+
+def test_the_shipped_churn_window_clears_its_floor_without_a_notice():
+    """The default has to sit above the derived floor on its own, or every
+    unmodified start prints a notice and an operator learns to stop reading
+    them."""
+    reloaded = importlib.reload(config_module)
+    assert reloaded.WATCHDOG_CHURN_WINDOW > reloaded.WATCHDOG_CHURN_WINDOW_FLOOR
+    assert reloaded.CLAMP_NOTICES == []
+
+
+# --- The meta-rule: enforced or reported, never neither ----------------------
+
+
+def _worst_session_seconds(cfg):
+    """The longest a connected session can take to end in a failure.
+
+    Derived here from the shape of module/device_manager.py's heartbeat_loop
+    rather than from config.py's own figure: a derivation checked against
+    itself would pass however wrong it was, and the whole point of the floor
+    below is that it models the loop it has to hold.
+
+    One round costs the interval plus what the probes in it wait for. A round
+    whose liveness probe goes unanswered spends one deadline and starts again;
+    a round that is answered goes on to ask about registration, which waits the
+    same deadline for its own answer.
+    """
+    unanswered = cfg.MODEM_PROBE_INTERVAL + cfg.MODEM_PROBE_TIMEOUT
+    answered = cfg.MODEM_PROBE_INTERVAL + 2 * cfg.MODEM_PROBE_TIMEOUT
+    # The liveness path: consecutive unanswered rounds until the count is
+    # reached, which is the whole session.
+    liveness = cfg.MODEM_PROBE_FAILURES * unanswered
+    if not cfg.MODEM_REGISTRATION_CHECK:
+        return liveness
+    # The registration path: only an answered round can find the modem off the
+    # network, so it takes that many answered rounds - and one answered probe
+    # clears the liveness count, so up to MODEM_PROBE_FAILURES - 1 unanswered
+    # rounds fit in front of each of them without ending the session first.
+    registration = cfg.MODEM_REGISTRATION_FAILURES * (
+        max(0, cfg.MODEM_PROBE_FAILURES - 1) * unanswered + answered
+    )
+    return max(liveness, registration)
+
+
+def _fastest_raise_seconds(cfg):
+    """The shortest a heartbeat-driven session can take to end in a failure.
+
+    The counterpart to the figure above, derived from the same loop and used
+    for the opposite purpose: the worst case says how wide the churn window has
+    to be, this one says whether such a session can be counted at all. A
+    session that ends before SERVICE_STABLE_SECONDS is never judged recovered
+    and never counted, so this figure has to stay above that window.
+
+    An unanswered liveness probe always spends its whole deadline, so the
+    liveness path costs the same either way. The registration path can have
+    both of its probes answered the instant they are asked, so its floor is the
+    intervals alone.
+    """
+    liveness = cfg.MODEM_PROBE_FAILURES * (
+        cfg.MODEM_PROBE_INTERVAL + cfg.MODEM_PROBE_TIMEOUT
+    )
+    if not cfg.MODEM_REGISTRATION_CHECK:
+        return liveness
+    return min(
+        liveness, cfg.MODEM_REGISTRATION_FAILURES * cfg.MODEM_PROBE_INTERVAL
+    )
+
+
+def _invariants(cfg):
+    """Every relationship between two operator-settable settings that has to
+    hold, as (name, holds, the names a single notice about it must mention
+    together).
+
+    A relationship that is only true by accident of the defaults is one that
+    will be broken by the first operator who tunes either side of it. Each one
+    here is either kept true by a clamp or, where two bounds genuinely
+    conflict, reported - and this is the list that says which relationships
+    there are among the settings an operator can actually reach from the
+    environment, so a new one of those cannot quietly join without one.
+
+    This is not the list of every relationship between two settings in this
+    file. TELEGRAM_LONG_POLL_SECONDS < TELEGRAM_REQUEST_TIMEOUT, for instance,
+    is just as real, but config.py deliberately hardcodes both (see the
+    comment there for why) - with no operator-settable value on either side,
+    there is nothing for a clamp to guard or a notice to report.
+    """
+    return [
+        (
+            "the shutdown path fits inside one stop grace period",
+            cfg.NOTIFY_TIMEOUT + cfg.SERIAL_CLOSE_TIMEOUT <= cfg.STOP_BUDGET_SECONDS,
+            ("SERIAL_CLOSE_TIMEOUT",),
+        ),
+        (
+            "the worst refresh gap stays inside the staleness window",
+            cfg.WATCHDOG_REFRESH_BUDGET <= cfg.HEALTH_STALE_SECONDS,
+            ("MODEM_PROBE_TIMEOUT", "HEALTH_STALE_SECONDS"),
+        ),
+        (
+            "the probe cannot refresh more slowly than half the window",
+            cfg.MODEM_PROBE_INTERVAL <= cfg.HEALTH_STALE_SECONDS / 2,
+            ("MODEM_PROBE_INTERVAL",),
+        ),
+        (
+            "the first recovery can be reached before the down clock runs out",
+            cfg.SERVICE_STABLE_SECONDS + cfg.WATCHDOG_CHECK_INTERVAL
+            < float(cfg.WATCHDOG_DOWN_SECONDS),
+            ("SERVICE_STABLE_SECONDS", "WATCHDOG_DOWN_SECONDS"),
+        ),
+        (
+            "a stall is not tolerated longer than an outright loss",
+            cfg.WATCHDOG_STALL_SECONDS <= float(cfg.WATCHDOG_DOWN_SECONDS),
+            ("WATCHDOG_STALL", "WATCHDOG_DOWN_SECONDS"),
+        ),
+        (
+            "the stall threshold clears the longest legitimate gap",
+            cfg.WATCHDOG_STALL_SECONDS >= cfg.WATCHDOG_STALL_FLOOR,
+            ("WATCHDOG_STALL",),
+        ),
+        (
+            "the backoff ceiling never sits below its own floor",
+            cfg.RECONNECT_BACKOFF_MAX >= cfg.RECONNECT_BACKOFF_MIN,
+            ("RECONNECT_BACKOFF_MAX", "RECONNECT_BACKOFF_MIN"),
+        ),
+        (
+            "a heartbeat failure outlasts the window that makes it countable",
+            cfg.SERVICE_STABLE_SECONDS < _fastest_raise_seconds(cfg),
+            ("SERVICE_STABLE_SECONDS", "WATCHDOG_CHURN_SESSIONS"),
+        ),
+        (
+            "the churn window can hold the threshold's worth of worst cycles",
+            cfg.WATCHDOG_CHURN_WINDOW
+            >= cfg.WATCHDOG_CHURN_SESSIONS
+            * (cfg.RECONNECT_BACKOFF_MAX + _worst_session_seconds(cfg)),
+            ("WATCHDOG_CHURN_WINDOW",),
+        ),
+    ]
+
+
+# Values an operator might plausibly reach for, including several that break
+# one invariant or another. Every one of them has to end up either satisfied
+# or explained.
+_TUNINGS = [
+    {},
+    {"NOTIFY_TIMEOUT": "10"},
+    {"NOTIFY_TIMEOUT": "9", "SERIAL_CLOSE_TIMEOUT": "9"},
+    {"SERIAL_CLOSE_TIMEOUT": "60"},
+    {"MODEM_PROBE_TIMEOUT": "30"},
+    {"MODEM_PROBE_INTERVAL": "40"},
+    {"MODEM_PROBE_INTERVAL": "55", "MODEM_PROBE_FAILURES": "5"},
+    {"HEALTH_STALE_SECONDS": "10"},
+    {"HEALTH_STALE_SECONDS": "600", "MODEM_PROBE_TIMEOUT": "60"},
+    {"WATCHDOG_DOWN_SECONDS": "100"},
+    # Short enough that the watchdog would exit before any component could
+    # reach its first recovery - a permanent restart loop on hardware that is
+    # working perfectly.
+    {"WATCHDOG_DOWN_SECONDS": "60"},
+    {"WATCHDOG_STALL_SECONDS": "30"},
+    {"MODEM_PROBE_FAILURES": "0", "MODEM_PROBE_TIMEOUT": "0"},
+    {"RECONNECT_BACKOFF_MIN": "10", "RECONNECT_BACKOFF_MAX": "5"},
+    # Requesting the probe deadline at exactly its own floor leaves _clamped
+    # silent - applied equals requested, so there is nothing for it to
+    # report - even though the schedule this pairs with still overflows the
+    # staleness window. Only the dedicated collision notice below catches
+    # this one; nothing else in CLAMP_NOTICES mentions the setting at all.
+    {"MODEM_PROBE_INTERVAL": "40", "MODEM_PROBE_TIMEOUT": "1"},
+    # The same shape on the shutdown path: requesting the close deadline at
+    # exactly its own floor leaves _clamped silent there too, even though
+    # NOTIFY_TIMEOUT alone already consumes the whole budget. Only the
+    # dedicated collision notice below catches this one.
+    {"NOTIFY_TIMEOUT": "10", "SERIAL_CLOSE_TIMEOUT": "1"},
+    # The churn window's floor is derived from three other settings, so it
+    # moves without being touched: a longer backoff or a slower probe schedule
+    # widens the slowest cycle it has to hold, and raising the session count
+    # multiplies it.
+    {"WATCHDOG_CHURN_WINDOW": "60"},
+    {"WATCHDOG_CHURN_SESSIONS": "20", "RECONNECT_BACKOFF_MAX": "300"},
+    # The registration check makes a session end after a run of readings rather
+    # than after one, so it multiplies the slowest cycle the window has to
+    # hold - and the count is a setting of its own that appears in no other
+    # bound. The first of these is the shipped count with the check switched
+    # on; the second is an operator asking the check for more patience.
+    {"MODEM_REGISTRATION_CHECK": "1"},
+    {"MODEM_REGISTRATION_CHECK": "1", "MODEM_REGISTRATION_FAILURES": "8"},
+    # A stable window wider than the fastest heartbeat failure, reached from
+    # each side: by lengthening the window, and by shortening the probe
+    # schedule it has to be read against. Either way the modem's own failures
+    # stop being counted, and only the settings table still says they are.
+    {"SERVICE_STABLE_SECONDS": "120"},
+    {"MODEM_PROBE_INTERVAL": "15"},
+]
+
+
+@pytest.mark.parametrize("tuning", _TUNINGS, ids=lambda t: "+".join(t) or "stock")
+def test_every_invariant_is_either_enforced_or_reported(monkeypatch, tuning):
+    for name, value in tuning.items():
+        monkeypatch.setenv(name, value)
+    reloaded = importlib.reload(config_module)
+    for description, holds, mentions in _invariants(reloaded):
+        if holds:
+            continue
+        assert any(
+            all(word in notice for word in mentions)
+            for notice in reloaded.CLAMP_NOTICES
+        ), (
+            f"{description!r} does not hold and no single notice says so: "
+            f"{reloaded.CLAMP_NOTICES}"
+        )
 
 
 # --- Credentials can never ride along ---------------------------------------

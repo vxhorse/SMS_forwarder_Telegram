@@ -69,16 +69,31 @@ health-file mtime comparison in `healthcheck.py`. A carrier-supplied message
 timestamp is message data, not a duration — that is not a violation.
 
 **`run()` must never return under normal operation.** A returning body is
-treated as a failure. Loop inside it. A session that ends sooner than
-`SERVICE_STABLE_SECONDS` is classified as flapping, which is what lets the
-watchdog tell a broken component from a busy one.
+treated as a failure. Loop inside it. How long a session lasts feeds two
+separate mechanisms, and calling both of them "flapping" hides a whole class of
+failure behind a word. A session that ends sooner than
+`SERVICE_STABLE_SECONDS` never resets the reconnection backoff or the log
+throttle, so a component that connects and fails immediately keeps looking
+broken instead of looking busy. Separately, and **however long its sessions
+last**, a component that keeps ending connected sessions is counted, and the
+watchdog ends the process at `WATCHDOG_CHURN_SESSIONS` of them inside
+`WATCHDOG_CHURN_WINDOW`. The second is what covers a failure slower to raise
+than the stable window — which the first, on its own, reads as a recovery.
 
 **Any loop that can complete an iteration without awaiting something that
 genuinely blocks is a bug.** A `StreamReader` at EOF returns `b""` with no
 await, which will spin a core at 100% and starve the event loop.
 
 **Tunables live in `config.py`,** with a floor where a zero value would disable
-the guard the setting exists for.
+the guard the setting exists for. Every relationship between two settings is
+either enforced by a clamp or reported by a startup notice — never neither. One
+that lives only in a comment is one the first operator to tune either side of it
+breaks silently.
+`tests/test_config.py::test_every_invariant_is_either_enforced_or_reported`
+walks the list of those relationships against configurations an operator might
+plausibly reach for, and fails if one holds neither way. A ceiling that is
+deliberately absent says so where the setting is documented, so an absent bound
+cannot be read as a forgotten one.
 
 **Comments, docstrings and log messages are English.** Telegram-facing user text
 stays in its current language — users read it. Comments explain the mechanism,

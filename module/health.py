@@ -10,6 +10,7 @@ snapshot file, which the healthcheck compares (see healthcheck.py).
 import json
 import os
 import time
+from collections import deque
 from typing import Callable, Optional
 
 import config
@@ -26,6 +27,7 @@ class HealthState:
         service_names: list,
         health_file: str = config.HEALTH_FILE,
         clock: Callable[[], float] = time.monotonic,
+        churn_window: float = config.WATCHDOG_CHURN_WINDOW,
     ):
         self._clock = clock
         self._health_file = health_file
@@ -51,6 +53,13 @@ class HealthState:
         # stalled, and must never be treated as the latter - that would
         # reinstate the startup deadline this project exists to remove.
         self._all_up_since: Optional[float] = None
+        self.churn_window = churn_window
+        # When each component's recovered sessions ended, most recent last.
+        # Only sessions that connected and then lasted long enough to be judged
+        # recovered are recorded here - see Supervisor._serve_session for why
+        # neither a component whose dependency has not appeared yet nor one
+        # that fails before that judgement may contribute to this.
+        self._session_ends = {name: deque() for name in service_names}
 
     def mark_up(self, name: str) -> None:
         """Mark a component ready. Idempotent: does not reset the timestamp."""
@@ -108,6 +117,56 @@ class HealthState:
             return
         service["progress"] = self._clock()
 
+    def record_session_end(self, name: str) -> None:
+        """Record that one recovered session of this component has ended.
+
+        Counted separately from mark_down because they answer different
+        questions. mark_down says the component is not working now;
+        this says it has stopped working again, which is the only evidence
+        that survives a component whose every failure is followed by a
+        recovery long enough to reset everything else.
+
+        Which is also why the caller reports only the sessions that reached
+        that recovery. A session that ended before it did reset nothing, so
+        the evidence of it is still in the down clock - which runs from the
+        last recovery, since mark_down re-stamps only a component that was up -
+        and the count is for what leaves no other trace. A component that
+        alternates between the two shapes is therefore measured fully by
+        neither: see the known limitation beside WATCHDOG_CHURN_SESSIONS in
+        config.py.
+        """
+        ends = self._session_ends.get(name)
+        if ends is None:
+            logger.warning(f"Ignoring session report for unregistered component: {name}")
+            return
+        ends.append(self._clock())
+
+    def reconnect_counts(self) -> dict:
+        """How many connected sessions each component has ended in the window.
+
+        Pruned on read rather than on write, so a component that stopped
+        failing does not keep an old count until something happens to it.
+        """
+        now = self._clock()
+        counts = {}
+        for name, ends in self._session_ends.items():
+            while ends and now - ends[0] > self.churn_window:
+                ends.popleft()
+            counts[name] = len(ends)
+        return counts
+
+    def churning(self, threshold: int) -> Optional[str]:
+        """Name a component that has ended `threshold` sessions in the window.
+
+        Per component rather than in total: two components each reconnecting
+        occasionally is not one component failing repeatedly, and a reading
+        that added them together could name neither.
+        """
+        for name, count in self.reconnect_counts().items():
+            if count >= threshold:
+                return name
+        return None
+
     def record_rssi(self, value: Optional[int]) -> None:
         """Record the most recent signal strength. Diagnostic only."""
         self._rssi = value
@@ -140,6 +199,9 @@ class HealthState:
             "services": {name: service["up"] for name, service in self._services.items()},
             "rssi": self._rssi,
             "registration": self._registration,
+            # Counts only. Diagnostic, and the one place this is visible before
+            # the watchdog acts on it.
+            "reconnects": self.reconnect_counts(),
         }
 
     def refresh_file(self) -> None:
@@ -160,42 +222,66 @@ class HealthState:
         self._last_refresh = self._clock()
 
     def stall_duration(self) -> Optional[float]:
-        """Seconds since the least recently advanced thing last advanced.
+        """Seconds since the least recently advanced component loop advanced.
 
-        Two kinds of thing are measured and the longest of them is returned:
-
-        - every component that is up, from the last time its own loop reported
-          progress. This is the reading that attributes a stall to a component.
-          A loop blocked on something that never returns raises nothing, so the
-          component stays marked up and no other reading in this process
-          changes at all.
-        - the snapshot file, from the last time it was written or the moment
-          the system last became whole, whichever is later. It says nothing
-          about any single component, because either component loop writes it
-          for both, and is kept only because it is also the reading that fails
-          when HEALTH_FILE itself can no longer be written.
-
-        The snapshot is not written at all while a component is down, so the
-        age it carries at the moment of a recovery measures the outage rather
-        than anything that is wrong now, and reading that as a stall would
-        restart the process for having reconnected. Measuring from the recovery
-        instead is what discounts it, and doing so here rather than downstream
-        is what makes it exact: this is where the moment is known. It expires
-        by itself, because the time since the recovery grows while the outage
-        it discounts does not, so an old outage cannot shorten a later stall.
+        This is the reading that attributes a stall to a component. A loop
+        blocked on something that never returns raises nothing, so the
+        component stays marked up and no other reading in this process changes
+        at all; its own progress stamp is the only thing that stops moving.
 
         A component that is down is not measured here. Its loop is not running,
         so of course it is not advancing; that state belongs to down_duration()
         and the far longer tolerance chosen for it.
 
-        None means the system has not yet been fully up even once, which is a
-        legitimate waiting state - hardware can appear long after the process
-        does. Only a system that was healthy and then stopped advancing is
-        stalled.
+        The snapshot file is deliberately not part of this reading. It is
+        written by whichever loop reaches the call first, so it says nothing
+        about any single component - and, more to the point, the one failure
+        that makes it age on its own is a file that cannot be written, which
+        restarting the process cannot fix. See snapshot_age().
+
+        None means either that the system has not yet been fully up even once
+        - a legitimate waiting state, since hardware can appear long after the
+        process does - or that every component is currently down, which
+        leaves nothing here to measure; that second case is down_duration()'s
+        business, not this reading's. Only a system with at least one
+        component currently up, and that was healthy at some point before, is
+        ever stalled.
         """
         if self._all_up_since is None:
             return None
         now = self._clock()
+        ages = [
+            now - service["progress"]
+            for service in self._services.values()
+            if service["up"]
+        ]
+        return max(ages) if ages else None
+
+    def snapshot_age(self) -> Optional[float]:
+        """Seconds since the snapshot was last written, or since the system
+        last became whole, whichever is later.
+
+        Kept apart from stall_duration() because the two need different
+        answers. A snapshot that stops being written while every component
+        loop keeps reporting progress means the loops are fine and the file is
+        not - the write is the step that failed - and restarting the process
+        cannot make an unwritable path writable. What it can do is repeat the
+        whole startup every few minutes for ever, which is worse than the fault
+        it is reacting to: an unhealthy container that keeps forwarding
+        messages beats one that stops to reinitialise the modem on a timer.
+
+        The snapshot is not written at all while a component is down, so the
+        age it carries at the moment of a recovery measures the outage rather
+        than anything that is wrong now. Measuring from the recovery instead is
+        what discounts it, and doing so here rather than downstream is what
+        makes it exact: this is where the moment is known. It expires by
+        itself, because the time since the recovery grows while the outage it
+        discounts does not.
+
+        None means the system has not yet been fully up even once.
+        """
+        if self._all_up_since is None:
+            return None
         # A snapshot that has never been written has no age of its own, and the
         # absence of one is not a reason to stop measuring: a process that
         # cannot write HEALTH_FILE at all is one whose healthcheck will never
@@ -203,15 +289,7 @@ class HealthState:
         written = self._all_up_since
         if self._last_refresh is not None and self._last_refresh > written:
             written = self._last_refresh
-        ages = [now - written]
-        # Anything reported up has a progress stamp: mark_up is the only way to
-        # become up, and it writes one.
-        ages.extend(
-            now - service["progress"]
-            for service in self._services.values()
-            if service["up"]
-        )
-        return max(ages)
+        return self._clock() - written
 
     def clear_file(self) -> None:
         """Remove the snapshot file. Safe to call repeatedly."""
