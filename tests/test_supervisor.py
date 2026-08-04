@@ -516,16 +516,21 @@ async def test_watchdog_stays_quiet_while_components_are_up():
 class _StallHealth:
     """Minimal health double: answers only what the watchdog asks."""
 
-    def __init__(self, down=0.0, stall=None, snapshot=None):
+    def __init__(self, down=0.0, stall=None, snapshot=None, churner=None):
         self.down = down
         self.stall = stall
         self.snapshot = snapshot
+        self.churner = churner
+        # Read by the watchdog's own log line, so the double has to carry it
+        # exactly as the real HealthState does.
+        self.churn_window = config.WATCHDOG_CHURN_WINDOW
         # Counts the inspections so a test can tell "the watchdog looked and
         # held its fire" apart from "the watchdog never got as far as looking",
         # which would otherwise satisfy the same assertions.
         self.down_reads = 0
         self.stall_reads = 0
         self.snapshot_reads = 0
+        self.churn_reads = 0
 
     def down_duration(self):
         self.down_reads += 1
@@ -538,6 +543,10 @@ class _StallHealth:
     def snapshot_age(self):
         self.snapshot_reads += 1
         return self.snapshot
+
+    def churning(self, threshold):
+        self.churn_reads += 1
+        return self.churner
 
 
 # The watchdog is driven with interval=0, so every scheduling step below is one
@@ -1116,3 +1125,144 @@ async def test_the_unwritable_snapshot_report_is_throttled(monkeypatch):
 
         shutdown.set()
         await task
+
+
+async def test_a_component_that_keeps_reconnecting_is_counted(tmp_path, monkeypatch):
+    """The failure both other criteria are blind to, driven end to end.
+
+    Each session is judged stable before it fails, which is the whole shape of
+    this failure: that judgement re-stamps every clock the other two criteria
+    measure from, so a component doing this for ever leaves down_duration() and
+    stall_duration() both reading as if it had just come back.
+
+    Synchronised on the supervisor's own mark_up rather than on elapsed time,
+    so the session really has been judged stable before it ends, and the test
+    terminates on a condition it controls.
+    """
+    clock = _ManualClock()
+    judged_stable = asyncio.Event()
+
+    class SignallingHealth(HealthState):
+        """The real HealthState, announcing the moment a session is accepted."""
+
+        def mark_up(self, name):
+            super().mark_up(name)
+            judged_stable.set()
+
+    health = SignallingHealth(
+        ["device", "telegram"],
+        health_file=str(tmp_path / "healthy"),
+        clock=clock,
+        churn_window=10_000.0,
+    )
+    # The window is what the session has to outlast to be accepted; zero makes
+    # the acceptance happen on the next scheduling round instead of in a minute.
+    monkeypatch.setattr(config, "SERVICE_STABLE_SECONDS", 0.0)
+
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+    supervisor.backoff_factory = lambda: Backoff(minimum=0.0, maximum=0.0)
+
+    sessions = 0
+
+    class Flapper:
+        name = "device"
+
+        async def connect_once(self):
+            return None
+
+        async def run(self):
+            nonlocal sessions
+            sessions += 1
+            judged_stable.clear()
+            await judged_stable.wait()
+            if sessions >= 4:
+                shutdown.set()
+            raise RuntimeError("the modem stopped answering")
+
+        async def teardown(self):
+            return None
+
+    await asyncio.wait_for(supervisor.run_service(Flapper()), timeout=_FAILSAFE)
+    assert sessions == 4
+    assert health.reconnect_counts()["device"] == 4
+    assert health.churning(threshold=4) == "device"
+
+
+async def test_a_component_that_never_connects_is_never_counted(tmp_path):
+    """The safety property this criterion stands on.
+
+    A USB modem can appear minutes after the container does, and connect_once()
+    fails on every attempt until it does. Counting those would put a ceiling on
+    how long this process may wait for its hardware - which is the startup
+    deadline this project exists to remove, arrived at from a new direction.
+    """
+    clock = _ManualClock()
+    health = HealthState(
+        ["device", "telegram"],
+        health_file=str(tmp_path / "healthy"),
+        clock=clock,
+        churn_window=10_000.0,
+    )
+    shutdown = asyncio.Event()
+    supervisor = Supervisor(health, shutdown)
+    supervisor.backoff_factory = lambda: Backoff(minimum=0.0, maximum=0.0)
+
+    attempts = 0
+
+    class NeverArrives:
+        name = "device"
+
+        async def connect_once(self):
+            nonlocal attempts
+            attempts += 1
+            if attempts >= 50:
+                shutdown.set()
+            raise FileNotFoundError("the port is not present yet")
+
+        async def run(self):  # pragma: no cover - never reached
+            raise AssertionError("run must not be reached")
+
+        async def teardown(self):
+            return None
+
+    await asyncio.wait_for(supervisor.run_service(NeverArrives()), timeout=_FAILSAFE)
+    assert attempts >= 50
+    assert health.reconnect_counts()["device"] == 0
+    assert health.churning(threshold=2) is None
+
+
+async def test_the_watchdog_exits_on_a_churning_component():
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=0.0, churner="device")
+    sup = Supervisor(health, shutdown)
+    with _LogCapture() as log:
+        await asyncio.wait_for(
+            sup.watchdog_loop(
+                threshold=3600.0,
+                interval=0.0,
+                stall_threshold=240.0,
+                churn_sessions=5,
+            ),
+            timeout=_FAILSAFE,
+        )
+    assert sup.exit_reason == "churning"
+    assert "device" in log.text
+
+
+async def test_the_watchdog_holds_fire_below_the_churn_threshold():
+    shutdown = asyncio.Event()
+    health = _StallHealth(down=0.0, stall=0.0, churner=None)
+    sup = Supervisor(health, shutdown)
+    task = asyncio.create_task(
+        sup.watchdog_loop(
+            threshold=3600.0, interval=0.0, stall_threshold=240.0, churn_sessions=5
+        )
+    )
+    for _ in range(_INERT_STEPS):
+        await asyncio.sleep(0)
+    assert not task.done()
+    assert sup.exit_reason is None
+    assert health.churn_reads >= _MIN_INSPECTIONS
+    shutdown.set()
+    await task

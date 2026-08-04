@@ -514,3 +514,61 @@ if WATCHDOG_STALL_FLOOR > WATCHDOG_DOWN_SECONDS:
         "that is still working - but the documented invariant no longer holds "
         "for this configuration."
     )
+
+# How many connected sessions one component may end inside WATCHDOG_CHURN_WINDOW
+# before the process exits and lets the container runtime start a fresh one.
+#
+# This is the criterion for the failures neither of the two above can see. A
+# session counts as recovered once it has lasted SERVICE_STABLE_SECONDS, and
+# that recovery re-stamps every clock the other two criteria measure from - so
+# any failure that takes longer than that window to raise reaches the point
+# where it looks recovered before the point where it fails, and repeats for
+# ever with the down clock and the stall clock both reading zero. The liveness
+# probe is one such failure at the values this file ships: a modem that opens
+# and answers the handshake but then stops answering AT+CSQ takes
+# WATCHDOG_REFRESH_BUDGET to raise, which is longer than
+# SERVICE_STABLE_SECONDS.
+#
+# Counting reconnections rather than lengthening the stable window is what
+# makes this cover the failures nobody has enumerated yet. It does not ask what
+# broke; it asks whether this component keeps connecting and disconnecting,
+# which is the one thing every such loop has in common.
+#
+# Floored at two for the same reason as MODEM_REGISTRATION_FAILURES: one
+# reconnection is not a pattern, and at zero or one a single transient failure
+# ends the process.
+WATCHDOG_CHURN_SESSIONS = _clamped(
+    "WATCHDOG_CHURN_SESSIONS", int(os.getenv("WATCHDOG_CHURN_SESSIONS", "5")), low=2
+)
+# The window those sessions are counted in, in seconds.
+#
+# Floored so that it can hold WATCHDOG_CHURN_SESSIONS of the slowest cycle
+# there is - a full backoff followed by the longest a component can take to
+# raise. Under that floor the count can never reach the threshold and the
+# criterion is simply switched off while looking enabled. It is a floor against
+# a false negative, unlike most of the bounds in this file.
+#
+# Deliberately unbounded above. Widening it only makes the criterion more eager,
+# in proportion to what the operator asked for, and no value of it disables a
+# guard or reinstates a failure - which is what every ceiling in this file is
+# for. The absence of one here is a decision, not an oversight.
+WATCHDOG_CHURN_WINDOW_FLOOR = WATCHDOG_CHURN_SESSIONS * (
+    RECONNECT_BACKOFF_MAX + WATCHDOG_REFRESH_BUDGET
+)
+_churn_window_env = os.environ.get("WATCHDOG_CHURN_WINDOW")
+_churn_window_requested = (
+    float(_churn_window_env) if _churn_window_env is not None else 1800.0
+)
+WATCHDOG_CHURN_WINDOW = max(WATCHDOG_CHURN_WINDOW_FLOOR, _churn_window_requested)
+
+# Reported only for a window the operator actually set, on the same reasoning
+# as WATCHDOG_STALL_SECONDS above: the shipped default clears the floor on its
+# own, and announcing arithmetic nobody asked about on every start is the noise
+# an operator learns to stop reading.
+if _churn_window_env is not None and WATCHDOG_CHURN_WINDOW != _churn_window_requested:
+    CLAMP_NOTICES.append(
+        f"WATCHDOG_CHURN_WINDOW was requested as {_churn_window_requested:g} but "
+        f"is running as {WATCHDOG_CHURN_WINDOW:g} (floor is "
+        f"{WATCHDOG_CHURN_WINDOW_FLOOR:g}, which is "
+        f"{WATCHDOG_CHURN_SESSIONS:g} worst-case reconnection cycles)"
+    )

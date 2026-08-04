@@ -10,6 +10,7 @@ snapshot file, which the healthcheck compares (see healthcheck.py).
 import json
 import os
 import time
+from collections import deque
 from typing import Callable, Optional
 
 import config
@@ -26,6 +27,7 @@ class HealthState:
         service_names: list,
         health_file: str = config.HEALTH_FILE,
         clock: Callable[[], float] = time.monotonic,
+        churn_window: float = config.WATCHDOG_CHURN_WINDOW,
     ):
         self._clock = clock
         self._health_file = health_file
@@ -51,6 +53,12 @@ class HealthState:
         # stalled, and must never be treated as the latter - that would
         # reinstate the startup deadline this project exists to remove.
         self._all_up_since: Optional[float] = None
+        self.churn_window = churn_window
+        # When each component's connected sessions ended, most recent last.
+        # Only sessions that actually connected are recorded here - see
+        # Supervisor.run_service for why a component whose dependency has not
+        # appeared yet must never contribute to this.
+        self._session_ends = {name: deque() for name in service_names}
 
     def mark_up(self, name: str) -> None:
         """Mark a component ready. Idempotent: does not reset the timestamp."""
@@ -108,6 +116,47 @@ class HealthState:
             return
         service["progress"] = self._clock()
 
+    def record_session_end(self, name: str) -> None:
+        """Record that one connected session of this component has ended.
+
+        Counted separately from mark_down because they answer different
+        questions. mark_down says the component is not working now;
+        this says it has stopped working again, which is the only evidence
+        that survives a component whose every failure is followed by a
+        recovery long enough to reset everything else.
+        """
+        ends = self._session_ends.get(name)
+        if ends is None:
+            logger.warning(f"Ignoring session report for unregistered component: {name}")
+            return
+        ends.append(self._clock())
+
+    def reconnect_counts(self) -> dict:
+        """How many connected sessions each component has ended in the window.
+
+        Pruned on read rather than on write, so a component that stopped
+        failing does not keep an old count until something happens to it.
+        """
+        now = self._clock()
+        counts = {}
+        for name, ends in self._session_ends.items():
+            while ends and now - ends[0] > self.churn_window:
+                ends.popleft()
+            counts[name] = len(ends)
+        return counts
+
+    def churning(self, threshold: int) -> Optional[str]:
+        """Name a component that has ended `threshold` sessions in the window.
+
+        Per component rather than in total: two components each reconnecting
+        occasionally is not one component failing repeatedly, and a reading
+        that added them together could name neither.
+        """
+        for name, count in self.reconnect_counts().items():
+            if count >= threshold:
+                return name
+        return None
+
     def record_rssi(self, value: Optional[int]) -> None:
         """Record the most recent signal strength. Diagnostic only."""
         self._rssi = value
@@ -140,6 +189,9 @@ class HealthState:
             "services": {name: service["up"] for name, service in self._services.items()},
             "rssi": self._rssi,
             "registration": self._registration,
+            # Counts only. Diagnostic, and the one place this is visible before
+            # the watchdog acts on it.
+            "reconnects": self.reconnect_counts(),
         }
 
     def refresh_file(self) -> None:

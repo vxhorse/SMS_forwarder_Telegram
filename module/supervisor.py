@@ -123,10 +123,11 @@ class Supervisor:
     or in main.py:
       1. SIGTERM / SIGINT
       2. FatalConfigError, which restarting cannot fix but which must be visible
-      3. The watchdog, once a component has been down past its threshold or a
-         component loop has stopped advancing past its own. An unwritable
-         health snapshot is reported by the same watchdog but is not among
-         these three: restarting cannot fix an unwritable path.
+      3. The watchdog, once a component has been down past its threshold, a
+         component loop has stopped advancing past its own, or a component has
+         ended too many connected sessions inside the churn window. An
+         unwritable health snapshot is reported by the same watchdog but is not
+         among these three: restarting cannot fix an unwritable path.
     """
 
     def __init__(self, health: HealthState, shutdown_event: asyncio.Event):
@@ -145,8 +146,17 @@ class Supervisor:
 
         try:
             while not self.shutdown_event.is_set():
+                # Whether this attempt got as far as a connected session. Only
+                # those are counted as reconnections: a component whose
+                # dependency has not appeared yet fails inside connect_once()
+                # on every attempt, for as long as that takes, and that is a
+                # waiting state this project must never put a ceiling on.
+                # Something that has never connected is already covered by the
+                # down criterion and its far longer tolerance.
+                session_began = False
                 try:
                     await service.connect_once()
+                    session_began = True
                     await self._serve_session(service, backoff, throttle)
                 except FatalConfigError:
                     self.exit_reason = "fatal_config"
@@ -154,6 +164,8 @@ class Supervisor:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    if session_began:
+                        self.health.record_session_end(service.name)
                     self.health.mark_down(service.name, exc)
                     if throttle.should_log():
                         logger.warning(
@@ -259,8 +271,9 @@ class Supervisor:
         threshold: float = config.WATCHDOG_DOWN_SECONDS,
         interval: float = config.WATCHDOG_CHECK_INTERVAL,
         stall_threshold: float = config.WATCHDOG_STALL_SECONDS,
+        churn_sessions: int = config.WATCHDOG_CHURN_SESSIONS,
     ) -> None:
-        """Exit the process on either of the two ways a component can be lost;
+        """Exit the process on any of the three ways a component can be lost;
         report, without exiting, the one way the snapshot file can be lost.
 
         A component that fails loudly is caught by down_duration: it raised,
@@ -270,6 +283,17 @@ class Supervisor:
         It is still marked up, so down_duration reads zero, but its own loop
         has stopped reporting that it advanced. Without this second check that
         failure is invisible and the process sits there forever.
+
+        A component that fails, recovers, and fails again for ever is caught by
+        churning, and is invisible to both of the above by construction. A
+        session counts as recovered once it has lasted SERVICE_STABLE_SECONDS,
+        and that judgement re-stamps every clock the first two measure from -
+        so any failure taking longer than that window to raise reaches the
+        point where it looks recovered before the point where it fails, and
+        repeats with the down clock at zero and the stall clock at zero. The
+        first two ask what state a component is in now; this one asks how many
+        times it has been in that state lately, which is the only reading such
+        a loop leaves behind.
 
         A snapshot that stops being written while every component loop keeps
         advancing is caught by snapshot_age, but only reported: the loops are
@@ -313,6 +337,26 @@ class Supervisor:
                     f"container runtime can restart everything"
                 )
                 self.exit_reason = "watchdog"
+                self.shutdown_event.set()
+                return
+
+            # Not gated on the down reading, unlike the two below. A component
+            # that keeps reconnecting spends much of its time down, so waiting
+            # for a moment when nothing is would mean sampling exactly the
+            # phase this criterion is looking for and missing it. The count is
+            # a history rather than an instantaneous reading, so it is
+            # meaningful whatever the component happens to be doing right now.
+            churner = self.health.churning(churn_sessions)
+            if churner is not None:
+                logger.error(
+                    f"Watchdog tripped: component {churner} has ended "
+                    f"{churn_sessions} connected sessions within "
+                    f"{self.health.churn_window:.0f}s. Each one lasted long "
+                    f"enough to count as a recovery, so neither the down clock "
+                    f"nor the stall clock ever accumulated; exiting so the "
+                    f"container runtime can restart everything"
+                )
+                self.exit_reason = "churning"
                 self.shutdown_event.set()
                 return
 

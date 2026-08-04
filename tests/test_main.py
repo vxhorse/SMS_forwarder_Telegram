@@ -440,6 +440,12 @@ async def test_a_stalled_process_exits_one(monkeypatch, tmp_path):
     assert await asyncio.wait_for(main.run(), timeout=_FAILSAFE) == 1
 
 
+def test_a_churning_component_asks_for_a_restart():
+    """Same request as the other two watchdog reasons, so the same code. The
+    logs say which of the three it was."""
+    assert main.EXIT_CODES["churning"] == main.EXIT_FAILURE
+
+
 async def test_a_configuration_error_exits_two(monkeypatch, tmp_path):
     """Restarting cannot supply a token that was never configured, so this is
     the one failure that has to be told apart from every other one."""
