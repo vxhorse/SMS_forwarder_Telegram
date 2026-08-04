@@ -52,7 +52,7 @@ graph TD
 
     DM -. "上报状态" .-> HS
     Bot -. "上报状态" .-> HS
-    WD -. "掉线时长" .-> HS
+    HS -. "掉线 / 停滞 / 重连次数 / 快照陈旧时长" .-> WD
     HS -. "状态快照文件" .-> HC
 ```
 
@@ -211,9 +211,9 @@ docker compose logs -f     # 跟踪启动过程
 | `MODEM_PROBE_TIMEOUT` | `5.0` | 模块应答一次探测的时限 | 下限 1，上限为 `(HEALTH_STALE_SECONDS − MODEM_PROBE_FAILURES × MODEM_PROBE_INTERVAL) / (MODEM_PROBE_FAILURES + 1)`，**当前默认为 7.5**。模块应答慢时正是要调大它，而一旦越过该值，两次快照刷新之间最坏的间隔就会超出 `HEALTH_STALE_SECONDS`，健康检查会把正常工作的进程判为失败 |
 | `MODEM_PROBE_FAILURES` | `3` | 连续丢失多少次探测后触发重连 | 下限 1：计数达到该值时循环即抛错，所以取零与取一行为完全相同，却看起来像个开关。故意不设上限——更有耐心只是推迟重连，且 `MODEM_PROBE_TIMEOUT` 的上限会随它增大而收紧 |
 | `MODEM_REGISTRATION_CHECK` | `0` | 是否额外询问模块是否已驻网。默认关闭——见[驻网检查](#驻网检查) | 只有开与关，不是数值。它与下面的次数分成两个设置，正是为了让「调整耐心」不会顺手把这项守卫关掉 |
-| `MODEM_REGISTRATION_FAILURES` | `3` | 开启该检查后，连续多少次读到「未驻网」触发重连 | 下限 2：小区切换时驻网状态会短暂中断，单次读数说明不了任何事；取零则会在看起来像设置的同时把检查关掉。故意不设上限——更有耐心只是推迟会话结束，且在检查开启时 `WATCHDOG_CHURN_WINDOW` 的下限按这个次数成倍放大，窗口不会跟不上因此变慢的周期 |
+| `MODEM_REGISTRATION_FAILURES` | `3` | 开启该检查后，连续多少次读到「未驻网」触发重连 | 下限 2：小区切换时驻网状态会短暂中断，单次读数说明不了任何事；而计数达到该值时会话即结束，所以取零与取一行为完全相同，却看起来像个开关——真正的开关是单独存在的 `MODEM_REGISTRATION_CHECK`。故意不设上限——更有耐心只是推迟会话结束，且在检查开启时 `WATCHDOG_CHURN_WINDOW` 的下限按这个次数成倍放大，窗口不会跟不上因此变慢的周期 |
 | `AT_COMMAND_TIMEOUT` | `3.0` | 单条AT命令的时限 | 故意无界。它约束的是一条命令而非整个循环；某条命令若拖过心跳探测自身的时限，会由该探测及其触发的重连接手 |
-| `AT_SLOW_COMMAND_TIMEOUT` | `10.0` | 慢速命令（`AT&F`、`AT+CFUN`、`AT&W`）的时限 | 故意无界，理由同上。这些命令在初始化阶段执行，而这一段等待本服务从不设时限 |
+| `AT_SLOW_COMMAND_TIMEOUT` | `10.0` | 慢速命令（`AT&F`、`AT+CFUN`、`AT&W`，以及列出已存短信的 `AT+CMGL=4`）的时限 | 故意无界，理由同上。这些命令在初始化阶段执行，而这一段等待本服务从不设时限 |
 | `SERIAL_CLOSE_TIMEOUT` | `5.0` | 释放串口时等待缓冲区排空的时限，超时后强制关闭 | 下限 1，上限为同一份十秒关停预算中 `NOTIFY_TIMEOUT` 用剩的部分——默认值恰好用满：5 + 5 = 10。当下限与该上限相撞时以下限为准，并由启动通知说明该预算已不再成立 |
 | `HEALTH_FILE` | `/tmp/healthy` | 健康检查读取的状态快照文件 | 无——这是一个路径。写不进去的路径只会被报出、而不会触发重启，见[读懂健康检查](#读懂健康检查) |
 | `HEALTH_STALE_SECONDS` | `120` | 该快照的最大允许陈旧时间 | 下限 2：`MODEM_PROBE_INTERVAL` 被钳到它的一半但绝不低于 1，窗口更短就会短于可能的最快刷新间隔。故意不设上限——它表达的是运维者对「快照可以多陈旧」的容忍度，而两个探测上限都由它推导得出，放宽它会让二者同步放宽 |
@@ -221,7 +221,7 @@ docker compose logs -f     # 跟踪启动过程
 | `WATCHDOG_STALL_SECONDS` | *(推导得出)* | 组件循环虽仍报告就绪却停止推进达该时长后退出进程 | 默认取 `HEALTH_STALE_SECONDS` 的两倍，再由推导出的下限抬高（**当前默认约 310**），并以 `WATCHDOG_DOWN_SECONDS` 为上限，下限最后生效。低于该下限，看门狗会重启一个只是在耐心等待慢模块的进程 |
 | `WATCHDOG_CHECK_INTERVAL` | `30.0` | 看门狗检查间隔 | 下限 1：取零会把看门狗变成忙等循环。故意不设上限——它只是采样频率，每条阈值都以各自的时钟度量、而非以本循环采样的疏密度量，所以看门狗变慢只会推迟重启，不会漏掉 |
 | `WATCHDOG_CHURN_SESSIONS` | `10` | 单个组件在下面这个窗口内结束多少次已连接会话后退出进程 | 下限 2：一次重连算不上模式，取零或一时单次瞬时故障就会结束进程。故意不设上限——阈值更高只会让判据更迟钝，且 `WATCHDOG_CHURN_WINDOW` 的下限按它成倍放大，窗口不会跟不上要容纳的次数 |
-| `WATCHDOG_CHURN_WINDOW` | `1800.0` | 统计这些会话的时间窗 | 下限为 `WATCHDOG_CHURN_SESSIONS × (RECONNECT_BACKOFF_MAX + 组件抛错最慢所需的时间)`，**当前默认为 1400**；开启 `MODEM_REGISTRATION_CHECK=1` 时为 **3600**，因为该检查要连续读到 `MODEM_REGISTRATION_FAILURES` 次才结束会话，而不是一次，最慢周期因此成倍拉长。低于该值，计数永远到不了阈值，判据会在看起来仍启用的同时形同关闭——与本表中其他下限不同，这是一条防漏报的下限。**故意不设上限**：放宽它只会让判据按运维者要求的比例变得更积极，任何取值都不会关掉某项守卫或让某种故障重新出现，而这正是本表中每一条上限存在的理由 |
+| `WATCHDOG_CHURN_WINDOW` | `1800.0` | 统计这些会话的时间窗 | 下限为 `WATCHDOG_CHURN_SESSIONS × (RECONNECT_BACKOFF_MAX + 组件抛错最慢所需的时间)`，**当前默认为 1400**；开启 `MODEM_REGISTRATION_CHECK=1` 时为 **3600**。低于该值，计数永远到不了阈值，判据会在看起来仍启用的同时形同关闭——与本表中其他下限不同，这是一条防漏报的下限。**故意不设上限**：放宽它只会让判据按运维者要求的比例变得更积极，任何取值都不会关掉某项守卫或让某种故障重新出现，而这正是本表中每一条上限存在的理由 |
 
 上表中凡是写成公式、或写成另一个设置名字的边界，都是推导得出而非固定的：
 它所依赖的任何东西一动，它就跟着动。这一列大部分都是推导得出的，
@@ -256,6 +256,12 @@ docker compose logs -f     # 跟踪启动过程
 
 如果确实要设置，请按服务自身看到的路径填写。使用本仓库的编排文件时，
 主机的 `/dev` 被挂载到 `/hostdev`，因此端口是 `/hostdev/ttyUSB2`，而不是 `/dev/ttyUSB2`。
+
+设置它会把自动发现整个关掉：上面那轮扫描根本不会执行，填写的路径按原样使用而不做任何校验。
+因此填错或拼错的路径与「硬件还没就位」无法区分，并且会被同样对待——无限期等待，
+日志里只有 `Device <path> is not present yet (check N)`，
+而 `candidate` 或 `discovered` 一行都不会出现，因为压根没有探测过任何端口。
+若看到这种情形，请清空 `SMS_PORT`，让自动发现把它找到的东西报出来。
 
 ### 驻网检查
 
@@ -319,6 +325,12 @@ docker compose exec sms-forwarder cat /tmp/healthy
 只有全部组件就绪时才会写入该文件，且每个组件都会从自己的循环中刷新它，
 因此进程一旦不再运行就不会再刷新，遗留下来的文件自然变陈旧。
 仅仅文件新鲜、或者文件存在，都不会被当作健康。
+
+另有两个字段只用于诊断，上面那个答案并不读它们。`rssi` 是模块最近一次 `+CSQ` 应答的
+第一个值——也就是心跳本身，因此「应答了但信号很弱」与「彻底不应答」仍然分得清。
+它是模块报出的原始 `<rssi>` 档位，而不是 dBm 数值；在收到第一次应答之前为 `null`。
+`registration` 是最近一次驻网状态，无论据此动作的那项检查开还是关都会发布，
+详见「驻网检查」一节。
 
 快照中还有一个 `reconnects` 对象：逐个组件给出它在 `WATCHDOG_CHURN_WINDOW`
 之内结束了多少次已连接的会话。**只有计数**——没有时间戳、没有原因，
@@ -422,9 +434,9 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
 
 ## 注意事项
 
-- **长短信支持**：本服务已支持长短信自动合并，分片短信会在60秒内等待所有分片到达后合并转发
+- **长短信支持**：本服务已支持长短信自动合并，分片短信会在60秒内等待所有分片到达后合并转发。分片始终凑不齐的短信会被丢弃，而不是按残片转发——日志为 `Concatenated message timed out from ...; discarding them`——因为半条短信读起来像一整条。这项检查只在又有一条分片短信到达时才执行，所以若之后再没有长短信到来，缓存中的分片就只是永远送不出去，也不会有任何日志
 - **兼容性**：不同型号的模块兼容性不同，某些模块可能不支持长文本短信的收发
-- **稳定性**：各组件独立按指数退避重连；看门狗在三种信号下重启进程——某组件掉线超过 `WATCHDOG_DOWN_SECONDS`；某组件循环虽仍报告就绪却停止推进达 `WATCHDOG_STALL_SECONDS`；或单个组件在 `WATCHDOG_CHURN_WINDOW` 之内结束了 `WATCHDOG_CHURN_SESSIONS` 次已连接的会话。健康快照写不出去是唯一一种只报出、不重启的故障
+- **稳定性**：各组件独立按指数退避重连；看门狗在三种信号中的任意一种下重启进程，而健康快照写不出去是唯一一种只报出、不重启的故障。三种信号分别是什么、各自以哪条阈值衡量，详见「读懂健康检查」一节
 - **串口选择**：优先让 `SMS_PORT` 保持为空，由自动发现决定；只有当发现选错设备时才设置，并填写 `SMS_DEV_ROOT` 之下的路径
 - **没有硬件不算错误**：未接入模块时，服务会无限期等待并重试，其间容器报告为不健康
 - **SIM卡检测**：确保SIM卡正确插入并有足够余额
@@ -435,7 +447,8 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
 
 1. **短信无法收发**：
    - 在日志中确认实际发现的端口：`docker compose logs | grep -i port`
-   - 确认SIM卡状态（是否有信号、余额）
+   - 确认SIM卡状态（是否有信号、余额）。模块最近报出的信号强度就是快照里的 `rssi` 字段：
+     `docker compose exec sms-forwarder cat /tmp/healthy`
    - 查看日志：`docker logs sms-forwarder`
 
 2. **Telegram通信问题**：
@@ -458,9 +471,11 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
 4. **本项目尚未验证过的模块**：
    - 初始化序列中有两条厂商专有命令（`AT+QCFG`、`AT+QURCCFG`）。不支持它们的模块会记录
      `... was not acknowledged; continuing setup` 并继续执行，这是无害的
-   - 只有四条命令是必需的：`AT+CFUN=1`、`AT+CMGF=0`、`AT+CPMS` 与 `AT+CNMI`。
-     日志出现 `Modem did not acknowledge <command>` 并随即重连，说明其中一条被拒绝，
-     该模块按现状无法驱动
+   - 必需的命令有五条：`AT+CFUN=1`、`AT+CMGF=0`、`AT+CPMS`、`AT+CNMI` 与 `AT+CMGL=4`。
+     前四条中若有一条被拒绝，日志会出现 `Modem did not acknowledge <command>` 并随即重连，
+     说明该模块按现状无法驱动。第五条是列出已存短信，它之所以同样致命，理由更尖锐——
+     紧随其后的命令会清空存储区，因此列不出来就等于销毁尚未读取的短信；
+     它的日志是 `Modem did not acknowledge AT+CMGL=4; store left unread`
    - [`doc/README.md`](doc/README.md) 列出了本服务发出的每一条命令及其用途，
      可据此在您自己模块的AT命令手册中逐条查阅
 
@@ -475,3 +490,15 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
    - 若容器不健康、而日志里出现的是 `HEALTH_FILE has not been written for ...`，
      这是唯一一种故意不重启的情形：循环都在跑，只是快照文件写不进去。
      详见「读懂健康检查」一节
+
+6. **容器立刻重启、始终跑不起来**：
+   - 这是首次运行最常见的失败，而第 5 条描述的并不是它：进程在启动阶段就结束了，
+     而不是带着故障继续留在那里，所以在 `restart: unless-stopped` 之下容器被一遍遍重启，
+     根本来不及让健康状态说明任何事
+   - 最常见的原因是 `.env` 里仍然是 `.env.example` 附带的占位凭据。退出前日志会说明这一点：
+     `Configuration is invalid, restarting cannot fix it: BOT_TOKEN is not configured`
+     ——或者同一行点名 `CHAT_ID`
+   - 进程的退出码是 **2** 而不是 1。这个码专门留给「重启也修不好的配置」，
+     所以不看日志也能靠它把这种情形与看门狗触发的重启区分开：
+     `docker inspect --format '{{.State.ExitCode}}' sms-forwarder`
+   - 把 `.env` 中的 `BOT_TOKEN` 与 `CHAT_ID` 改成你自己的值，再执行 `docker compose up -d`

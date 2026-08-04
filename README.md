@@ -52,7 +52,7 @@ graph TD
 
     DM -. "Report State" .-> HS
     Bot -. "Report State" .-> HS
-    WD -. "Down Duration" .-> HS
+    HS -. "Down / Stall / Churn / Snapshot Age" .-> WD
     HS -. "Snapshot File" .-> HC
 ```
 
@@ -224,9 +224,9 @@ never be read as a forgotten one.
 | `MODEM_PROBE_TIMEOUT` | `5.0` | How long the modem has to answer a probe | 1 to `(HEALTH_STALE_SECONDS − MODEM_PROBE_FAILURES × MODEM_PROBE_INTERVAL) / (MODEM_PROBE_FAILURES + 1)`, which is **7.5 as shipped**. Raising this is exactly what one does for a slow modem, and past that figure the worst gap between two snapshot refreshes leaves `HEALTH_STALE_SECONDS` and the healthcheck fails a working process |
 | `MODEM_PROBE_FAILURES` | `3` | Consecutive missed probes that force a reconnect | Floored at 1: the loop raises once the count reaches this figure, so zero behaves exactly as one while reading like an off switch. Unbounded above, deliberately — more patience only delays a reconnect, and `MODEM_PROBE_TIMEOUT`'s ceiling tightens as this grows |
 | `MODEM_REGISTRATION_CHECK` | `0` | Also ask whether the modem is on the network. Off by default — see [The registration check](#the-registration-check) | On or off, not a number. Kept as a separate setting from the count below precisely so that tuning how patient the check is cannot switch it off by accident |
-| `MODEM_REGISTRATION_FAILURES` | `3` | Consecutive "not registered" readings that force a reconnect, once the check is on | Floored at 2: registration dips for a moment during a handover, so one reading is evidence of nothing, and zero would switch the check off while looking like a setting. Unbounded above, deliberately — more patience only delays the session ending, and while the check is on `WATCHDOG_CHURN_WINDOW`'s floor is multiplied by this count, so the window keeps pace with the slower cycle it then has to hold |
+| `MODEM_REGISTRATION_FAILURES` | `3` | Consecutive "not registered" readings that force a reconnect, once the check is on | Floored at 2: registration dips for a moment during a handover, so one reading is evidence of nothing, and zero behaves exactly as one — the session ends once the count reaches this figure — while reading like an off switch, which is what `MODEM_REGISTRATION_CHECK` exists separately to provide. Unbounded above, deliberately — more patience only delays the session ending, and while the check is on `WATCHDOG_CHURN_WINDOW`'s floor is multiplied by this count, so the window keeps pace with the slower cycle it then has to hold |
 | `AT_COMMAND_TIMEOUT` | `3.0` | Deadline for one AT command | Unbounded, deliberately. It bounds one command, not the loop; a command that outlasts the liveness probe's own deadline is caught by that probe and the reconnect it forces |
-| `AT_SLOW_COMMAND_TIMEOUT` | `10.0` | Deadline for slow commands (`AT&F`, `AT+CFUN`, `AT&W`) | Unbounded, deliberately, for the same reason. These commands run during setup, which is a wait this service never puts a ceiling on |
+| `AT_SLOW_COMMAND_TIMEOUT` | `10.0` | Deadline for slow commands (`AT&F`, `AT+CFUN`, `AT&W`, and the stored-message listing `AT+CMGL=4`) | Unbounded, deliberately, for the same reason. These commands run during setup, which is a wait this service never puts a ceiling on |
 | `SERIAL_CLOSE_TIMEOUT` | `5.0` | How long a serial port has to flush before the close is forced | 1 to whatever `NOTIFY_TIMEOUT` leaves of the same ten-second shutdown budget — the defaults use it exactly, 5 + 5 = 10. Where the floor and that ceiling collide the floor wins and a startup notice says the budget no longer holds |
 | `HEALTH_FILE` | `/tmp/healthy` | Snapshot file the healthcheck reads | None — a path. A path that cannot be written is reported rather than restarted for; see [Reading the health check](#reading-the-health-check) |
 | `HEALTH_STALE_SECONDS` | `120` | How old that snapshot may be | Floored at 2, because `MODEM_PROBE_INTERVAL` is clamped to half of it but never below 1, so a shorter window would be shorter than the fastest possible refresh. Unbounded above, deliberately — it is the operator's stated tolerance for a stale snapshot, and both probe ceilings are derived from it, so widening it loosens them in step |
@@ -234,7 +234,7 @@ never be read as a forgotten one.
 | `WATCHDOG_STALL_SECONDS` | *(derived)* | Exit once a component loop has not advanced for this long while still reporting up | Defaults to twice `HEALTH_STALE_SECONDS`, then floored at a derived figure (**310 as shipped**) and capped at `WATCHDOG_DOWN_SECONDS`, floor applied last. Below the floor the watchdog restarts a process that is merely riding out a slow modem |
 | `WATCHDOG_CHECK_INTERVAL` | `30.0` | How often the watchdog looks | Floored at 1: zero turns the watchdog into a busy loop. Unbounded above, deliberately — it is a sampling rate, and every threshold is measured from its own clock rather than from how often this loop samples, so a slower watchdog delays a restart instead of missing one |
 | `WATCHDOG_CHURN_SESSIONS` | `10` | Exit once one component has ended this many connected sessions inside the window below | Floored at 2: one reconnection is not a pattern, and at zero or one a single transient failure ends the process. Unbounded above, deliberately — a higher threshold only makes the criterion less eager, and `WATCHDOG_CHURN_WINDOW`'s floor is multiplied by it, so the window cannot fall behind the count it has to hold |
-| `WATCHDOG_CHURN_WINDOW` | `1800.0` | The window those sessions are counted in | Floored at `WATCHDOG_CHURN_SESSIONS × (RECONNECT_BACKOFF_MAX + the worst time a component can take to raise)`, which is **1400 as shipped** and **3600 with `MODEM_REGISTRATION_CHECK=1`**, because that check ends a session only after `MODEM_REGISTRATION_FAILURES` readings rather than after one and so multiplies the slowest cycle. Below the floor the count can never reach the threshold and the criterion is switched off while looking enabled — a floor against a false negative, unlike every other one here. **Unbounded above, deliberately**: widening it only makes the criterion more eager, in proportion to what was asked for, and no value of it disables a guard or reinstates a failure, which is what every ceiling in this table exists to prevent |
+| `WATCHDOG_CHURN_WINDOW` | `1800.0` | The window those sessions are counted in | Floored at `WATCHDOG_CHURN_SESSIONS × (RECONNECT_BACKOFF_MAX + the worst time a component can take to raise)`, which is **1400 as shipped** and **3600 with `MODEM_REGISTRATION_CHECK=1`**. Below the floor the count can never reach the threshold and the criterion is switched off while looking enabled — a floor against a false negative, unlike every other one here. **Unbounded above, deliberately**: widening it only makes the criterion more eager, in proportion to what was asked for, and no value of it disables a guard or reinstates a failure, which is what every ceiling in this table exists to prevent |
 
 Any bound written above as a formula, or as another setting's name, is derived
 rather than fixed: it moves whenever something it is built from moves. Most of
@@ -277,6 +277,14 @@ have more than one modem, or if your device is somewhere unusual.
 If you do set it, name the path as the service sees it. Under the compose file
 in this repository the host's `/dev` is mounted at `/hostdev`, so the port is
 `/hostdev/ttyUSB2`, not `/dev/ttyUSB2`.
+
+Setting it switches discovery off entirely: the scan above never runs, and the
+path is taken as given rather than checked. A path that is wrong or misspelled
+is therefore indistinguishable from hardware that has not arrived yet, and is
+waited for on the same terms — for ever, with `Device <path> is not present yet
+(check N)` in the log and no `candidate` or `discovered` line anywhere, because
+nothing was ever probed. If that is what you see, clear `SMS_PORT` and let
+discovery report what it finds.
 
 ### The registration check
 
@@ -354,6 +362,15 @@ The file is only written while every component is up, and each component
 rewrites it from its own loop, so a process that has stopped running stops
 refreshing it and the file it left behind goes stale. Freshness alone is never
 taken as health, and neither is the file merely existing.
+
+Two further fields are diagnostic only, and nothing in the answer above reads
+them. `rssi` is the first value of the modem's last `+CSQ` reply — the heartbeat
+itself, so a modem that answers with a weak signal stays distinguishable from
+one that has stopped answering at all. It is the raw `<rssi>` index the module
+reports, not a figure in dBm, and it is `null` until the first reply arrives.
+`registration` is the last network registration state, published whether or not
+the check that acts on it is on — see
+[The registration check](#the-registration-check).
 
 The snapshot also carries a `reconnects` object: for each component, how many
 connected sessions it has ended inside `WATCHDOG_CHURN_WINDOW`. Counts only —
@@ -487,9 +504,9 @@ Send `/help` in the Telegram bot conversation to view all available commands.
 
 ## Notes
 
-- **Long SMS Support**: This service supports automatic merging of long SMS. Segmented messages will wait up to 60 seconds for all parts to arrive before merging and forwarding
+- **Long SMS Support**: This service supports automatic merging of long SMS. Segmented messages will wait up to 60 seconds for all parts to arrive before merging and forwarding. A message whose parts never all arrive is discarded rather than forwarded in pieces — `Concatenated message timed out from ...; discarding them` in the log — because half a message reads as a whole one. That check runs only when another segmented message arrives, so if no further one ever does, the buffered parts are simply never delivered and no line is logged
 - **Compatibility**: Different module models have varying compatibility; some modules may not support sending and receiving long text messages
-- **Stability**: Each component reconnects on its own with exponential backoff, and a watchdog restarts the process on any of three signals — a component down past `WATCHDOG_DOWN_SECONDS`, a component loop that has not advanced for `WATCHDOG_STALL_SECONDS` while still reporting up, or one component ending `WATCHDOG_CHURN_SESSIONS` connected sessions inside `WATCHDOG_CHURN_WINDOW`. A health snapshot that cannot be written is the one fault reported without a restart
+- **Stability**: Each component reconnects on its own with exponential backoff, and a watchdog restarts the process on any of three signals; a health snapshot that cannot be written is the one fault reported without a restart. [Reading the health check](#reading-the-health-check) names the three and the threshold each is measured against
 - **Serial Port Selection**: Leave `SMS_PORT` empty and let discovery choose. Set it only when discovery picks the wrong device, and give the path under `SMS_DEV_ROOT`
 - **Missing hardware is not an error**: with no modem attached, the service waits and retries indefinitely; the container reports unhealthy while it does
 - **SIM Card Detection**: Ensure the SIM card is properly inserted and has sufficient balance
@@ -500,7 +517,9 @@ Send `/help` in the Telegram bot conversation to view all available commands.
 
 1. **Unable to Send/Receive SMS**:
    - Check the logs for which port was discovered: `docker compose logs | grep -i port`
-   - Confirm SIM card status (signal, balance)
+   - Confirm SIM card status (signal, balance). The last signal strength the
+     modem reported is the `rssi` field of the snapshot:
+     `docker compose exec sms-forwarder cat /tmp/healthy`
    - Check logs: `docker logs sms-forwarder`
 
 2. **Telegram Communication Issues**:
@@ -528,9 +547,13 @@ Send `/help` in the Telegram bot conversation to view all available commands.
      `AT+QURCCFG`). A module that does not implement them logs
      `... was not acknowledged; continuing setup` and carries on, which is
      harmless
-   - Only four commands are mandatory: `AT+CFUN=1`, `AT+CMGF=0`, `AT+CPMS` and
-     `AT+CNMI`. `Modem did not acknowledge <command>` followed by a reconnect
-     means one of those was refused, and the module cannot be driven as it stands
+   - Five commands are mandatory: `AT+CFUN=1`, `AT+CMGF=0`, `AT+CPMS`,
+     `AT+CNMI` and `AT+CMGL=4`. For the first four, `Modem did not acknowledge
+     <command>` followed by a reconnect means one of them was refused, and the
+     module cannot be driven as it stands. The fifth is the stored-message
+     listing, and it is fatal for a sharper reason — the next command erases the
+     store, so a failed listing would destroy unread messages; its line reads
+     `Modem did not acknowledge AT+CMGL=4; store left unread`
    - [`doc/README.md`](doc/README.md) maps every command the service issues to
      what it does, so each one can be looked up in your own module's AT manual
 
@@ -550,3 +573,19 @@ Send `/help` in the Telegram bot conversation to view all available commands.
      written for ...` is the one case that is deliberately not restarted: the
      loops are running and the snapshot file is not writable. See
      [Reading the health check](#reading-the-health-check)
+
+6. **The Container Restarts Immediately and Never Runs**:
+   - This is the likeliest first-run failure, and section 5 does not describe
+     it: the process ends during startup rather than staying up in a bad state,
+     so with `restart: unless-stopped` the container is restarted over and over
+     and never gets far enough for a health state to say anything
+   - The usual cause is an `.env` that still holds the placeholder credentials
+     shipped in `.env.example`. The log says so on the way out:
+     `Configuration is invalid, restarting cannot fix it: BOT_TOKEN is not
+     configured` — or the same line naming `CHAT_ID`
+   - The process exits with code **2**, not 1. That code is reserved for a
+     configuration no restart can repair, so it is what tells this case apart
+     from a watchdog restart without reading the log:
+     `docker inspect --format '{{.State.ExitCode}}' sms-forwarder`
+   - Set `BOT_TOKEN` and `CHAT_ID` in `.env` to your own values and run
+     `docker compose up -d` again
