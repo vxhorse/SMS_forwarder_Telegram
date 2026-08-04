@@ -199,7 +199,7 @@ def test_the_notify_deadline_is_clamped_at_both_ends(monkeypatch):
         assert importlib.reload(config).NOTIFY_TIMEOUT >= 1.0
         monkeypatch.setenv("NOTIFY_TIMEOUT", "600")
         reloaded = importlib.reload(config)
-        assert reloaded.NOTIFY_TIMEOUT <= reloaded.NOTIFY_TIMEOUT_CEILING
+        assert reloaded.NOTIFY_TIMEOUT <= reloaded.STOP_BUDGET_SECONDS
     finally:
         monkeypatch.undo()
         importlib.reload(config)

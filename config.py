@@ -125,16 +125,23 @@ WATCHDOG_CHECK_INTERVAL = _clamped(
 # notification before it was attempted, and capped because an over-large value
 # reinstates exactly the stall the deadline exists to prevent.
 #
-# There is nothing in this process to clamp the cap against: the stop grace
-# period is chosen by whatever starts the container and is not visible from in
-# here. Ten seconds is the shortest one in common use, so a notification that
-# could outlast that is one that could outlast the whole stop.
-NOTIFY_TIMEOUT_CEILING = 10.0
+# The whole shutdown path's budget, in seconds.
+#
+# There is nothing in this process to measure it against: the stop grace period
+# is chosen by whatever starts the container and is not visible from in here.
+# Ten seconds is the shortest one in common use, so anything on the way out that
+# could outlast that is something that could outlast the whole stop.
+#
+# It bounds the path rather than any one deadline on it, because the device
+# teardown awaits two of them one after the other - the serial close and the
+# outward notification - and two deadlines each inside the budget can still add
+# up to more than it.
+STOP_BUDGET_SECONDS = 10.0
 NOTIFY_TIMEOUT = _clamped(
     "NOTIFY_TIMEOUT",
     float(os.getenv("NOTIFY_TIMEOUT", "5.0")),
     low=1.0,
-    high=NOTIFY_TIMEOUT_CEILING,
+    high=STOP_BUDGET_SECONDS,
 )
 
 # Root of the device tree to scan. Inside a container this points at the
@@ -161,12 +168,33 @@ AT_SLOW_COMMAND_TIMEOUT = float(os.getenv("AT_SLOW_COMMAND_TIMEOUT", "10.0"))
 # out an hour later.
 #
 # Past the deadline the transport is aborted instead, which discards the buffer
-# and forces the close through. Floored because zero would abort every ordinary
-# disconnect before the transport had a chance to flush, and an abort throws
-# away whatever was still queued.
+# and forces the close through.
+#
+# Floored because zero would abort every ordinary disconnect before the
+# transport had a chance to flush, and an abort throws away whatever was still
+# queued. Capped by whatever the notification deadline leaves of the shutdown
+# budget, because both are awaited on the same way out: a close alone that
+# outlives the grace period turns a clean stop into a kill, and the snapshot
+# then keeps claiming this process is healthy until it ages out.
+SERIAL_CLOSE_TIMEOUT_FLOOR = 1.0
+_serial_close_ceiling = STOP_BUDGET_SECONDS - NOTIFY_TIMEOUT
 SERIAL_CLOSE_TIMEOUT = _clamped(
-    "SERIAL_CLOSE_TIMEOUT", float(os.getenv("SERIAL_CLOSE_TIMEOUT", "5.0")), low=1.0
+    "SERIAL_CLOSE_TIMEOUT",
+    float(os.getenv("SERIAL_CLOSE_TIMEOUT", "5.0")),
+    low=SERIAL_CLOSE_TIMEOUT_FLOOR,
+    # The floor wins where the two conflict, and the notice below says so.
+    # Zero here would abort every disconnect outright, which is a worse answer
+    # to a tight budget than overrunning it.
+    high=max(SERIAL_CLOSE_TIMEOUT_FLOOR, _serial_close_ceiling),
 )
+if _serial_close_ceiling < SERIAL_CLOSE_TIMEOUT_FLOOR:
+    CLAMP_NOTICES.append(
+        f"SERIAL_CLOSE_TIMEOUT floor ({SERIAL_CLOSE_TIMEOUT_FLOOR:g}) leaves "
+        f"NOTIFY_TIMEOUT ({NOTIFY_TIMEOUT:g}) and the close together above "
+        f"STOP_BUDGET_SECONDS ({STOP_BUDGET_SECONDS:g}): a teardown can now "
+        "outlast the shortest stop grace period in common use, and a teardown "
+        "that does is killed rather than finished."
+    )
 
 # Modem liveness probe (AT+CSQ): interval, response deadline, and how many
 # consecutive misses trigger a reconnect.
@@ -185,10 +213,53 @@ MODEM_PROBE_INTERVAL = _clamped(
     low=1.0,
     high=HEALTH_STALE_SECONDS / 2,
 )
+# Consecutive misses that trigger a reconnect. Floored at one: the loop raises
+# once the count reaches this figure, so zero behaves exactly as one while
+# reading like an off switch, and a number that looks like a switch and is not
+# one is what MODEM_REGISTRATION_CHECK exists separately to avoid.
+MODEM_PROBE_FAILURES = _clamped(
+    "MODEM_PROBE_FAILURES", int(os.getenv("MODEM_PROBE_FAILURES", "3")), low=1
+)
 # Also governs the AT handshake performed right after the port opens: both ask
 # the same question, which is how long the modem gets to answer a probe.
-MODEM_PROBE_TIMEOUT = float(os.getenv("MODEM_PROBE_TIMEOUT", "5.0"))
-MODEM_PROBE_FAILURES = int(os.getenv("MODEM_PROBE_FAILURES", "3"))
+#
+# Capped against the staleness window the container healthcheck reads. The
+# longest gap this loop can legitimately leave between two refreshes is
+# WATCHDOG_REFRESH_BUDGET below, which in closed form is
+#
+#     F x I + (F + 1) x T
+#
+# so keeping that inside HEALTH_STALE_SECONDS means
+#
+#     T <= (HEALTH_STALE_SECONDS - F x I) / (F + 1)
+#
+# which is seven and a half seconds at the values this file ships. Raising the
+# reply deadline is exactly what one does for a modem that answers slowly, and
+# past this bound it fails the healthcheck on a process that is working.
+# MODEM_PROBE_INTERVAL is clamped for the same reason; until now this was not.
+#
+# Floored because a deadline of zero abandons every probe before the modem
+# could answer it, which fails the connection on the first round for ever.
+MODEM_PROBE_TIMEOUT_FLOOR = 1.0
+_probe_timeout_ceiling = (
+    HEALTH_STALE_SECONDS - MODEM_PROBE_FAILURES * MODEM_PROBE_INTERVAL
+) / (MODEM_PROBE_FAILURES + 1)
+MODEM_PROBE_TIMEOUT = _clamped(
+    "MODEM_PROBE_TIMEOUT",
+    float(os.getenv("MODEM_PROBE_TIMEOUT", "5.0")),
+    low=MODEM_PROBE_TIMEOUT_FLOOR,
+    high=max(MODEM_PROBE_TIMEOUT_FLOOR, _probe_timeout_ceiling),
+)
+if _probe_timeout_ceiling < MODEM_PROBE_TIMEOUT_FLOOR:
+    CLAMP_NOTICES.append(
+        f"MODEM_PROBE_TIMEOUT floor ({MODEM_PROBE_TIMEOUT_FLOOR:g}) leaves the "
+        f"worst refresh gap above HEALTH_STALE_SECONDS "
+        f"({HEALTH_STALE_SECONDS:g}): {MODEM_PROBE_FAILURES:g} probes "
+        f"{MODEM_PROBE_INTERVAL:g}s apart already fill that window, so the "
+        "container healthcheck can fail a process that is working. Lower "
+        "MODEM_PROBE_INTERVAL or MODEM_PROBE_FAILURES, or raise "
+        "HEALTH_STALE_SECONDS."
+    )
 
 # Consecutive heartbeat readings of "not on the network" before the connection
 # counts as failed.
@@ -279,13 +350,12 @@ MODEM_REGISTRATION_CHECK = os.getenv(
 # bound and no exception, and a send stuck mid-transaction holds the AT lock the
 # probe needs, so the worst gap was unbounded rather than large.
 #
-# The margin no floor here protects is the one against HEALTH_STALE_SECONDS,
-# which the container healthcheck reads: 120 seconds against a worst gap of 110.
-# At the default interval and retry count the gap is 90 + 4T, so it passes the
-# window once MODEM_PROBE_TIMEOUT exceeds seven and a half seconds - and that
-# setting is neither capped nor clamped against the window, so a generous reply
-# deadline can fail the healthcheck on a process that is working.
-# MODEM_PROBE_INTERVAL is clamped for exactly this reason; the deadline is not.
+# The margin this protects is the one against HEALTH_STALE_SECONDS, which the
+# container healthcheck reads: 120 seconds against a worst gap of 110 at the
+# values this file ships. Both terms it is built from are now bounded so that
+# the gap cannot leave that window silently - MODEM_PROBE_INTERVAL against half
+# of it, MODEM_PROBE_TIMEOUT against what the interval and the retry count
+# leave of it - and where those bounds cannot both hold, a notice above says so.
 WATCHDOG_REFRESH_BUDGET = (
     max(0, MODEM_PROBE_FAILURES - 1) * (MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT)
     + MODEM_PROBE_INTERVAL
