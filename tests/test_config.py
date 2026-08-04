@@ -328,15 +328,18 @@ def test_a_down_tolerance_under_the_first_recovery_is_reported(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "tuning",
+    "tuning, path",
     [
-        {"SERVICE_STABLE_SECONDS": "120"},
-        {"MODEM_PROBE_INTERVAL": "15"},
-        {"MODEM_REGISTRATION_CHECK": "1", "MODEM_REGISTRATION_FAILURES": "2"},
+        ({"SERVICE_STABLE_SECONDS": "120"}, "liveness probe"),
+        ({"MODEM_PROBE_INTERVAL": "15"}, "liveness probe"),
+        (
+            {"MODEM_REGISTRATION_CHECK": "1", "MODEM_REGISTRATION_FAILURES": "2"},
+            "registration check",
+        ),
     ],
 )
 def test_a_stable_window_wider_than_the_fastest_failure_is_reported(
-    monkeypatch, tuning
+    monkeypatch, tuning, path
 ):
     """The churn criterion counts only sessions judged recovered, so a stable
     window wider than the fastest a heartbeat failure can raise means the
@@ -349,6 +352,12 @@ def test_a_stable_window_wider_than_the_fastest_failure_is_reported(
     turning the registration check on at its own floor. Coverage is not lost in
     the pure case - the down clock does accumulate - but detection falls from
     roughly twenty minutes to an hour, and nothing said so.
+
+    The figure is the faster of two paths, so the notice has to name which one
+    reached it. The third case here is exactly why: the registration check at
+    its own floor of 2 raises in 60 seconds while the liveness probe still
+    takes 105 and is still counted, so a notice reading as though nothing were
+    counted any more would describe a guard that is still doing its job.
     """
     for name, value in tuning.items():
         monkeypatch.setenv(name, value)
@@ -360,6 +369,7 @@ def test_a_stable_window_wider_than_the_fastest_failure_is_reported(
         if "SERVICE_STABLE_SECONDS" in notice and "WATCHDOG_CHURN_SESSIONS" in notice
     ]
     assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert path in matches[0]
 
 
 def test_a_stable_window_inside_the_fastest_failure_is_silent(monkeypatch):

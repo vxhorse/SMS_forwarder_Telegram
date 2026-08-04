@@ -703,30 +703,43 @@ WATCHDOG_RAISE_BUDGET = WATCHDOG_REFRESH_BUDGET * (
 # The margin is 45 seconds at the values this file ships (105 against 60), and
 # closable by one ordinary tuning from either side, which is why it is reported
 # rather than left as a property of the defaults.
-WATCHDOG_RAISE_FLOOR = min(
-    MODEM_PROBE_FAILURES * (MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT),
-    (
-        MODEM_REGISTRATION_FAILURES * MODEM_PROBE_INTERVAL
-        if MODEM_REGISTRATION_CHECK
-        else float("inf")
-    ),
+_liveness_raise = MODEM_PROBE_FAILURES * (MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT)
+_registration_raise = (
+    MODEM_REGISTRATION_FAILURES * MODEM_PROBE_INTERVAL
+    if MODEM_REGISTRATION_CHECK
+    else float("inf")
 )
+WATCHDOG_RAISE_FLOOR = min(_liveness_raise, _registration_raise)
 # Reported rather than clamped, for the same reason as the down tolerance
 # above: lowering SERVICE_STABLE_SECONDS to fit a probe schedule would loosen
 # what counts as a recovery, and that judgement is what three other guards rest
 # on. Compared with >= because a window equal to the raise time makes the
 # session end and the judgement land in the same instant, which is a race and
 # not a guarantee.
+#
+# The figure is the faster of two paths, so the notice names which one reached
+# it and says the slower one is unaffected. Both can be true at once - the
+# registration check at its own floor of 2 raises in two intervals while the
+# liveness probe still takes MODEM_PROBE_FAILURES rounds and is still counted -
+# and a notice reading as though the criterion were off altogether would
+# describe a guard that is still doing its job.
 if SERVICE_STABLE_SECONDS >= WATCHDOG_RAISE_FLOOR:
+    _raise_floor_source = (
+        "the registration check: MODEM_REGISTRATION_FAILURES x "
+        "MODEM_PROBE_INTERVAL"
+        if _registration_raise < _liveness_raise
+        else "the liveness probe: MODEM_PROBE_FAILURES x (MODEM_PROBE_INTERVAL "
+        "+ MODEM_PROBE_TIMEOUT)"
+    )
     CLAMP_NOTICES.append(
         f"SERVICE_STABLE_SECONDS ({SERVICE_STABLE_SECONDS:g}) is not below the "
-        f"shortest time a heartbeat failure takes to raise "
-        f"({WATCHDOG_RAISE_FLOOR:g}): the modem's own failures now end every "
-        "session before it counts as a recovery, so WATCHDOG_CHURN_SESSIONS "
-        "never counts one of them and that fault is left to "
+        f"shortest time one of the modem's heartbeat failures takes to raise "
+        f"({WATCHDOG_RAISE_FLOOR:g}, from {_raise_floor_source}): a session "
+        "ending on that failure is over before it counts as a recovery, so "
+        "WATCHDOG_CHURN_SESSIONS never counts one and that fault is left to "
         f"WATCHDOG_DOWN_SECONDS ({WATCHDOG_DOWN_SECONDS:g}) and its far longer "
-        "tolerance. Lower SERVICE_STABLE_SECONDS, or lengthen the probe "
-        "schedule it is read against."
+        "tolerance. Any slower failure is still counted. Lower "
+        "SERVICE_STABLE_SECONDS, or lengthen the schedule this is read against."
     )
 #
 # Deliberately unbounded above. Widening it only makes the criterion more eager,
