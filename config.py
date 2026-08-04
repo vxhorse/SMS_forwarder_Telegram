@@ -148,6 +148,48 @@ WATCHDOG_CHECK_INTERVAL = _clamped(
     float(os.getenv("WATCHDOG_CHECK_INTERVAL", "30.0")),
     low=1.0,
 )
+
+# Every clock the watchdog reads measures from a recovery, and a component
+# cannot reach its first one until it has connected and then held for
+# SERVICE_STABLE_SECONDS. Until that moment it is marked down, and has been
+# since the process started - so a down tolerance shorter than that window plus
+# one inspection interval exits before any component could possibly be marked
+# up. That is a permanent restart loop on hardware that is working perfectly,
+# announced by a line about a component being down, which is true and describes
+# nothing an operator can act on.
+#
+# Reported rather than clamped, and the reported part is deliberately less than
+# the whole relationship. What has to hold is
+#
+#     connect time + SERVICE_STABLE_SECONDS + WATCHDOG_CHECK_INTERVAL
+#         < WATCHDOG_DOWN_SECONDS
+#
+# and the connect time is a property of the hardware - port discovery, the
+# open, the AT handshake, the SIM setup - which nothing in this file can know.
+# So the two terms that are knowable are checked here, and the third is stated
+# where a human can apply it: the same division docker-compose.example.yml
+# makes for the healthcheck's start_period, which has to clear the same window
+# plus the same unknowable time.
+#
+# Nothing is clamped because there is nothing safe to clamp to. Raising
+# WATCHDOG_DOWN_SECONDS would overrule the operator's stated tolerance for
+# losing a component, and lowering SERVICE_STABLE_SECONDS would loosen what
+# counts as a recovery to fit a watchdog - which is the judgement three other
+# guards are built on.
+if (
+    SERVICE_STABLE_SECONDS + WATCHDOG_CHECK_INTERVAL
+    >= float(WATCHDOG_DOWN_SECONDS)
+):
+    CLAMP_NOTICES.append(
+        f"WATCHDOG_DOWN_SECONDS ({WATCHDOG_DOWN_SECONDS:g}) is not above "
+        f"SERVICE_STABLE_SECONDS ({SERVICE_STABLE_SECONDS:g}) plus "
+        f"WATCHDOG_CHECK_INTERVAL ({WATCHDOG_CHECK_INTERVAL:g}): a component "
+        "is marked down until a session of its has held for the stable window, "
+        "so the watchdog can now exit before any component reaches its first "
+        "recovery, on working hardware, for ever. Raise WATCHDOG_DOWN_SECONDS "
+        "above those two together plus however long this hardware takes to "
+        "connect, or shorten SERVICE_STABLE_SECONDS."
+    )
 # Deadline for one outward component-state notification, in seconds.
 #
 # Sending a notification retries several times with a delay between attempts, so
