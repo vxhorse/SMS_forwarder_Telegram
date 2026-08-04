@@ -297,6 +297,7 @@ MODEM_PROBE_INTERVAL = _clamped(
     float(os.getenv("MODEM_PROBE_INTERVAL", "30.0")),
     low=1.0,
     high=HEALTH_STALE_SECONDS / 2,
+    high_label=f"half of HEALTH_STALE_SECONDS={HEALTH_STALE_SECONDS:g}",
 )
 # Consecutive misses that trigger a reconnect. Floored at one: the loop raises
 # once the count reaches this figure, so zero behaves exactly as one while
