@@ -181,6 +181,42 @@ def test_a_probe_schedule_with_no_room_left_for_a_deadline_is_reported(monkeypat
     ), reloaded.CLAMP_NOTICES
 
 
+# --- A clamp notice names the setting a derived bound came from, not just --
+# --- the number it works out to ----------------------------------------------
+
+
+def test_a_ceiling_that_coincides_with_the_floor_still_blames_the_ceiling(
+    monkeypatch,
+):
+    """NOTIFY_TIMEOUT=9 puts SERIAL_CLOSE_TIMEOUT's derived ceiling exactly on
+    its fixed floor (10 - 9 == 1). The invariant still holds at 9 + 1 == 10, so
+    there is no floor/ceiling collision to report - but the operator asked for
+    more than the ceiling allowed, and the notice has to blame the ceiling
+    (and name NOTIFY_TIMEOUT as where it came from), not the floor that only
+    happens to sit at the same value."""
+    monkeypatch.setenv("NOTIFY_TIMEOUT", "9")
+    monkeypatch.setenv("SERIAL_CLOSE_TIMEOUT", "9")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.SERIAL_CLOSE_TIMEOUT == 1.0
+    matches = _notices_for(reloaded, "SERIAL_CLOSE_TIMEOUT")
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "ceiling" in matches[0]
+    assert "NOTIFY_TIMEOUT=9" in matches[0]
+
+
+def test_the_plain_probe_ceiling_notice_names_its_origin(monkeypatch):
+    """The common case - an operator raising MODEM_PROBE_TIMEOUT for a slow
+    modem, with no floor collision anywhere in sight - must still say where
+    the resulting ceiling comes from. A bare 'ceiling is 7.5' gives the
+    operator nothing to act on."""
+    monkeypatch.setenv("MODEM_PROBE_TIMEOUT", "15")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.MODEM_PROBE_TIMEOUT == 7.5
+    matches = _notices_for(reloaded, "MODEM_PROBE_TIMEOUT")
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+    assert "HEALTH_STALE_SECONDS" in matches[0]
+
+
 # --- WATCHDOG_STALL_SECONDS: two derived bounds instead of two fixed ones ----
 
 
@@ -241,14 +277,22 @@ def test_watchdog_down_seconds_comfortably_above_the_floor_is_silent(monkeypatch
 
 
 def _invariants(cfg):
-    """Every relationship between two settings that has to hold, as
-    (name, holds, the names a notice about it must mention).
+    """Every relationship between two operator-settable settings that has to
+    hold, as (name, holds, the names a single notice about it must mention
+    together).
 
     A relationship that is only true by accident of the defaults is one that
     will be broken by the first operator who tunes either side of it. Each one
     here is either kept true by a clamp or, where two bounds genuinely
     conflict, reported - and this is the list that says which relationships
-    there are, so a new setting cannot quietly join without one.
+    there are among the settings an operator can actually reach from the
+    environment, so a new one of those cannot quietly join without one.
+
+    This is not the list of every relationship between two settings in this
+    file. TELEGRAM_LONG_POLL_SECONDS < TELEGRAM_REQUEST_TIMEOUT, for instance,
+    is just as real, but config.py deliberately hardcodes both (see the
+    comment there for why) - with no operator-settable value on either side,
+    there is nothing for a clamp to guard or a notice to report.
     """
     return [
         (
@@ -259,7 +303,7 @@ def _invariants(cfg):
         (
             "the worst refresh gap stays inside the staleness window",
             cfg.WATCHDOG_REFRESH_BUDGET <= cfg.HEALTH_STALE_SECONDS,
-            ("MODEM_PROBE_TIMEOUT",),
+            ("MODEM_PROBE_TIMEOUT", "HEALTH_STALE_SECONDS"),
         ),
         (
             "the probe cannot refresh more slowly than half the window",
@@ -275,6 +319,11 @@ def _invariants(cfg):
             "the stall threshold clears the longest legitimate gap",
             cfg.WATCHDOG_STALL_SECONDS >= cfg.WATCHDOG_STALL_FLOOR,
             ("WATCHDOG_STALL",),
+        ),
+        (
+            "the backoff ceiling never sits below its own floor",
+            cfg.RECONNECT_BACKOFF_MAX >= cfg.RECONNECT_BACKOFF_MIN,
+            ("RECONNECT_BACKOFF_MAX", "RECONNECT_BACKOFF_MIN"),
         ),
     ]
 
@@ -295,6 +344,13 @@ _TUNINGS = [
     {"WATCHDOG_DOWN_SECONDS": "100"},
     {"WATCHDOG_STALL_SECONDS": "30"},
     {"MODEM_PROBE_FAILURES": "0", "MODEM_PROBE_TIMEOUT": "0"},
+    {"RECONNECT_BACKOFF_MIN": "10", "RECONNECT_BACKOFF_MAX": "5"},
+    # Requesting the probe deadline at exactly its own floor leaves _clamped
+    # silent - applied equals requested, so there is nothing for it to
+    # report - even though the schedule this pairs with still overflows the
+    # staleness window. Only the dedicated collision notice below catches
+    # this one; nothing else in CLAMP_NOTICES mentions the setting at all.
+    {"MODEM_PROBE_INTERVAL": "40", "MODEM_PROBE_TIMEOUT": "1"},
 ]
 
 
@@ -303,12 +359,14 @@ def test_every_invariant_is_either_enforced_or_reported(monkeypatch, tuning):
     for name, value in tuning.items():
         monkeypatch.setenv(name, value)
     reloaded = importlib.reload(config_module)
-    joined = " ".join(reloaded.CLAMP_NOTICES)
     for description, holds, mentions in _invariants(reloaded):
         if holds:
             continue
-        assert all(word in joined for word in mentions), (
-            f"{description!r} does not hold and nothing says so: "
+        assert any(
+            all(word in notice for word in mentions)
+            for notice in reloaded.CLAMP_NOTICES
+        ), (
+            f"{description!r} does not hold and no single notice says so: "
             f"{reloaded.CLAMP_NOTICES}"
         )
 
