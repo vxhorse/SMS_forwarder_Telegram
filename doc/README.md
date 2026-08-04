@@ -104,9 +104,6 @@ described above and the check must stay off.
 
 Asking `AT+CGREG?` and `AT+CEREG?` as well — on the failing path only, counting
 a miss only when every domain agrees — is the complete answer, and it is not a
-copy of the `+CREG` code: `process_message` routes `+CREG:` alone, so those
-replies currently reach no parser at all, and 3GPP TS 27.007 allows their `<n>`
-to range up to 5, which breaks the rule the `+CREG` parser depends on (a leading
-value above 2 cannot be an `<n>`, so the line must be an unsolicited report).
-They need a shape rule of their own. See `_REGISTERED_STATES` in
-[`module/device_manager.py`](../module/device_manager.py).
+copy of the `+CREG` code; they need a shape rule of their own. See
+`_REGISTERED_STATES` in
+[`module/device_manager.py`](../module/device_manager.py) for why.

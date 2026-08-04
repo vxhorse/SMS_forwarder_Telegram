@@ -11,5 +11,3 @@ specific to Claude Code belong below.
 - `docs/superpowers/` holds planning documents from earlier work and is
   git-ignored on purpose — the repository stays focused on what users need, not
   on how it was built.
-- `docs/deployments/` is git-ignored: those notes name a specific host, which
-  the documentation rules in AGENTS.md exclude from the repository.

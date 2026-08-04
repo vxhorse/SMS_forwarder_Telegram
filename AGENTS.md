@@ -43,8 +43,9 @@ interpreter must be the one in `.venv/`.
   passed in by `main.py`, not by importing each other.
 - **`module/discovery.py`** — finds the modem's AT port by probing candidates.
 
-`healthcheck.py` is a separate short-lived process, the container's
-`HEALTHCHECK` entrypoint.
+`healthcheck.py` is a separate short-lived process, run by the compose file's
+`healthcheck:` (`docker-compose.example.yml`) rather than by a `HEALTHCHECK`
+instruction in the image.
 
 ## Rules
 
@@ -74,11 +75,12 @@ separate mechanisms, and calling both of them "flapping" hides a whole class of
 failure behind a word. A session that ends sooner than
 `SERVICE_STABLE_SECONDS` never resets the reconnection backoff or the log
 throttle, so a component that connects and fails immediately keeps looking
-broken instead of looking busy. Separately, and **however long its sessions
-last**, a component that keeps ending connected sessions is counted, and the
-watchdog ends the process at `WATCHDOG_CHURN_SESSIONS` of them inside
-`WATCHDOG_CHURN_WINDOW`. The second is what covers a failure slower to raise
-than the stable window — which the first, on its own, reads as a recovery.
+broken instead of looking busy. Separately, and only for sessions that lasted
+`SERVICE_STABLE_SECONDS`, a component that keeps ending connected sessions is
+counted, and the watchdog ends the process at `WATCHDOG_CHURN_SESSIONS` of them
+inside `WATCHDOG_CHURN_WINDOW`. The second is what covers a failure slower to
+raise than the stable window — which the first, on its own, reads as a
+recovery.
 
 **Any loop that can complete an iteration without awaiting something that
 genuinely blocks is a bug.** A `StreamReader` at EOF returns `b""` with no
@@ -98,6 +100,13 @@ cannot be read as a forgotten one.
 **Comments, docstrings and log messages are English.** Telegram-facing user text
 stays in its current language — users read it. Comments explain the mechanism,
 never a specific deployment or past incident.
+
+**Documentation that describes the same fact in more than one file moves
+together.** A user-facing change moves `README.md` and its three translations
+(`README_CN.md`, `README_JP.md`, `README_FA.md`) together; a settings change
+also moves `config.py` and `.env.example`; a change to the AT command set also
+moves `doc/README.md`, whose tables claim to cover every command this project
+issues. Nothing checks this, so it is on the author.
 
 ## Testing
 
@@ -124,9 +133,8 @@ attribution of any kind** — no co-author trailers, no "generated with" lines.
 - `docker-compose.yml` is gitignored and holds real credentials. Only
   `docker-compose.example.yml` is tracked. Never read the local one into output.
 - The compose file bind-mounts `/dev` to `/hostdev` instead of using `devices:`.
-  `devices:` is resolved when the container is *created*, so a modem that has not
-  finished enumerating makes creation fail outright — and a restart policy never
-  applies to a container that never ran. Do not "simplify" this back.
+  See "Why not `devices:`" in `README.md` for the reason. Do not "simplify"
+  this back.
 - `device_cgroup_rules` is load-bearing, not decoration. Without it the container
   gets `EPERM` opening the device.
 - To check the process really holds the serial port, look at the **Python
