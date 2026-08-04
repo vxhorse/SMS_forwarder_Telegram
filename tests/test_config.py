@@ -52,11 +52,13 @@ def test_a_fully_specified_but_legal_configuration_has_no_notices(monkeypatch):
 
     The values here have to satisfy the derived bounds as well as the fixed
     ones: the two deadlines on the shutdown path have to fit inside
-    STOP_BUDGET_SECONDS together, and the probe schedule has to leave the worst
-    refresh gap inside HEALTH_STALE_SECONDS.
+    STOP_BUDGET_SECONDS together, the probe schedule has to leave the worst
+    refresh gap inside HEALTH_STALE_SECONDS, and the stable window has to stay
+    under the fastest failure that schedule can raise - which at an interval of
+    25 is 3 x (25 + 5) = 90, so the window is 80 rather than a rounder number.
     """
     monkeypatch.setenv("HEALTH_STALE_SECONDS", "120")
-    monkeypatch.setenv("SERVICE_STABLE_SECONDS", "90")
+    monkeypatch.setenv("SERVICE_STABLE_SECONDS", "80")
     monkeypatch.setenv("WATCHDOG_CHECK_INTERVAL", "15")
     monkeypatch.setenv("NOTIFY_TIMEOUT", "8")
     monkeypatch.setenv("SERIAL_CLOSE_TIMEOUT", "2")
@@ -325,13 +327,66 @@ def test_a_down_tolerance_under_the_first_recovery_is_reported(monkeypatch):
     assert "WATCHDOG_CHECK_INTERVAL" in matches[0]
 
 
+@pytest.mark.parametrize(
+    "tuning",
+    [
+        {"SERVICE_STABLE_SECONDS": "120"},
+        {"MODEM_PROBE_INTERVAL": "15"},
+        {"MODEM_REGISTRATION_CHECK": "1", "MODEM_REGISTRATION_FAILURES": "2"},
+    ],
+)
+def test_a_stable_window_wider_than_the_fastest_failure_is_reported(
+    monkeypatch, tuning
+):
+    """The churn criterion counts only sessions judged recovered, so a stable
+    window wider than the fastest a heartbeat failure can raise means the
+    modem's own failures end every session before the judgement and are never
+    counted at all - the criterion switched off for the component it was built
+    around, while the settings table still says it is on.
+
+    Reachable from either side and at the shipped values by a margin of 45
+    seconds: by lengthening the window, by shortening the probe schedule, or by
+    turning the registration check on at its own floor. Coverage is not lost in
+    the pure case - the down clock does accumulate - but detection falls from
+    roughly twenty minutes to an hour, and nothing said so.
+    """
+    for name, value in tuning.items():
+        monkeypatch.setenv(name, value)
+    reloaded = importlib.reload(config_module)
+    assert reloaded.SERVICE_STABLE_SECONDS >= _fastest_raise_seconds(reloaded)
+    matches = [
+        notice
+        for notice in reloaded.CLAMP_NOTICES
+        if "SERVICE_STABLE_SECONDS" in notice and "WATCHDOG_CHURN_SESSIONS" in notice
+    ]
+    assert len(matches) == 1, reloaded.CLAMP_NOTICES
+
+
+def test_a_stable_window_inside_the_fastest_failure_is_silent(monkeypatch):
+    """The shipped values clear it, and so must a schedule tuned in the safe
+    direction - a notice on a configuration that is fine is how an operator
+    learns to stop reading them."""
+    monkeypatch.setenv("SERVICE_STABLE_SECONDS", "100")
+    monkeypatch.setenv("MODEM_PROBE_INTERVAL", "40")
+    monkeypatch.setenv("MODEM_PROBE_TIMEOUT", "1")
+    reloaded = importlib.reload(config_module)
+    # 3 x (40 + 1) = 123 against a 100-second window.
+    assert not [
+        notice
+        for notice in reloaded.CLAMP_NOTICES
+        if "SERVICE_STABLE_SECONDS" in notice
+    ], reloaded.CLAMP_NOTICES
+
+
 def test_a_down_tolerance_that_clears_the_first_recovery_is_silent(monkeypatch):
     """The bound is only the part that can be computed, so it has to stay quiet
     for a configuration that satisfies it - including one tuned right up to the
     edge, or every operator who shortens the tolerance deliberately learns to
     ignore the line that matters."""
     monkeypatch.setenv("WATCHDOG_DOWN_SECONDS", "3000")
-    monkeypatch.setenv("SERVICE_STABLE_SECONDS", "120")
+    # Under the stock probe schedule's fastest failure, 105 seconds, so the
+    # only relationship this test can trip is the one it is about.
+    monkeypatch.setenv("SERVICE_STABLE_SECONDS", "90")
     monkeypatch.setenv("WATCHDOG_CHECK_INTERVAL", "10")
     reloaded = importlib.reload(config_module)
     assert reloaded.CLAMP_NOTICES == []
@@ -436,6 +491,30 @@ def _worst_session_seconds(cfg):
     return max(liveness, registration)
 
 
+def _fastest_raise_seconds(cfg):
+    """The shortest a heartbeat-driven session can take to end in a failure.
+
+    The counterpart to the figure above, derived from the same loop and used
+    for the opposite purpose: the worst case says how wide the churn window has
+    to be, this one says whether such a session can be counted at all. A
+    session that ends before SERVICE_STABLE_SECONDS is never judged recovered
+    and never counted, so this figure has to stay above that window.
+
+    An unanswered liveness probe always spends its whole deadline, so the
+    liveness path costs the same either way. The registration path can have
+    both of its probes answered the instant they are asked, so its floor is the
+    intervals alone.
+    """
+    liveness = cfg.MODEM_PROBE_FAILURES * (
+        cfg.MODEM_PROBE_INTERVAL + cfg.MODEM_PROBE_TIMEOUT
+    )
+    if not cfg.MODEM_REGISTRATION_CHECK:
+        return liveness
+    return min(
+        liveness, cfg.MODEM_REGISTRATION_FAILURES * cfg.MODEM_PROBE_INTERVAL
+    )
+
+
 def _invariants(cfg):
     """Every relationship between two operator-settable settings that has to
     hold, as (name, holds, the names a single notice about it must mention
@@ -492,6 +571,11 @@ def _invariants(cfg):
             ("RECONNECT_BACKOFF_MAX", "RECONNECT_BACKOFF_MIN"),
         ),
         (
+            "a heartbeat failure outlasts the window that makes it countable",
+            cfg.SERVICE_STABLE_SECONDS < _fastest_raise_seconds(cfg),
+            ("SERVICE_STABLE_SECONDS", "WATCHDOG_CHURN_SESSIONS"),
+        ),
+        (
             "the churn window can hold the threshold's worth of worst cycles",
             cfg.WATCHDOG_CHURN_WINDOW
             >= cfg.WATCHDOG_CHURN_SESSIONS
@@ -546,6 +630,12 @@ _TUNINGS = [
     # on; the second is an operator asking the check for more patience.
     {"MODEM_REGISTRATION_CHECK": "1"},
     {"MODEM_REGISTRATION_CHECK": "1", "MODEM_REGISTRATION_FAILURES": "8"},
+    # A stable window wider than the fastest heartbeat failure, reached from
+    # each side: by lengthening the window, and by shortening the probe
+    # schedule it has to be read against. Either way the modem's own failures
+    # stop being counted, and only the settings table still says they are.
+    {"SERVICE_STABLE_SECONDS": "120"},
+    {"MODEM_PROBE_INTERVAL": "15"},
 ]
 
 
