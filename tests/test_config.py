@@ -298,6 +298,38 @@ def test_watchdog_down_seconds_comfortably_above_the_floor_is_silent(monkeypatch
     assert reloaded.CLAMP_NOTICES == []
 
 
+# --- WATCHDOG_CHURN_*: a fixed floor, and a window with a derived one --------
+
+
+def test_the_churn_threshold_has_a_floor(monkeypatch):
+    """One reconnect is not a pattern. At zero or one, a single transient
+    failure ends the process."""
+    monkeypatch.setenv("WATCHDOG_CHURN_SESSIONS", "1")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.WATCHDOG_CHURN_SESSIONS == 2
+    assert len(_notices_for(reloaded, "WATCHDOG_CHURN_SESSIONS")) == 1
+
+
+def test_the_churn_window_must_hold_that_many_worst_case_cycles(monkeypatch):
+    """A window shorter than the threshold's worth of slowest cycles can never
+    reach the threshold, so the criterion would simply never fire."""
+    monkeypatch.setenv("WATCHDOG_CHURN_WINDOW", "60")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.WATCHDOG_CHURN_WINDOW == reloaded.WATCHDOG_CHURN_WINDOW_FLOOR
+    matches = _notices_for(reloaded, "WATCHDOG_CHURN_WINDOW")
+    assert len(matches) == 1
+    assert "60" in matches[0]
+
+
+def test_the_shipped_churn_window_clears_its_floor_without_a_notice():
+    """The default has to sit above the derived floor on its own, or every
+    unmodified start prints a notice and an operator learns to stop reading
+    them."""
+    reloaded = importlib.reload(config_module)
+    assert reloaded.WATCHDOG_CHURN_WINDOW > reloaded.WATCHDOG_CHURN_WINDOW_FLOOR
+    assert reloaded.CLAMP_NOTICES == []
+
+
 # --- The meta-rule: enforced or reported, never neither ----------------------
 
 
@@ -350,6 +382,11 @@ def _invariants(cfg):
             cfg.RECONNECT_BACKOFF_MAX >= cfg.RECONNECT_BACKOFF_MIN,
             ("RECONNECT_BACKOFF_MAX", "RECONNECT_BACKOFF_MIN"),
         ),
+        (
+            "the churn window can hold the threshold's worth of worst cycles",
+            cfg.WATCHDOG_CHURN_WINDOW >= cfg.WATCHDOG_CHURN_WINDOW_FLOOR,
+            ("WATCHDOG_CHURN_WINDOW",),
+        ),
     ]
 
 
@@ -381,6 +418,12 @@ _TUNINGS = [
     # NOTIFY_TIMEOUT alone already consumes the whole budget. Only the
     # dedicated collision notice below catches this one.
     {"NOTIFY_TIMEOUT": "10", "SERIAL_CLOSE_TIMEOUT": "1"},
+    # The churn window's floor is derived from three other settings, so it
+    # moves without being touched: a longer backoff or a slower probe schedule
+    # widens the slowest cycle it has to hold, and raising the session count
+    # multiplies it.
+    {"WATCHDOG_CHURN_WINDOW": "60"},
+    {"WATCHDOG_CHURN_SESSIONS": "20", "RECONNECT_BACKOFF_MAX": "300"},
 ]
 
 

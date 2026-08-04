@@ -117,6 +117,9 @@ def test_file_written_when_all_up(tmp_path):
         "services": {"device": True, "telegram": True},
         "rssi": 21,
         "registration": 5,
+        # Counts only, and zero here: nothing has reconnected. The healthcheck
+        # ignores this field; it is carried for an operator reading the file.
+        "reconnects": {"device": 0, "telegram": 0},
     }
 
 
@@ -466,3 +469,69 @@ def test_snapshot_age_is_measured_from_the_later_of_write_and_recovery(tmp_path)
     assert health.snapshot_age() == 45.0
     health.refresh_file()
     assert health.snapshot_age() == 0.0
+
+
+def _churn(tmp_path, window=1000.0):
+    clock = FakeClock()
+    health = HealthState(
+        ["device", "telegram"],
+        health_file=str(tmp_path / "healthy"),
+        clock=clock,
+        churn_window=window,
+    )
+    return health, clock
+
+
+def test_reconnect_counts_start_at_zero(tmp_path):
+    health, _ = _churn(tmp_path)
+    assert health.reconnect_counts() == {"device": 0, "telegram": 0}
+
+
+def test_churning_names_the_component_that_reached_the_threshold(tmp_path):
+    health, clock = _churn(tmp_path)
+    for _ in range(3):
+        clock.advance(100.0)
+        health.record_session_end("device")
+    assert health.churning(threshold=4) is None
+    clock.advance(100.0)
+    health.record_session_end("device")
+    assert health.churning(threshold=4) == "device"
+
+
+def test_sessions_older_than_the_window_stop_counting(tmp_path):
+    """A component that reconnected a few times last week is not churning now.
+    Without the window the count only ever grows and every long-lived process
+    eventually trips."""
+    health, clock = _churn(tmp_path, window=1000.0)
+    for _ in range(4):
+        health.record_session_end("device")
+        clock.advance(600.0)
+    # Three of the four are now outside the window.
+    assert health.reconnect_counts()["device"] == 1
+    assert health.churning(threshold=4) is None
+
+
+def test_each_component_is_counted_on_its_own(tmp_path):
+    """Two components each reconnecting occasionally is not one component
+    churning, and restarting for the sum would blame neither."""
+    health, clock = _churn(tmp_path)
+    for _ in range(3):
+        clock.advance(10.0)
+        health.record_session_end("device")
+        health.record_session_end("telegram")
+    assert health.churning(threshold=4) is None
+
+
+def test_the_snapshot_publishes_the_counts(tmp_path):
+    """The only place an operator can see this before the container restarts.
+    Counts only: nothing here may carry message data."""
+    health, clock = _churn(tmp_path)
+    clock.advance(10.0)
+    health.record_session_end("device")
+    assert health.snapshot()["reconnects"] == {"device": 1, "telegram": 0}
+
+
+def test_a_session_end_from_an_unregistered_component_is_ignored(tmp_path):
+    health, _ = _churn(tmp_path)
+    health.record_session_end("nonexistent")
+    assert health.churning(threshold=1) is None
