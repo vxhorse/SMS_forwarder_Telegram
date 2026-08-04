@@ -392,7 +392,9 @@ class DeviceManager:
 
         Read deadlines are not settable here: they come from config, because
         each one bounds a different thing. See AT_COMMAND_TIMEOUT,
-        AT_SLOW_COMMAND_TIMEOUT and MODEM_PROBE_TIMEOUT.
+        AT_SLOW_COMMAND_TIMEOUT and MODEM_PROBE_TIMEOUT. The one deadline that
+        is neither settable nor in config is the wait for the modem's +CMGS
+        confirmation in handle_send_sms, fixed at ten seconds.
 
         :param receive_sms_callback: called with each received message
         :param health: HealthState to report signal strength and freshness to
@@ -694,7 +696,7 @@ class DeviceManager:
             self._abort_transport(writer)
         except Exception as exc:
             logger.warning(f"Error closing serial writer: {exc}")
-        await self._notify("⚠️ Modem disconnected, reconnecting")
+        await self._notify("⚠️ Modem disconnected")
 
     @staticmethod
     def _abort_transport(writer) -> None:
@@ -1064,7 +1066,9 @@ class DeviceManager:
                 await self.process_message(message)
                 errors = 0
             except asyncio.TimeoutError:
-                # Idle tick: nudge any partially received PDU along.
+                # Idle tick: re-report any pending PDU. This cannot complete
+                # one - nothing has been appended - so it only surfaces a PDU
+                # still in flight.
                 await self.handle_incoming_sms_pdu()
                 continue
             except asyncio.CancelledError:
@@ -1113,15 +1117,9 @@ class DeviceManager:
             self.sms_sent_event.set()
         elif self.pending_sms["pdu"] is not None and _is_pdu_line(message):
             # The two branches above are ordered ahead of this one for
-            # readability, but neither is what keeps them safe: this is. Any
-            # line at all can arrive between a +CMT header and the PDU it
-            # announced, and only a line made entirely of hexadecimal can be
-            # part of that PDU. Everything else falls through to its own
-            # branch, so the URC is routed and the pending PDU is left intact
-            # for the line that really does belong to it. A guard that instead
-            # listed the URCs allowed to interrupt would have to be extended
-            # for every URC a module invents, and each omission silently
-            # destroys one received message.
+            # readability, but neither is what keeps them safe: this is. See
+            # _is_pdu_line for why testing the line's shape, rather than
+            # listing the URCs that might intrude, is what keeps that true.
             await self.handle_incoming_sms_pdu(message)
         elif message.startswith(b'+CREG:'):
             # Registration reports arrive unasked as well as in answer to the

@@ -20,7 +20,10 @@ logger = setup_logger(__name__)
 
 
 class HealthState:
-    """Tracks per-component up/down state and maintains the snapshot file."""
+    """Tracks per-component up/down state, loop progress and recovered-session
+    history, and maintains the snapshot file. Single source of the readings
+    the watchdog acts on.
+    """
 
     def __init__(
         self,
@@ -79,11 +82,9 @@ class HealthState:
             # reconnected. This is also what lets stall_duration() assume that
             # anything reported up has a progress stamp.
             service["progress"] = now
-            # The moment the system became whole. The snapshot is not written
-            # while anything is down, so the age it carries here measures the
-            # outage; stall_duration() reads from this instead when it is the
-            # later of the two. Recorded at the transition, where the moment is
-            # exact, rather than left to be sampled by whoever reads the age.
+            # The moment the system became whole, which snapshot_age() reads
+            # against. Recorded at the transition, where the moment is exact,
+            # rather than left to be sampled by whoever reads the age.
             if self.all_up():
                 self._all_up_since = now
             logger.info(f"Component is up: {name}")
@@ -126,14 +127,9 @@ class HealthState:
         that survives a component whose every failure is followed by a
         recovery long enough to reset everything else.
 
-        Which is also why the caller reports only the sessions that reached
-        that recovery. A session that ended before it did reset nothing, so
-        the evidence of it is still in the down clock - which runs from the
-        last recovery, since mark_down re-stamps only a component that was up -
-        and the count is for what leaves no other trace. A component that
-        alternates between the two shapes is therefore measured fully by
-        neither: see the known limitation beside WATCHDOG_CHURN_SESSIONS in
-        config.py.
+        Which is also why the caller reports only sessions that reached that
+        recovery: see Supervisor._serve_session for the judgement and its
+        known limitation.
         """
         ends = self._session_ends.get(name)
         if ends is None:
