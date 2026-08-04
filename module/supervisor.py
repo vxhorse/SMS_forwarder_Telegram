@@ -348,13 +348,26 @@ class Supervisor:
             # meaningful whatever the component happens to be doing right now.
             churner = self.health.churning(churn_sessions)
             if churner is not None:
+                # The observed count, not the threshold it cleared. This loop
+                # only looks every `interval`, so a component flapping faster
+                # than that ends several sessions between two inspections and
+                # the count is then well above the threshold; printing the
+                # threshold here would understate what happened by an amount
+                # nothing bounds. The key is always present - it comes from the
+                # same mapping churning() just read.
+                observed = self.health.reconnect_counts()[churner]
+                # States the criterion rather than diagnosing the other two.
+                # A component that fails inside SERVICE_STABLE_SECONDS is never
+                # marked up, so its down clock has been accumulating all along
+                # and this one merely reached its threshold first - a line
+                # claiming otherwise would describe a fault that is not the one
+                # being debugged.
                 logger.error(
                     f"Watchdog tripped: component {churner} has ended "
-                    f"{churn_sessions} connected sessions within "
-                    f"{self.health.churn_window:.0f}s. Each one lasted long "
-                    f"enough to count as a recovery, so neither the down clock "
-                    f"nor the stall clock ever accumulated; exiting so the "
-                    f"container runtime can restart everything"
+                    f"{observed} connected sessions within "
+                    f"{self.health.churn_window:.0f}s (threshold "
+                    f"{churn_sessions}); exiting so the container runtime can "
+                    f"restart everything"
                 )
                 self.exit_reason = "churning"
                 self.shutdown_event.set()
