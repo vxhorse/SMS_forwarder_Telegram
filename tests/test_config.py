@@ -120,6 +120,9 @@ def test_modem_probe_interval_ceiling_tracks_health_stale_seconds(monkeypatch):
     matches = _notices_for(reloaded, "MODEM_PROBE_INTERVAL")
     assert len(matches) == 1
     assert "100" in matches[0]
+    # And says which setting it came from, not just the number it works out
+    # to - a bare "ceiling is 10" leaves an operator nothing to act on.
+    assert "HEALTH_STALE_SECONDS" in matches[0]
 
 
 def test_the_shutdown_path_fits_inside_one_stop_grace_period(monkeypatch):
