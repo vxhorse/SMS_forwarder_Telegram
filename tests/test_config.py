@@ -321,6 +321,40 @@ def test_the_churn_window_must_hold_that_many_worst_case_cycles(monkeypatch):
     assert "60" in matches[0]
 
 
+@pytest.mark.parametrize("failures", ["2", "3", "8"])
+def test_the_churn_window_floor_holds_a_registration_driven_cycle(
+    monkeypatch, failures
+):
+    """The registration check ends a session after a run of readings, not after
+    one, so the slowest cycle the window has to hold is multiplied by
+    MODEM_REGISTRATION_FAILURES - a setting that appears in no other bound.
+
+    Left out of the floor, a patient count makes the window too short to hold
+    the threshold's worth of cycles, the count can never reach the threshold,
+    and the criterion is switched off while the settings table still says it is
+    on. That is a false negative, which for a criterion whose whole purpose is
+    seeing what nothing else sees is the dangerous direction.
+    """
+    monkeypatch.setenv("MODEM_REGISTRATION_CHECK", "1")
+    monkeypatch.setenv("MODEM_REGISTRATION_FAILURES", failures)
+    reloaded = importlib.reload(config_module)
+    cycle = reloaded.RECONNECT_BACKOFF_MAX + _worst_session_seconds(reloaded)
+    assert (
+        reloaded.WATCHDOG_CHURN_WINDOW >= reloaded.WATCHDOG_CHURN_SESSIONS * cycle
+    ), reloaded.WATCHDOG_CHURN_WINDOW_FLOOR
+
+
+def test_the_churn_window_floor_ignores_the_registration_count_when_off(monkeypatch):
+    """The multiplier belongs to the check, not to the count. With the check
+    off the count decides nothing at all, and a floor that grew with it anyway
+    would widen the window - and with it the criterion's appetite - for a
+    setting that is not in force."""
+    monkeypatch.setenv("MODEM_REGISTRATION_FAILURES", "8")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.WATCHDOG_CHURN_WINDOW_FLOOR == 1400.0
+    assert reloaded.CLAMP_NOTICES == []
+
+
 def test_the_shipped_churn_window_clears_its_floor_without_a_notice():
     """The default has to sit above the derived floor on its own, or every
     unmodified start prints a notice and an operator learns to stop reading
@@ -331,6 +365,36 @@ def test_the_shipped_churn_window_clears_its_floor_without_a_notice():
 
 
 # --- The meta-rule: enforced or reported, never neither ----------------------
+
+
+def _worst_session_seconds(cfg):
+    """The longest a connected session can take to end in a failure.
+
+    Derived here from the shape of module/device_manager.py's heartbeat_loop
+    rather than from config.py's own figure: a derivation checked against
+    itself would pass however wrong it was, and the whole point of the floor
+    below is that it models the loop it has to hold.
+
+    One round costs the interval plus what the probes in it wait for. A round
+    whose liveness probe goes unanswered spends one deadline and starts again;
+    a round that is answered goes on to ask about registration, which waits the
+    same deadline for its own answer.
+    """
+    unanswered = cfg.MODEM_PROBE_INTERVAL + cfg.MODEM_PROBE_TIMEOUT
+    answered = cfg.MODEM_PROBE_INTERVAL + 2 * cfg.MODEM_PROBE_TIMEOUT
+    # The liveness path: consecutive unanswered rounds until the count is
+    # reached, which is the whole session.
+    liveness = cfg.MODEM_PROBE_FAILURES * unanswered
+    if not cfg.MODEM_REGISTRATION_CHECK:
+        return liveness
+    # The registration path: only an answered round can find the modem off the
+    # network, so it takes that many answered rounds - and one answered probe
+    # clears the liveness count, so up to MODEM_PROBE_FAILURES - 1 unanswered
+    # rounds fit in front of each of them without ending the session first.
+    registration = cfg.MODEM_REGISTRATION_FAILURES * (
+        max(0, cfg.MODEM_PROBE_FAILURES - 1) * unanswered + answered
+    )
+    return max(liveness, registration)
 
 
 def _invariants(cfg):
@@ -384,7 +448,9 @@ def _invariants(cfg):
         ),
         (
             "the churn window can hold the threshold's worth of worst cycles",
-            cfg.WATCHDOG_CHURN_WINDOW >= cfg.WATCHDOG_CHURN_WINDOW_FLOOR,
+            cfg.WATCHDOG_CHURN_WINDOW
+            >= cfg.WATCHDOG_CHURN_SESSIONS
+            * (cfg.RECONNECT_BACKOFF_MAX + _worst_session_seconds(cfg)),
             ("WATCHDOG_CHURN_WINDOW",),
         ),
     ]
@@ -424,6 +490,13 @@ _TUNINGS = [
     # multiplies it.
     {"WATCHDOG_CHURN_WINDOW": "60"},
     {"WATCHDOG_CHURN_SESSIONS": "20", "RECONNECT_BACKOFF_MAX": "300"},
+    # The registration check makes a session end after a run of readings rather
+    # than after one, so it multiplies the slowest cycle the window has to
+    # hold - and the count is a setting of its own that appears in no other
+    # bound. The first of these is the shipped count with the check switched
+    # on; the second is an operator asking the check for more patience.
+    {"MODEM_REGISTRATION_CHECK": "1"},
+    {"MODEM_REGISTRATION_CHECK": "1", "MODEM_REGISTRATION_FAILURES": "8"},
 ]
 
 
