@@ -85,6 +85,7 @@ def test_a_fully_specified_but_legal_configuration_has_no_notices(monkeypatch):
         ("MODEM_REGISTRATION_FAILURES", "0", 2),
         ("MODEM_PROBE_TIMEOUT", "0", 1.0),
         ("MODEM_PROBE_FAILURES", "0", 1),
+        ("RECONNECT_BACKOFF_MIN", "0", 0.1),
     ],
 )
 def test_a_floored_setting_is_reported(monkeypatch, env_name, low_value, floor):

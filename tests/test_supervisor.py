@@ -29,6 +29,25 @@ def test_backoff_reset_returns_to_minimum():
     assert backoff.next_delay() == 1.0
 
 
+def test_a_minimum_of_zero_never_starts_growing():
+    """Why RECONNECT_BACKOFF_MIN carries a floor.
+
+    The delay grows by doubling, and zero doubles to zero, so a minimum of zero
+    is not a short first wait - it is every wait, for ever. The supervision loop
+    would then retry a dependency that is not there with nothing between
+    attempts, which is the spin this backoff exists to prevent. The maximum
+    cannot catch it either: min() of zero and any ceiling is still zero.
+    """
+    backoff = Backoff(minimum=0.0, maximum=30.0, rng=_no_jitter)
+    assert [backoff.next_delay() for _ in range(6)] == [0.0] * 6
+
+    floored = Backoff(minimum=0.1, maximum=30.0, rng=_no_jitter)
+    delays = [floored.next_delay() for _ in range(6)]
+    assert delays[0] > 0.0
+    assert delays == sorted(delays)
+    assert delays[-1] > delays[0]
+
+
 def test_backoff_jitter_stays_within_bounds():
     low = Backoff(minimum=10.0, maximum=10.0, jitter=0.2, rng=lambda: 0.0)
     high = Backoff(minimum=10.0, maximum=10.0, jitter=0.2, rng=lambda: 1.0)
