@@ -307,7 +307,7 @@ docker compose exec sms-forwarder cat /tmp/healthy
   把 `LOG_LEVEL` 设为 `DEBUG` 可以看到解析出的每一条驻网上报；
   在读到真实取值之前不要据此做开关决定。
 
-[`doc/README.md`](doc/README.md) 记录了要给出完整答案还需要做什么。
+[`doc/AT_COMMANDS.md`](doc/AT_COMMANDS.md) 记录了要给出完整答案还需要做什么。
 
 ### 为什么不使用 `devices:`
 
@@ -500,7 +500,7 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
      `Skipping the erase: only N of M readable stored message(s) were delivered ...`，
      存储区会在下次重连时再读一遍，已经送达的那些会再到一次。
      重复是可以承受的，擦除不是
-   - [`doc/README.md`](doc/README.md) 列出了本服务发出的每一条命令及其用途，
+   - [`doc/AT_COMMANDS.md`](doc/AT_COMMANDS.md) 列出了本服务发出的每一条命令及其用途，
      可据此在您自己模块的AT命令手册中逐条查阅
 
 5. **容器始终不进入健康状态**：

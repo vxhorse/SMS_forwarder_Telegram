@@ -114,7 +114,7 @@ also moves `config.py`, `.env.example` and `docker-compose.example.yml`, whose
 `STOP_BUDGET_SECONDS`, `NOTIFY_TIMEOUT`, `SERIAL_CLOSE_TIMEOUT` and
 `SERVICE_STABLE_SECONDS` in the terms an operator acts on — `config.py`
 delegates half of one invariant to that file by name; a change to the AT
-command set also moves `doc/README.md`, whose tables claim to cover every
+command set also moves `doc/AT_COMMANDS.md`, whose tables claim to cover every
 command this project issues. Nothing checks this, so it is on the author.
 
 ## Testing
@@ -181,7 +181,7 @@ the tests and the build — it does not publish half of anything.
   PY=$(pgrep -P "$(docker inspect -f '{{.State.Pid}}' sms-forwarder)" | head -1)
   ls -l /proc/$PY/fd | grep -E 'ttyUSB|ttyACM'
   ```
-- `doc/README.md` maps every AT command this project issues to its purpose, so
+- `doc/AT_COMMANDS.md` maps every AT command this project issues to its purpose, so
   you can find the right section of the vendor manual without reading all of it.
 - The `Dockerfile` copies a named allow-list, not `COPY . .`. A new file at the
   repository root must be added to

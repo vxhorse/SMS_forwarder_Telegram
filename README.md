@@ -338,7 +338,7 @@ docker compose exec sms-forwarder cat /tmp/healthy
   Set `LOG_LEVEL=DEBUG` to see each one as it is parsed, and do not decide
   either way until you have a real value.
 
-[`doc/README.md`](doc/README.md) records what a complete answer would require.
+[`doc/AT_COMMANDS.md`](doc/AT_COMMANDS.md) records what a complete answer would require.
 
 ### Why not `devices:`
 
@@ -580,7 +580,7 @@ Send `/help` in the Telegram bot conversation to view all available commands.
      stored message(s) were delivered ...`, the store is read again on the next
      reconnect, and the messages that did get through arrive a second time.
      Duplicates are recoverable; an erase is not
-   - [`doc/README.md`](doc/README.md) maps every command the service issues to
+   - [`doc/AT_COMMANDS.md`](doc/AT_COMMANDS.md) maps every command the service issues to
      what it does, so each one can be looked up in your own module's AT manual
 
 5. **The Container Never Becomes Healthy**:
