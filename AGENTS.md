@@ -1,7 +1,13 @@
 # AGENTS.md
 
 Instructions for coding agents working in this repository. This is the single
-authoritative file — `CLAUDE.md` imports it rather than repeating it.
+authoritative file. Codex, OpenCode and Cursor read it directly; Claude Code
+reads `CLAUDE.md`, which imports it rather than repeating it.
+
+If a tool needs a file of its own, that file is a pointer plus whatever is
+genuinely specific to that tool, the way `CLAUDE.md` is — never a copy. Two
+copies of a rule are one rule and one stale rule, and nothing here can tell you
+which is which.
 
 ## What this is
 
@@ -17,7 +23,7 @@ not a cosmetic one.
 ## Commands
 
 ```bash
-uv venv                                                            # .venv/ is gitignored: a fresh clone has none
+uv venv --python 3.12                                              # .venv/ is gitignored: a fresh clone has none
 uv pip install --python .venv/bin/python -r requirements-dev.txt   # setup (no pip in this venv)
 .venv/bin/python -m pytest                                          # run the suite
 .venv/bin/python -m pytest tests/test_supervisor.py -v              # one file
@@ -25,6 +31,15 @@ uv pip install --python .venv/bin/python -r requirements-dev.txt   # setup (no p
 
 Never invoke bare `pytest` or `python3` — the venv is uv-managed and the
 interpreter must be the one in `.venv/`.
+
+**Build the venv on the version the `Dockerfile` ships.** A green suite on a
+newer interpreter than production runs says nothing about production, and the
+gap is not hypothetical: the suite passed on a 3.13 venv for four rounds while
+failing on the 3.11 the image shipped, because `asyncio.wait_for` below 3.12
+can absorb a cancellation instead of re-raising it. 3.12 is a floor for that
+reason, `tests/test_runtime.py` asserts the behaviour rather than the version
+number, and a second guard there fails if the CI matrix stops covering
+whatever base image the `Dockerfile` names.
 
 ## Architecture
 
@@ -130,6 +145,14 @@ several tests in this repo's history passed against the bug they named.
 
 Test output must be pristine. A warning, an unretrieved task exception, or a
 "coroutine was never awaited" is a defect.
+
+`pytest.ini` caps each test at 60 seconds by the `signal` method. It is not a
+budget to tune — every test here terminates on a condition it controls, so a
+test that reaches the cap has stopped doing that. What the cap buys is a name:
+without it a hung test runs out the CI job's own timeout and GitHub reports the
+result as *cancelled*, which reads as a person stopping the run rather than a
+failure. `signal` rather than `thread` because the thread method kills the
+interpreter, so the first hang would be the last thing the run reported.
 
 ## Commits
 
