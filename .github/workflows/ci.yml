@@ -29,7 +29,13 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        python-version: ["3.11", "3.13"]
+        # The interpreter the image ships, and the newest supported one. The
+        # first is the one that matters: a suite that only ever runs on a
+        # developer's newer venv says nothing about what production executes.
+        # tests/test_runtime.py fails if this list stops covering the
+        # Dockerfile's base image. 3.11 is deliberately absent - see the
+        # cancellation guard in that file for what it does not do correctly.
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
