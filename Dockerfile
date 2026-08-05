@@ -1,5 +1,9 @@
-# Official slim Python image.
-FROM python:3.11-slim
+# Official slim Python image. 3.12 is a floor, not a preference: below it
+# asyncio.wait_for wraps its awaitable in a separate task and can absorb a
+# cancellation instead of re-raising it, which would leave a component the
+# supervisor had cancelled still running. tests/test_runtime.py asserts the
+# behaviour itself, and that CI tests whichever version is named here.
+FROM python:3.12-slim
 
 # No .pyc files, and unbuffered output so logs appear as they are written.
 ENV PYTHONDONTWRITEBYTECODE=1 \
