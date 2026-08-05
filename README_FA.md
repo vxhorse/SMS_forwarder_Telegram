@@ -324,7 +324,7 @@ docker compose exec sms-forwarder cat /tmp/healthy
   `LOG_LEVEL` را روی `DEBUG` بگذارید تا هر گزارش را همان‌طور که تجزیه می‌شود ببینید، و تا
   پیش از گرفتن یک مقدار واقعی درباره این تنظیم تصمیم نگیرید.
 
-[`doc/README.md`](doc/README.md) ثبت کرده که یک پاسخ کامل به چه چیزی نیاز دارد.
+[`doc/AT_COMMANDS.md`](doc/AT_COMMANDS.md) ثبت کرده که یک پاسخ کامل به چه چیزی نیاز دارد.
 
 ### چرا از `devices:` استفاده نمی‌کنیم
 
@@ -540,7 +540,7 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
      `Skipping the erase: only N of M readable stored message(s) were delivered ...`
      حافظه در اتصال مجدد بعدی دوباره خوانده می‌شود و آن‌هایی که یک بار رسیده بودند بار
      دوم هم می‌رسند. تکرار جبران‌شدنی است، پاک‌شدن نه
-   - فایل [`doc/README.md`](doc/README.md) هر دستوری را که سرویس می‌فرستد به کارکردش نگاشت
+   - فایل [`doc/AT_COMMANDS.md`](doc/AT_COMMANDS.md) هر دستوری را که سرویس می‌فرستد به کارکردش نگاشت
      می‌کند تا بتوانید تک‌تک آن‌ها را در دفترچه دستورات AT ماژول خودتان پیدا کنید
 
 5. **کانتینر هرگز سالم نمی‌شود**:

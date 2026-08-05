@@ -326,7 +326,7 @@ docker compose exec sms-forwarder cat /tmp/healthy
   `LOG_LEVEL` を `DEBUG` にすると解析された報告が1件ずつ見えます。実際の値を
   読むまでは、どちらとも決めないでください。
 
-完全な答えに何が必要かは [`doc/README.md`](doc/README.md) に記録しています。
+完全な答えに何が必要かは [`doc/AT_COMMANDS.md`](doc/AT_COMMANDS.md) に記録しています。
 
 ### `devices:` を使わない理由
 
@@ -545,7 +545,7 @@ Telegramボットとの対話で`/help`を送信して、利用可能なすべ�
      `Skipping the erase: only N of M readable stored message(s) were delivered ...`
      で、ストアは次の再接続でもう一度読まれ、すでに届いていたぶんはもう一度届きます。
      重複は取り返せますが、消去は取り返せません
-   - [`doc/README.md`](doc/README.md) にサービスが発行する全命令とその用途をまとめてあるので、
+   - [`doc/AT_COMMANDS.md`](doc/AT_COMMANDS.md) にサービスが発行する全命令とその用途をまとめてあるので、
      お使いのモジュールのATコマンドマニュアルで1つずつ照合できます
 
 5. **コンテナがいつまでも healthy にならない**：
