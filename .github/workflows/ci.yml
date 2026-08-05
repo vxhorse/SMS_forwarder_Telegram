@@ -59,9 +59,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The three docker actions below are pinned by commit rather than by
-      # moving tag, because on a tag push they are the code that handles the
-      # registry credential.
+      # Every docker/* action in this job - the two setup steps and the login
+      # immediately below, and the build-push further down - is pinned by
+      # commit rather than by moving tag, because on a tag push they are the
+      # code that handles the registry credential. Count them if you add one:
+      # a pin that is skipped is invisible until it is the one that matters.
 
       # This is what a developer machine is missing when a multi-platform build
       # dies at the first RUN with "exec format error": the emulator for the
