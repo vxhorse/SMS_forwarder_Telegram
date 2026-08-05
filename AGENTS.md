@@ -137,6 +137,32 @@ Conventional Commits (`feat:`/`fix:`/`refactor:`/`docs:`/`test:`/`chore:`). The
 body explains *why*, not what the diff already shows. **No tool or assistant
 attribution of any kind** — no co-author trailers, no "generated with" lines.
 
+## Releasing
+
+Publishing is a git tag push and nothing else:
+
+```bash
+git tag 2026-08-05b && git push origin 2026-08-05b
+```
+
+CI runs the suite on both interpreters, builds `linux/amd64` and `linux/arm64`,
+pushes the image as that tag and as `latest`, then reads the published index
+back and fails if either platform is missing. The tag name is the image tag, so
+every published image maps to a commit without a lookup.
+
+**Never build and push by hand.** The tag list is easy to get right once and
+lose silently later: a machine missing the emulator for the other architecture
+still produces a correct multi-platform image for as long as every foreign
+layer is a cache hit, and publishes a single-platform one the first time it is
+not. That is how `latest` became `arm64`-only while four README files went on
+promising `amd64`. The check in CI reads its wanted platforms from its own
+list rather than from the build's, so editing the build to drop one fails
+rather than publishing quietly.
+
+Publishing needs `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` as repository
+secrets. Without them a tag push fails at the login step, having already run
+the tests and the build — it does not publish half of anything.
+
 ## Things that will catch you out
 
 - `.env` holds the live credentials — `BOT_TOKEN`, `CHAT_ID`, `PROXY_URL`. It is

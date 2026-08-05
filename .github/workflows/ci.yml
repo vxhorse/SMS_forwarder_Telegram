@@ -3,7 +3,21 @@ name: CI
 on:
   push:
     branches: [master]
+    # Publishing is a tag push and nothing else, so the git tag and the image
+    # tag are the same string and every published image maps back to a commit.
+    tags: ['*']
   pull_request:
+  workflow_dispatch:
+
+# The repository default is read, but a workflow that can publish an image
+# should state what it may do rather than inherit it: that default is one click
+# from read-write in the repository settings, and nothing here would notice the
+# day it changed.
+permissions:
+  contents: read
+
+env:
+  IMAGE: vxhorse/sms-forwarder
 
 jobs:
   test:
@@ -26,10 +40,111 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -v
 
-  build:
+  image:
+    # Nothing is published unless the suite passed on both interpreters. A
+    # published tag cannot be withdrawn — deleting it unlinks the name and
+    # leaves the layers fetchable by digest — so the gate belongs before the
+    # push rather than after it.
+    needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The arm64 half is emulated on an amd64 runner and is several times slower
+    # than the native half.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - name: Build image
-        run: docker build -t sms-forwarder:ci .
+
+      # The three docker actions below are pinned by commit rather than by
+      # moving tag, because on a tag push they are the code that handles the
+      # registry credential.
+
+      # This is what a developer machine is missing when a multi-platform build
+      # dies at the first RUN with "exec format error": the emulator for the
+      # architecture the builder is not. A machine without it still builds a
+      # multi-platform image successfully whenever every foreign layer happens
+      # to be a cache hit, so the capability can be absent for months without
+      # anything saying so.
+      - name: Register the emulator for the non-native architecture
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to Docker Hub
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Decide what this run produces
+        id: plan
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            {
+              echo "push=true"
+              echo "tags=${IMAGE}:${GITHUB_REF_NAME},${IMAGE}:latest"
+              echo "outputs="
+            } >> "$GITHUB_OUTPUT"
+          else
+            # Not a publish. The image is still built for every platform and
+            # written to an OCI archive, so the check below reads a real index
+            # on every run rather than lying dormant until the day it would
+            # have mattered.
+            {
+              echo "push=false"
+              echo "tags=${IMAGE}:ci"
+              echo "outputs=type=oci,dest=image.tar"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build every platform
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.plan.outputs.push }}
+          tags: ${{ steps.plan.outputs.tags }}
+          outputs: ${{ steps.plan.outputs.outputs }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Every platform the READMEs promise is in the index
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The wanted list is written out here rather than read from the
+          # platforms input above, and that is the entire point of this step.
+          # Dropping an architecture from that input fails nothing — it builds
+          # a smaller index and publishes it, which is exactly how latest
+          # became arm64-only once already. A check that read the same variable
+          # would agree with itself and catch nothing.
+          #
+          # Kept as a sorted file compared with comm rather than a list walked
+          # by the shell, so the comparison does not depend on word splitting.
+          printf '%s\n' linux/amd64 linux/arm64 > want.txt
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            docker buildx imagetools inspect "${IMAGE}:${GITHUB_REF_NAME}" --raw > index.json
+          else
+            # An OCI archive nests one level: index.json names the image index,
+            # whose blob carries the per-platform manifests.
+            mkdir -p oci && tar -xf image.tar -C oci
+            digest=$(jq -r '.manifests[0].digest' oci/index.json | tr ':' '/')
+            cp "oci/blobs/${digest}" index.json
+          fi
+
+          # Provenance and SBOM attestations ride along as unknown/unknown.
+          # They are not platforms and must not be counted as one.
+          jq -r '.manifests[]
+                 | select(.platform.os != "unknown")
+                 | "\(.platform.os)/\(.platform.architecture)"' index.json \
+            | sort -u > got.txt
+          echo "platforms in the index:"; sed 's/^/  /' got.txt
+
+          missing=$(comm -23 want.txt got.txt)
+          if [ -n "${missing}" ]; then
+            echo "::error::the image index is missing: $(echo ${missing} | tr '\n' ' ')"
+            exit 1
+          fi
