@@ -205,7 +205,7 @@ docker compose logs -f     # 跟踪启动过程
 | `CHAT_ID` | *(占位符)* | 接收转发短信的Telegram会话 | 无——同上，这是凭据 |
 | `PROXY_URL` | *(空)* | 访问Telegram API的出站代理，留空表示直连 | 无——这是一个URL |
 | `NOTIFY_TIMEOUT` | `5.0` | 单次状态通知的时限 | 下限 1，上限为十秒的关停预算——它与 `SERIAL_CLOSE_TIMEOUT` 共用这一份预算：关停路径上先后等待这两者，两者之和不得超过常见运行时中最短的那个停机宽限期 |
-| `RECONNECT_BACKOFF_MIN` | `1.0` | 重连退避的最小间隔 | 无界。这一对的次序由另一侧保证——被钳制的是 `RECONNECT_BACKOFF_MAX` |
+| `RECONNECT_BACKOFF_MIN` | `1.0` | 重连退避的最小间隔 | 下限为 `0.1`：退避靠翻倍推进，而零翻倍仍是零，所以最小值设成零不是「第一次等得短」，而是每一次都不等。故意不设上限——`RECONNECT_BACKOFF_MAX` 的下限就是这个值，抬高它会把最大值一并带上去 |
 | `RECONNECT_BACKOFF_MAX` | `30.0` | 抖动之前的重连退避上限 | 下限为 `RECONNECT_BACKOFF_MIN`：最大值低于最小值会让每次重试的等待越缩越短，而不是越拉越长。每次等待都会带 ±20% 的抖动，这正是两个组件不会同步重试的原因，所以实际取到的最长等待比这个数字高五分之一——当前默认为 36 秒。故意不设上限——等得更久只是推迟重连，而 `WATCHDOG_CHURN_WINDOW` 的下限会随之增大，重连频次判据因此不会掉队 |
 | `SERVICE_STABLE_SECONDS` | `60.0` | 会话持续多久才算恢复 | 下限 5：取零时，连上的那一瞬间就算恢复，而这正是本设置要防的事。不设上限，但并非没有代价，而且被两个方向的关系夹住，而不是被某个数字。在一次会话持续这么久之前，没有任何组件会被标记为就绪，所以它与 `WATCHDOG_CHECK_INTERVAL` 之和必须小于 `WATCHDOG_DOWN_SECONDS`；而只有算作恢复的会话才计数，所以它还必须小于探测计划能抛错的最快时间——取 `MODEM_PROBE_FAILURES × (MODEM_PROBE_INTERVAL + MODEM_PROBE_TIMEOUT)` 与（开启驻网检查时）`MODEM_REGISTRATION_FAILURES × MODEM_PROBE_INTERVAL` 之中较小的那个，**当前默认为 105**，对应 60 秒的窗口——否则那一类故障根本到不了 `WATCHDOG_CHURN_SESSIONS`。两者中的任何一条不成立，启动通知都会点明，并说明后者指的是哪一类故障 |
 | `MODEM_PROBE_INTERVAL` | `30.0` | 心跳探测间隔 | 下限 1，上限为 `HEALTH_STALE_SECONDS` 的一半（当前默认 60）。刷新快照的正是这个探测，所以仅凭这一条循环也必须能让文件保持新鲜 |

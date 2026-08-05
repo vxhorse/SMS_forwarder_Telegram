@@ -129,7 +129,19 @@ HEALTH_STALE_SECONDS = _clamped(
 # rather than a number, stated with the notice for it further down.
 WATCHDOG_DOWN_SECONDS = int(os.getenv("WATCHDOG_DOWN_SECONDS", "3600"))
 # Exponential backoff bounds for component reconnection, in seconds.
-RECONNECT_BACKOFF_MIN = float(os.getenv("RECONNECT_BACKOFF_MIN", "1.0"))
+#
+# Floored because the backoff grows by doubling, and zero doubles to zero: a
+# minimum of zero is not a short first wait but every wait, for ever, so the
+# supervision loop would retry a dependency that is not there with nothing in
+# between. The maximum below cannot catch that, since it bounds the base from
+# above and zero is already under it. Deliberately unbounded above instead:
+# the maximum is floored at whatever this is, so raising it past the ceiling
+# it was going to have simply carries that ceiling with it.
+RECONNECT_BACKOFF_MIN = _clamped(
+    "RECONNECT_BACKOFF_MIN",
+    float(os.getenv("RECONNECT_BACKOFF_MIN", "1.0")),
+    low=0.1,
+)
 # The maximum bounds the base the backoff doubles toward, not the delay taken:
 # Backoff.next_delay multiplies it by 1 +/- 20% of jitter, which is what keeps
 # two components from retrying in lockstep, so the longest wait in practice is
