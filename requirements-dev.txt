@@ -1,3 +1,6 @@
 -r requirements.txt
 pytest==8.3.4
 pytest-asyncio==0.25.2
+# Turns a hung test into one named failure instead of a job that runs to its
+# own timeout and is reported as cancelled. See the timeout in pytest.ini.
+pytest-timeout==2.3.1
