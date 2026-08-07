@@ -184,6 +184,15 @@ jobs:
           # another file in this repository has to become absolute or it points
           # at a Docker Hub page that does not exist. Anchors are left alone -
           # they resolve within the rendered page.
+          #
+          # It also caps the field at 25000 bytes, and README.md is well past
+          # that, so the page carries whole leading sections and a link for the
+          # rest. Cutting on section boundaries rather than at a byte count is
+          # what keeps a code fence or a table from being sliced in half, and
+          # the sections that fit are the ones a reader of a registry page came
+          # for - what it is, what it needs, how to start it. What does not fit
+          # is the settings reference, which wants to be read next to the file
+          # it documents anyway.
           python3 - "$GITHUB_REPOSITORY" "$GITHUB_SHA" > overview.md <<'PY'
           import re, sys
           repo, sha = sys.argv[1], sys.argv[2]
@@ -195,9 +204,40 @@ jobs:
               lambda m: f"]({base}{m.group(1)})",
               text,
           )
-          sys.stdout.write(text)
+
+          readme = f"https://github.com/{repo}/blob/{sha}/README.md"
+          footer = (
+              "\n---\n\n"
+              f"The rest of the documentation - configuration reference, usage, "
+              f"and troubleshooting - is in [the full README]({readme}), "
+              f"alongside translations in 简体中文, 日本語 and فارسی.\n"
+          )
+          LIMIT = 25000 - len(footer.encode())
+
+          sections = re.split(r"(?m)^(?=## )", text)
+          kept, dropped, total = [], [], 0
+          for part in sections:
+              size = len(part.encode())
+              # Once one section does not fit, stop rather than skip it and
+              # take a later one: a page missing its middle reads as broken,
+              # where a page that stops and says so reads as an excerpt.
+              if dropped or total + size > LIMIT:
+                  dropped.append(part.split("\n", 1)[0] or "(preamble)")
+                  continue
+              kept.append(part)
+              total += size
+
+          if not kept or total < 500:
+              sys.exit("refusing to publish a stub: no section fits the limit")
+
+          sys.stdout.write("".join(kept) + footer)
+          sys.stderr.write("sections on the registry page:\n")
+          for s in kept:
+              sys.stderr.write(f"  + {s.split(chr(10), 1)[0] or '(preamble)'}\n")
+          for s in dropped:
+              sys.stderr.write(f"  - {s}  (left on GitHub)\n")
           PY
-          echo "overview: $(wc -c < overview.md) bytes"
+          echo "overview: $(wc -c < overview.md) bytes (Docker Hub allows 25000)"
 
           # Docker Hub caps the short description at 100 characters, so it
           # cannot be README.md's opening paragraph, which is half as long
