@@ -187,7 +187,8 @@ docker compose ps          # health goes from starting to healthy
 docker compose logs -f     # follow the startup sequence
 ```
 
-The container reports `starting` for up to three minutes, which is expected.
+The container reports `starting` for up to about four and a half minutes, which
+is expected.
 [Reading the health check](#reading-the-health-check) explains what each health
 state means and how to inspect it.
 
@@ -418,6 +419,14 @@ Three states are worth recognising:
   the slower of the two takes to connect — the modem enumerating, or the
   Telegram API becoming reachable through whatever proxy is in front of it;
   raise it if either is slow here.
+
+  `start_period` is not the whole wait. A check that fails inside it is not
+  counted, so the state cannot change while it lasts; once it has passed, the
+  check still has to fail `retries` times at `interval` — three times thirty
+  seconds in the example file — before the container is called `unhealthy`.
+  That is the four and a half minutes quoted above, and it is why a container
+  that will never come up still spends several minutes looking as though it
+  might.
 - **`unhealthy`** — nothing is being forwarded, with the single exception
   described below: a snapshot that cannot be written. Note that this does not
   restart anything by itself; the container runtime only records it. Recovery
@@ -584,7 +593,7 @@ Send `/help` in the Telegram bot conversation to view all available commands.
      what it does, so each one can be looked up in your own module's AT manual
 
 5. **The Container Never Becomes Healthy**:
-   - `starting` for up to three minutes is expected — see
+   - `starting` for up to about four and a half minutes is expected — see
      [Reading the health check](#reading-the-health-check)
    - Staying `unhealthy` means a component is down, and the log names which:
      `Component <name> failed ...`

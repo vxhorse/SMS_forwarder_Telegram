@@ -177,7 +177,7 @@ docker compose ps          # 健康状态由 starting 变为 healthy
 docker compose logs -f     # 跟踪启动过程
 ```
 
-容器最多会显示三分钟的 `starting`，这是正常现象。
+容器最多会显示约四分半钟的 `starting`，这是正常现象。
 各个健康状态的含义以及查看方法，详见「读懂健康检查」一节。
 
 ## 配置说明
@@ -372,6 +372,11 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
   而快照要等到全部组件都就绪才写入，因此最早也要在两者都连上之后再过一分钟。
   `start_period` 必须覆盖这段时间，再加上两者中较慢的那个连上所需的时间——
   模块枚举，或 Telegram API 经由前面那层代理变得可达；哪一边慢就调大它。
+
+  `start_period` 并不是等待的全部。落在它以内的失败不计数，所以在它持续期间状态不会改变；
+  它过去之后，检查还要以 `interval` 为间隔连续失败 `retries` 次——示例文件里是
+  3 × 30 秒——容器才会被判为 `unhealthy`。上面那个四分半钟就是这么来的，
+  也正因如此，一个永远起不来的容器仍会有好几分钟看上去像是快好了。
 - **`unhealthy`**——除下文「快照写不出去」那一种情形外，此时没有任何短信被转发。
   请注意它本身不会重启任何东西，容器运行时只是把它记录下来。
   恢复要么靠服务自行重连，要么靠看门狗退出进程、再由重启策略接手。
@@ -504,7 +509,7 @@ docker compose exec sms-forwarder python /app/healthcheck.py; echo $?
      可据此在您自己模块的AT命令手册中逐条查阅
 
 5. **容器始终不进入健康状态**：
-   - 最多三分钟的 `starting` 属于正常，详见「读懂健康检查」一节
+   - 最多约四分半钟的 `starting` 属于正常，详见「读懂健康检查」一节
    - 一直是 `unhealthy` 说明有组件掉线，日志会指出是哪一个：`Component <name> failed ...`
    - 容器运行时不会因为不健康而自行重启容器。看门狗会退出进程——组件已失败的
      走 `WATCHDOG_DOWN_SECONDS`，未失败却停止推进的走短得多的
