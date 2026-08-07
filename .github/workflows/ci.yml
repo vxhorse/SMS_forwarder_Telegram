@@ -156,3 +156,78 @@ jobs:
             echo "::error::the image index is missing: $(echo ${missing} | tr '\n' ' ')"
             exit 1
           fi
+
+      # Deliberately after the platform check, not before it: this step is what
+      # the registry page tells people the image is, and it should not describe
+      # something the run has not confirmed it shipped.
+      #
+      # Runs on a manual dispatch as well as a tag, so the description can be
+      # corrected without cutting a release, and so this step can be exercised
+      # at all - it needs no docker login, only the API credential, which is
+      # why it works on a branch run where the registry login is skipped.
+      - name: Give the registry page the same description as the repository
+        if: >-
+          github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "::error::the Docker Hub credentials are not set"
+            exit 1
+          fi
+
+          # README.md is the source. Docker Hub renders the markdown but
+          # resolves relative links against its own host, so every link to
+          # another file in this repository has to become absolute or it points
+          # at a Docker Hub page that does not exist. Anchors are left alone -
+          # they resolve within the rendered page.
+          python3 - "$GITHUB_REPOSITORY" "$GITHUB_SHA" > overview.md <<'PY'
+          import re, sys
+          repo, sha = sys.argv[1], sys.argv[2]
+          base = f"https://github.com/{repo}/blob/{sha}/"
+          text = open("README.md", encoding="utf-8").read()
+          # ](path) where path is not absolute, not an anchor, not a protocol
+          text = re.sub(
+              r"\]\((?!https?://|#|/)([^)]+)\)",
+              lambda m: f"]({base}{m.group(1)})",
+              text,
+          )
+          sys.stdout.write(text)
+          PY
+          echo "overview: $(wc -c < overview.md) bytes"
+
+          # Docker Hub caps the short description at 100 characters, so it
+          # cannot be README.md's opening paragraph, which is half as long
+          # again. It is the one sentence that exists twice; everything else on
+          # that page is generated from the file above.
+          SHORT='Forwards SMS from a serial GSM/LTE modem to Telegram, and sends SMS back out from Telegram.'
+
+          # The credential goes in on stdin, never on a command line, so it
+          # cannot surface in a process listing on the runner.
+          TOKEN=$(jq -n --arg u "$DOCKERHUB_USERNAME" --arg p "$DOCKERHUB_TOKEN" \
+                    '{username:$u,password:$p}' \
+                  | curl -sS --fail-with-body -X POST \
+                      -H 'Content-Type: application/json' --data @- \
+                      https://hub.docker.com/v2/users/login/ \
+                  | jq -r .token)
+          if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "null" ]; then
+            echo "::error::could not obtain a Docker Hub API token"
+            exit 1
+          fi
+
+          code=$(jq -n --arg s "$SHORT" --rawfile f overview.md \
+                   '{description:$s, full_description:$f}' \
+                 | curl -sS -o response.json -w '%{http_code}' -X PATCH \
+                     -H "Authorization: JWT ${TOKEN}" \
+                     -H 'Content-Type: application/json' --data @- \
+                     "https://hub.docker.com/v2/repositories/${IMAGE}/")
+          if [ "${code}" != "200" ]; then
+            echo "::error::Docker Hub rejected the description update (HTTP ${code})"
+            # The body names the failing field; it carries no credential.
+            head -c 500 response.json
+            exit 1
+          fi
+          echo "registry page updated (HTTP ${code})"
