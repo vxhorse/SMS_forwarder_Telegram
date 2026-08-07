@@ -78,9 +78,15 @@ jobs:
           fi
           # A shape check would pass 2026-13-45. The date has to exist, because
           # the whole point of the scheme is that the tag says when.
+          #
+          # python3 rather than date(1): the GNU and BSD versions disagree on
+          # what -d means, so a date(1) check passes on the runner and cannot be
+          # run on the macOS this is written on - which makes it a guard nobody
+          # can test before trusting it. fromisoformat is the same everywhere
+          # and rejects 2026-02-30 as readily as 2026-13-45.
           date_part="${tag:0:10}"
-          if ! date -u -d "${date_part}" +%Y-%m-%d >/dev/null 2>&1 \
-             || [ "$(date -u -d "${date_part}" +%Y-%m-%d)" != "${date_part}" ]; then
+          if ! python3 -c 'import datetime,sys; datetime.date.fromisoformat(sys.argv[1])' \
+                 "${date_part}" 2>/dev/null; then
             echo "::error::'${date_part}' is not a real date"
             exit 1
           fi
