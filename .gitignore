@@ -46,3 +46,15 @@ docs/superpowers/
 
 # Local deployment records name specific hosts
 docs/deployments/
+
+# Agent instruction files. They stay on disk - every agent tool reads them from
+# the working directory, so ignoring them here changes nothing locally - but
+# they describe how this project is worked on rather than what it does, which
+# is not what a reader of the published repository came for.
+AGENTS.md
+CLAUDE.md
+
+# The vendor AT command manual is Quectel's copyrighted material. Keep a local
+# copy to work from; doc/AT_COMMANDS.md says where to download it rather than
+# this repository redistributing it under its own MIT terms.
+doc/*.pdf

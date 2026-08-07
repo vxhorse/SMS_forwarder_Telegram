@@ -1,16 +1,15 @@
 # Vendor AT command manual
 
-`Quectel_LTE_Standard(A)系列_AT命令手册_V1.1.pdf` is the vendor's AT command
-reference for the Quectel LTE Standard (A) module family — the EC200T, EC200S,
-EC200A, EC200N, EC600S, EC600N, EC800N, EG912Y and EG915N series listed in the
-top-level [README](../README.md#hardware-requirements). It is kept here so that
-anyone adapting this project to another module can look up what a command means
-without hunting for the document first.
-
-The manual is the vendor's copyrighted material, included for reference only.
+The vendor's AT command reference for the Quectel LTE Standard (A) module
+family — the EC200T, EC200S, EC200A, EC200N, EC600S, EC600N, EC800N, EG912Y and
+EG915N series listed in the top-level
+[README](../README.md#hardware-requirements) — is published as
+*Quectel_LTE_Standard(A)系列_AT命令手册*. It is Quectel's copyrighted material,
+so this repository does not redistribute it; download it from Quectel's own
+document centre.
 
 The tables below map every AT command this project actually issues to what it is
-for, so you can search the PDF for the command name and land in the right
+for, so you can search that manual for the command name and land in the right
 section instead of reading it end to end. They are derived from
 [`module/device_manager.py`](../module/device_manager.py) and
 [`module/discovery.py`](../module/discovery.py); nothing here is issued anywhere
@@ -94,8 +93,8 @@ Nothing in this project writes a message body to the log, so an unrecognised
 line is reported by length, prefixed by its URC name only when that name is one
 `_KNOWN_URCS` in [`module/device_manager.py`](../module/device_manager.py)
 lists — a body can itself have the shape of a URC keyword, so a fixed set is
-the only test text cannot satisfy. Look that name up in the manual beside this
-file. A line that arrives as a byte count with no name is a URC nobody has seen
+the only test text cannot satisfy. Look that name up in the vendor manual named
+above. A line that arrives as a byte count with no name is a URC nobody has seen
 yet: identify it in the manual and add its prefix to that set, which is a
 one-line change. The bare responses of the AT command set (`RING`, `RDY`,
 `NO CARRIER` and the rest of `_SAFE_BARE_RESPONSES`) are the exception and are
