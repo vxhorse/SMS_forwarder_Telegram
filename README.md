@@ -144,6 +144,17 @@ For detailed tutorial, refer to the [Telegram Bot API documentation](https://cor
 docker pull vxhorse/sms-forwarder
 ```
 
+**Image tags are release dates**, `YYYY-MM-DD` — `2026-08-06`, and
+`2026-08-06b` for a second release the same day. They are not version numbers:
+nothing here promises compatibility between releases, and a date answers the
+question you actually have about a container that has been running for a while,
+which is how old it is. `latest` is whichever release is newest. Pin a date if
+you would rather decide when to move.
+
+Tags `1.0` through `2.0` predate this scheme. They are frozen, `amd64` only,
+and older than the reliability work described here — don't read the highest
+number as the newest image.
+
 Or build it from this repository instead, which is the usual choice if you have
 just cloned it:
 
